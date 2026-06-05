@@ -1,0 +1,90 @@
+{
+  "schema_version": "0.1",
+  "sample": {
+    "name": "mock_mirai",
+    "arch": "arm",
+    "endianness": "little",
+    "binary": "unpacked.elf",
+    "oep": "0x10420"
+  },
+  "file_dependencies": [
+    {
+      "path": "/proc/cpuinfo",
+      "syscall": "open",
+      "flags": "O_RDONLY",
+      "ret": 3
+    },
+    {
+      "path": "/proc/meminfo",
+      "syscall": "open",
+      "flags": "O_RDONLY",
+      "ret": 4
+    },
+    {
+      "path": "/proc/uptime",
+      "syscall": "open",
+      "flags": "O_RDONLY",
+      "ret": 5
+    },
+    {
+      "path": "/dev/urandom",
+      "syscall": "open",
+      "flags": "O_RDONLY",
+      "ret": 6
+    },
+    {
+      "path": "/tmp/.bot.lock",
+      "syscall": "open",
+      "flags": "O_CREAT|O_RDWR",
+      "ret": 7
+    }
+  ],
+  "network_dependencies": [
+  {
+    "type": "tcp",
+    "role": "c2",
+    "ip": "185.123.123.123",
+    "port": 48101,
+    "protocol_hint": "mirai-like"
+  }
+  ],
+  "library_dependencies": [
+    {
+      "name": "libc.so.6",
+      "path": "/lib/libc.so.6",
+      "symbols": ["socket", "connect", "send", "recv", "open", "read", "write"]
+    }
+  ],
+  "syscalls": [
+    {
+      "name": "uname",
+      "args": [],
+      "ret": 0
+    },
+    {
+      "name": "open",
+      "args": ["/proc/cpuinfo", "O_RDONLY"],
+      "ret": 3
+    },
+    {
+      "name": "socket",
+      "args": ["AF_INET", "SOCK_STREAM", 0],
+      "ret": 8
+    },
+    {
+      "name": "connect",
+      "args": ["127.0.0.1", 48101],
+      "ret": 0
+    }
+  ],
+  "anti_analysis": [
+    {
+      "type": "proc_check",
+      "detail": "/proc/cpuinfo"
+    },
+    {
+      "type": "uptime_check",
+      "detail": "/proc/uptime"
+    }
+  ]
+}
