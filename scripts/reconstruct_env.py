@@ -23,11 +23,11 @@ def main():
 
     taint = load_taint_log(args.taint)
 
-    fs_generator = StubFilesystemGenerator(out_dir=Path(args.out), arch=taint.sample.arch)
+    fs_generator = StubFilesystemGenerator(out_dir=Path(args.out), arch=taint.arch)
 
     fs_generator.generate(taint.file_dependencies)
 
-    network_policy = build_network_policy(taint=taint, mode = "local test", default_bind_ip = args.bind_ip)
+    network_policy = build_network_policy(taint=taint, mode = "local_test", default_bind_ip = args.bind_ip)
 
     network_policy_path = config_dir / "network_policy.json"
     save_network_policy(network_policy, network_policy_path)

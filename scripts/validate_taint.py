@@ -17,12 +17,13 @@ def main():
         sys.exit(1)
 
     print("Valid taint log")
-    print(f"    sample={taint.sample.name}")
-    print(f"    arch={taint.sample.arch}")
+    print(f"    arch={taint.arch}")
+    print(f"    oep={taint.oep}")
+    print(f"    base={taint.base}")
+    print(f"    regions={len(taint.regions)}")
     print(f"    files={len(taint.file_dependencies)}")
     print(f"    network={len(taint.network_dependencies)}")
     print(f"    libraries={len(taint.library_dependencies)}")
-    print(f"    syscalls={len(taint.syscalls)}")
 
 
 if __name__ == "__main__":

@@ -1,90 +1,55 @@
 {
-  "schema_version": "0.1",
-  "sample": {
-    "name": "mock_mirai",
-    "arch": "arm",
-    "endianness": "little",
-    "binary": "unpacked.elf",
-    "oep": "0x10420"
-  },
+  "oep": "0x401050",
+  "arch": "x86_64",
+  "base": "0x400000",
+  "regions": [
+    {
+      "addr": "0x400000",
+      "size": 45056,
+      "prot": 5,
+      "offset": 0
+    },
+    {
+      "addr": "0x41b000",
+      "size": 8192,
+      "prot": 3,
+      "offset": 45056
+    }
+  ],
   "file_dependencies": [
     {
       "path": "/proc/cpuinfo",
-      "syscall": "open",
-      "flags": "O_RDONLY",
-      "ret": 3
+      "write": false
     },
     {
-      "path": "/proc/meminfo",
-      "syscall": "open",
-      "flags": "O_RDONLY",
-      "ret": 4
+      "path": "/proc/self/maps",
+      "write": false
     },
     {
-      "path": "/proc/uptime",
-      "syscall": "open",
-      "flags": "O_RDONLY",
-      "ret": 5
-    },
-    {
-      "path": "/dev/urandom",
-      "syscall": "open",
-      "flags": "O_RDONLY",
-      "ret": 6
-    },
-    {
-      "path": "/tmp/.bot.lock",
-      "syscall": "open",
-      "flags": "O_CREAT|O_RDWR",
-      "ret": 7
+      "path": "/var/run/mirai.pid",
+      "write": true
     }
   ],
   "network_dependencies": [
-  {
-    "type": "tcp",
-    "role": "c2",
-    "ip": "185.123.123.123",
-    "port": 48101,
-    "protocol_hint": "mirai-like"
-  }
+    {
+      "ip": "185.62.190.0",
+      "port": 48101,
+      "type": "c2_binary",
+      "sample_bytes": "00 00 00 2a..."
+    },
+    {
+      "ip": "8.8.8.8",
+      "port": 53,
+      "type": "dns"
+    }
   ],
   "library_dependencies": [
-    {
-      "name": "libc.so.6",
-      "path": "/lib/libc.so.6",
-      "symbols": ["socket", "connect", "send", "recv", "open", "read", "write"]
-    }
+    "libc.so.6",
+    "libpthread.so.0"
   ],
-  "syscalls": [
-    {
-      "name": "uname",
-      "args": [],
-      "ret": 0
-    },
-    {
-      "name": "open",
-      "args": ["/proc/cpuinfo", "O_RDONLY"],
-      "ret": 3
-    },
-    {
-      "name": "socket",
-      "args": ["AF_INET", "SOCK_STREAM", 0],
-      "ret": 8
-    },
-    {
-      "name": "connect",
-      "args": ["127.0.0.1", 48101],
-      "ret": 0
-    }
-  ],
-  "anti_analysis": [
-    {
-      "type": "proc_check",
-      "detail": "/proc/cpuinfo"
-    },
-    {
-      "type": "uptime_check",
-      "detail": "/proc/uptime"
-    }
-  ]
+  "anti_analysis": {
+    "cpuinfo_check": true,
+    "uname_check": true,
+    "ptrace_traceme": false
+  }
 }

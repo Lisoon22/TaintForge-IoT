@@ -11,15 +11,9 @@ from .models import TaintLog
 
 @dataclass(slots=True)
 class LibraryRequirement:
-    """
-    A single library or dynamic loader that should be available inside rootfs.
-    """
-
     name: str
     kind: str
 
-    # guest_path is known for absolute paths like /lib/ld-uClibc.so.0.
-    # For plain NEEDED entries like libc.so.0, guest_path may be None.
     guest_path: Optional[str] = None
 
     sources: list[str] = field(default_factory=list)
@@ -42,17 +36,7 @@ class LibraryPlan:
         }
 
 
-def build_library_plan(
-    taint: TaintLog,
-    elf_info: Optional[ELFInfo] = None,
-) -> LibraryPlan:
-    """
-    Build unified library requirements from:
-    - ELF interpreter
-    - ELF NEEDED entries
-    - Phase 1 library_dependencies
-    - Phase 1 file_dependencies that look like library paths
-    """
+def build_library_plan(taint: TaintLog, elf_info: Optional[ELFInfo] = None) -> LibraryPlan:
     requirements_by_key: dict[str, LibraryRequirement] = {}
 
     if elf_info is not None:
@@ -69,10 +53,7 @@ def build_library_plan(
     )
 
 
-def add_elf_requirements(
-    requirements: dict[str, LibraryRequirement],
-    elf_info: ELFInfo,
-) -> None:
+def add_elf_requirements(requirements: dict[str, LibraryRequirement],elf_info: ELFInfo) -> None:
     if elf_info.interpreter:
         add_requirement(
             requirements=requirements,
@@ -92,10 +73,7 @@ def add_elf_requirements(
         )
 
 
-def add_taint_library_requirements(
-    requirements: dict[str, LibraryRequirement],
-    taint: TaintLog,
-) -> None:
+def add_taint_library_requirements(requirements: dict[str, LibraryRequirement],taint: TaintLog) -> None:
     for dep in taint.library_dependencies:
         guest_path = dep.path
 
@@ -115,10 +93,7 @@ def add_taint_library_requirements(
         )
 
 
-def add_library_like_file_requirements(
-    requirements: dict[str, LibraryRequirement],
-    taint: TaintLog,
-) -> None:
+def add_library_like_file_requirements(requirements: dict[str, LibraryRequirement],taint: TaintLog) -> None:
     for dep in taint.file_dependencies:
         path = dep.path
 
@@ -134,13 +109,7 @@ def add_library_like_file_requirements(
         )
 
 
-def add_requirement(
-    requirements: dict[str, LibraryRequirement],
-    name: str,
-    kind: str,
-    guest_path: Optional[str],
-    source: str,
-) -> None:
+def add_requirement(requirements: dict[str, LibraryRequirement],name: str,kind: str,guest_path: Optional[str],source: str) -> None:
     key = make_requirement_key(name=name, guest_path=guest_path)
 
     if key not in requirements:
@@ -153,8 +122,6 @@ def add_requirement(
 
     requirements[key].add_source(source)
 
-    # If earlier we only knew the name, but now got an absolute guest path,
-    # keep the more precise guest_path.
     if requirements[key].guest_path is None and guest_path is not None:
         requirements[key].guest_path = guest_path
 
@@ -187,3 +154,19 @@ def save_library_plan(plan: LibraryPlan, path: str | Path) -> None:
         json.dumps(plan.to_dict(), indent=2),
         encoding="utf-8",
     )
+
+def load_library_plan(path: str | Path) -> LibraryPlan:
+    path = Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    requirements = [
+        LibraryRequirement(
+            name=item["name"],
+            kind=item["kind"],
+            guest_path=item.get("guest_path"),
+            sources=item.get("sources", []),
+        )
+        for item in raw.get("requirements", [])
+    ]
+
+    return LibraryPlan(requirements=requirements)

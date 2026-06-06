@@ -32,8 +32,20 @@ def require_string(value: Any, context: str) -> str:
     return value
 
 
-def validate_arch(arch: str) -> str:
-    arch = require_string(arch, "sample.arch").lower()
+def require_bool(value: Any, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise TaintLogValidationError(f"{context} must be boolean")
+    return value
+
+
+def require_int(value: Any, context: str) -> int:
+    if not isinstance(value, int):
+        raise TaintLogValidationError(f"{context} must be integer")
+    return value
+
+
+def validate_arch(arch: Any) -> str:
+    arch = require_string(arch, "arch").lower()
 
     if arch not in SUPPORTED_ARCHES:
         supported = ", ".join(sorted(SUPPORTED_ARCHES))
@@ -44,7 +56,7 @@ def validate_arch(arch: str) -> str:
     return arch
 
 
-def validate_file_path(path: str) -> str:
+def validate_file_path(path: Any) -> str:
     path = require_string(path, "file_dependency.path")
 
     if not path.startswith("/"):
@@ -62,7 +74,7 @@ def validate_file_path(path: str) -> str:
     return str(posix_path)
 
 
-def validate_network_type(net_type: str) -> str:
+def validate_network_type(net_type: Any) -> str:
     net_type = require_string(net_type, "network_dependency.type").lower()
 
     if net_type not in SUPPORTED_NETWORK_TYPES:

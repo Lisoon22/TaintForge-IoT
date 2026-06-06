@@ -1,8 +1,3 @@
-Processor       : ARMv7 Processor rev 1 (v7l)
-BogoMIPS        : 38.40
-Features        : half thumb fastmult vfp edsp neon vfpv3 tls
-CPU implementer : 0x41
-CPU architecture: 7
-Hardware        : Generic IoT Board
-Revision        : 0000
-Serial          : 0000000000000000
+processor   : 0
+vendor_id   : GenuineIntel
+model name  : Generic Embedded CPU

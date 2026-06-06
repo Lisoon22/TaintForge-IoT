@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 
 SUPPORTED_ARCHES = {
@@ -13,33 +13,30 @@ SUPPORTED_ARCHES = {
     "x86_64",
 }
 
+
 SUPPORTED_NETWORK_TYPES = {
-    "tcp",
-    "udp",
+    "c2_binary",
     "dns",
     "ntp",
+    "tcp",
+    "udp",
+    "http",
+    "https",
 }
 
 
 @dataclass(slots=True)
-class SampleInfo:
-    name: str
-    arch: str
-    endianness: Optional[str] = None
-    binary: Optional[str] = None
-    oep: Optional[str] = None
-
-    def is_cross_arch(self) -> bool:
-        return self.arch in {"arm", "aarch64", "mips", "mipsel"}
+class MemoryRegion:
+    addr: str
+    size: int
+    prot: int
+    offset: int
 
 
 @dataclass(slots=True)
 class FileDependency:
     path: str
-    syscall: Optional[str] = None
-    flags: Optional[str] = None
-    ret: Optional[int] = None
-    content_hint: Optional[str] = None
+    write: bool = False
 
     def is_proc(self) -> bool:
         return self.path.startswith("/proc/")
@@ -53,40 +50,42 @@ class FileDependency:
     def is_config(self) -> bool:
         return self.path.startswith("/etc/") or self.path.startswith("/var/")
 
+
 @dataclass(slots=True)
 class NetworkDependency:
+    ip: str
+    port: int
     type: str
-    role: Optional[str] = None
-
-    # New explicit fields: what malware actually tried to contact.
-    remote_ip: Optional[str] = None
-    remote_port: Optional[int] = None
-
-    # Legacy fields from early mock logs.
-    ip: Optional[str] = None
-    port: Optional[int] = None
-
-    domain: Optional[str] = None
-    response_ip: Optional[str] = None
-    protocol_hint: Optional[str] = None
-
-    def effective_remote_ip(self) -> Optional[str]:
-        return self.remote_ip or self.ip
-
-    def effective_remote_port(self) -> Optional[int]:
-        return self.remote_port or self.port
-
-    def is_tcp(self) -> bool:
-        return self.type == "tcp"
-
-    def is_udp(self) -> bool:
-        return self.type == "udp"
+    sample_bytes: Optional[str] = None
 
     def is_dns(self) -> bool:
-        return self.type == "dns"
+        return self.type == "dns" or self.port == 53
 
     def is_ntp(self) -> bool:
-        return self.type == "ntp"
+        return self.type == "ntp" or self.port == 123
+
+    def is_c2(self) -> bool:
+        return self.type.startswith("c2")
+
+    def effective_remote_ip(self) -> str:
+        return self.ip
+
+    def effective_remote_port(self) -> int:
+        return self.port
+
+    def transport(self) -> str:
+        if self.type == "dns":
+            return "udp"
+
+        if self.type == "ntp":
+            return "udp"
+
+        if self.type in {"udp"}:
+            return "udp"
+
+        # c2_binary, http, https, tcp are treated as TCP for the first MVP.
+        return "tcp"
+
 
 @dataclass(slots=True)
 class LibraryDependency:
@@ -96,29 +95,22 @@ class LibraryDependency:
 
 
 @dataclass(slots=True)
-class SyscallEvent:
-    name: str
-    args: list[Any] = field(default_factory=list)
-    ret: Optional[Any] = None
-    timestamp: Optional[float] = None
-    pc: Optional[str] = None
-
-
-@dataclass(slots=True)
-class AntiAnalysisEvent:
-    type: str
-    detail: Optional[str] = None
+class AntiAnalysis:
+    cpuinfo_check: bool = False
+    uname_check: bool = False
+    ptrace_traceme: bool = False
 
 
 @dataclass(slots=True)
 class TaintLog:
-    schema_version: str
-    sample: SampleInfo
+    oep: str
+    arch: str
+    base: str
+    regions: list[MemoryRegion] = field(default_factory=list)
     file_dependencies: list[FileDependency] = field(default_factory=list)
     network_dependencies: list[NetworkDependency] = field(default_factory=list)
     library_dependencies: list[LibraryDependency] = field(default_factory=list)
-    syscalls: list[SyscallEvent] = field(default_factory=list)
-    anti_analysis: list[AntiAnalysisEvent] = field(default_factory=list)
+    anti_analysis: AntiAnalysis = field(default_factory=AntiAnalysis)
 
     def required_paths(self) -> list[str]:
         return sorted({dep.path for dep in self.file_dependencies})
@@ -129,20 +121,17 @@ class TaintLog:
     def tcp_services(self) -> list[NetworkDependency]:
         return [
             dep for dep in self.network_dependencies
-            if dep.type == "tcp"
+            if dep.transport() == "tcp"
         ]
 
     def udp_services(self) -> list[NetworkDependency]:
         return [
             dep for dep in self.network_dependencies
-            if dep.type == "udp"
+            if dep.transport() == "udp"
         ]
 
     def dns_dependencies(self) -> list[NetworkDependency]:
         return [
             dep for dep in self.network_dependencies
-            if dep.type == "dns"
+            if dep.is_dns()
         ]
-
-    def syscall_names(self) -> list[str]:
-        return [event.name for event in self.syscalls]

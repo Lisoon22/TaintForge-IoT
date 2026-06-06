@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-@dataclass(slot=True)
+@dataclass(slots=True)
 class ELFInfo:
     path: str
     arch_hint: str
@@ -41,7 +41,7 @@ def analyze_elf(path: str | Path, arch_hint: str) -> ELFInfo:
     dynamic_section = run_command(["readelf", "-d", str(path)])
 
     interpreter = parse_interpreter(program_headers)
-    needed_libraries = parse_libraries(dynamic_section)
+    needed_libraries = parse_needed_libraries(dynamic_section)
 
     is_dynamic = interpreter is not None or bool(needed_libraries)
 
@@ -62,7 +62,7 @@ def parse_needed_libraries(readelf_d_output: str) -> list[str]:
     needed: list[str] = []
 
     for line in readelf_d_output.splitlines():
-        if "(NEEDED)" not int line:
+        if "(NEEDED)" not in line:
             continue
 
         match = re.search(r"\[(.*?)\]", line)

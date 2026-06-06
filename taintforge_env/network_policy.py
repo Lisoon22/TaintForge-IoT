@@ -51,7 +51,7 @@ def choose_tcp_bind_port(host: str, preferred_port: Optional[int]) -> int:
         sock.bind((host,0))
         return int(sock.getsockname()[1])
 
-def build_network_policy(taint: TaintLog, mode: str = "local test", default_bind_ip: str = "127.0.0.1") -> NetworkPolicy:
+def build_network_policy(taint: TaintLog, mode: str = "local_test", default_bind_ip: str = "127.0.0.1") -> NetworkPolicy:
     policy = NetworkPolicy(mode = mode, allow_internet = False)
     for dep in taint.network_dependencies:
         service = build_service_policy(dep = dep, default_bind_ip = default_bind_ip)
@@ -61,19 +61,35 @@ def build_network_policy(taint: TaintLog, mode: str = "local test", default_bind
 
     return policy
 
-def build_service_policy(dep: NetworkDependency, default_bind_ip: str) -> Optional[NetworkServicePolicy]:
-    if dep.type != "tcp":
-        #all other types later
+def build_service_policy(
+    dep: NetworkDependency,
+    default_bind_ip: str,
+) -> Optional[NetworkServicePolicy]:
+    if dep.transport() != "tcp":
+        # DNS/UDP/NTP позже.
         return None
-    
+
     remote_port = dep.effective_remote_port()
 
-    if remote_port is None:
-        return None
+    bind_port = choose_tcp_bind_port(
+        host=default_bind_ip,
+        preferred_port=remote_port,
+    )
 
-    bind_port = choose_tcp_bind_port(host = default_bind_ip, preferred_port=remote_port)
+    return NetworkServicePolicy(
+        service_type="tcp",
+        role=dep.type,
 
-    return NetworkServicePolicy(service_type = dep.type, role = dep.role or "unknown", remote_ip = dep.effective_remote_ip(), remote_port = remote_port, domain = dep.domain, bind_ip = default_bind_ip, bind_port = bind_port, protocol_hint = dep.protocol_hint)
+        remote_ip=dep.effective_remote_ip(),
+        remote_port=remote_port,
+        domain=None,
+
+        bind_ip=default_bind_ip,
+        bind_port=bind_port,
+
+        protocol_hint=dep.type,
+    )
+
 
 def save_network_policy(policy: NetworkPolicy, path: str | Path) -> None:
     path = Path(path)

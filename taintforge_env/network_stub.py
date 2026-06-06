@@ -66,7 +66,7 @@ class TCPFakeService:
 
         return b"OK\n"
 
-async def run_network_emulator(policy: NetowrkPolicy, log_dir: str | Path) -> None:
+async def run_network_emulator(policy: NetworkPolicy, log_dir: str | Path) -> None:
     tcp_services = [
             service for service in policy.services
             if service.service_type == "tcp"

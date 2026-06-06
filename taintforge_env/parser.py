@@ -5,17 +5,18 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    AntiAnalysisEvent,
+    AntiAnalysis,
     FileDependency,
     LibraryDependency,
+    MemoryRegion,
     NetworkDependency,
-    SampleInfo,
-    SyscallEvent,
     TaintLog,
 )
 from .validators import (
     TaintLogValidationError,
+    require_bool,
     require_dict,
+    require_int,
     require_list,
     require_string,
     validate_arch,
@@ -48,85 +49,70 @@ def load_taint_log(path: str | Path) -> TaintLog:
 def parse_taint_log(raw: dict[str, Any]) -> TaintLog:
     raw = require_dict(raw, "taint_log")
 
-    schema_version = str(raw.get("schema_version", "0.1"))
+    oep = require_string(raw.get("oep"), "oep")
+    arch = validate_arch(raw.get("arch"))
+    base = require_string(raw.get("base"), "base")
 
-    sample = parse_sample(raw.get("sample"))
+    regions = [
+        parse_memory_region(item, index=i)
+        for i, item in enumerate(require_list(raw.get("regions"), "regions"))
+    ]
 
     file_dependencies = [
         parse_file_dependency(item, index=i)
-        for i, item in enumerate(require_list(
-            raw.get("file_dependencies"),
-            "file_dependencies",
-        ))
+        for i, item in enumerate(
+            require_list(raw.get("file_dependencies"), "file_dependencies")
+        )
     ]
 
     network_dependencies = [
         parse_network_dependency(item, index=i)
-        for i, item in enumerate(require_list(
-            raw.get("network_dependencies"),
-            "network_dependencies",
-        ))
+        for i, item in enumerate(
+            require_list(raw.get("network_dependencies"), "network_dependencies")
+        )
     ]
 
     library_dependencies = [
         parse_library_dependency(item, index=i)
-        for i, item in enumerate(require_list(
-            raw.get("library_dependencies"),
-            "library_dependencies",
-        ))
+        for i, item in enumerate(
+            require_list(raw.get("library_dependencies"), "library_dependencies")
+        )
     ]
 
-    syscalls = [
-        parse_syscall_event(item, index=i)
-        for i, item in enumerate(require_list(
-            raw.get("syscalls"),
-            "syscalls",
-        ))
-    ]
-
-    anti_analysis = [
-        parse_anti_analysis_event(item, index=i)
-        for i, item in enumerate(require_list(
-            raw.get("anti_analysis"),
-            "anti_analysis",
-        ))
-    ]
+    anti_analysis = parse_anti_analysis(raw.get("anti_analysis", {}))
 
     return TaintLog(
-        schema_version=schema_version,
-        sample=sample,
+        oep=oep,
+        arch=arch,
+        base=base,
+        regions=regions,
         file_dependencies=file_dependencies,
         network_dependencies=network_dependencies,
         library_dependencies=library_dependencies,
-        syscalls=syscalls,
         anti_analysis=anti_analysis,
     )
 
 
-def parse_sample(raw: Any) -> SampleInfo:
-    raw = require_dict(raw, "sample")
+def parse_memory_region(raw: Any, index: int) -> MemoryRegion:
+    context = f"regions[{index}]"
+    raw = require_dict(raw, context)
 
-    name = require_string(raw.get("name"), "sample.name")
-    arch = validate_arch(raw.get("arch"))
+    addr = require_string(raw.get("addr"), f"{context}.addr")
+    size = require_int(raw.get("size"), f"{context}.size")
+    prot = require_int(raw.get("prot"), f"{context}.prot")
+    offset = require_int(raw.get("offset"), f"{context}.offset")
 
-    endianness = raw.get("endianness")
-    if endianness is not None:
-        endianness = require_string(endianness, "sample.endianness").lower()
+    if size <= 0:
+        raise TaintLogValidationError(f"{context}.size must be > 0")
 
-    binary = raw.get("binary")
-    if binary is not None:
-        binary = require_string(binary, "sample.binary")
+    if offset < 0:
+        raise TaintLogValidationError(f"{context}.offset must be >= 0")
 
-    oep = raw.get("oep")
-    if oep is not None:
-        oep = require_string(oep, "sample.oep")
-
-    return SampleInfo(
-        name=name,
-        arch=arch,
-        endianness=endianness,
-        binary=binary,
-        oep=oep,
+    return MemoryRegion(
+        addr=addr,
+        size=size,
+        prot=prot,
+        offset=offset,
     )
 
 
@@ -136,28 +122,12 @@ def parse_file_dependency(raw: Any, index: int) -> FileDependency:
 
     path = validate_file_path(raw.get("path"))
 
-    syscall = raw.get("syscall")
-    if syscall is not None:
-        syscall = require_string(syscall, f"{context}.syscall")
-
-    flags = raw.get("flags")
-    if flags is not None:
-        flags = require_string(flags, f"{context}.flags")
-
-    ret = raw.get("ret")
-    if ret is not None and not isinstance(ret, int):
-        raise TaintLogValidationError(f"{context}.ret must be int or null")
-
-    content_hint = raw.get("content_hint")
-    if content_hint is not None:
-        content_hint = require_string(content_hint, f"{context}.content_hint")
+    write = raw.get("write", False)
+    write = require_bool(write, f"{context}.write")
 
     return FileDependency(
         path=path,
-        syscall=syscall,
-        flags=flags,
-        ret=ret,
-        content_hint=content_hint,
+        write=write,
     )
 
 
@@ -165,66 +135,30 @@ def parse_network_dependency(raw: Any, index: int) -> NetworkDependency:
     context = f"network_dependencies[{index}]"
     raw = require_dict(raw, context)
 
+    ip = require_string(raw.get("ip"), f"{context}.ip")
+    port = validate_port(raw.get("port"), f"{context}.port")
     net_type = validate_network_type(raw.get("type"))
 
-    role = raw.get("role")
-    if role is not None:
-        role = require_string(role, f"{context}.role")
-
-    remote_ip = raw.get("remote_ip")
-    if remote_ip is not None:
-        remote_ip = require_string(remote_ip, f"{context}.remote_ip")
-
-    remote_port = raw.get("remote_port")
-    if remote_port is not None:
-        remote_port = validate_port(remote_port, f"{context}.remote_port")
-
-    ip = raw.get("ip")
-    if ip is not None:
-        ip = require_string(ip, f"{context}.ip")
-
-    port = raw.get("port")
-    if port is not None:
-        port = validate_port(port, f"{context}.port")
-
-    domain = raw.get("domain")
-    if domain is not None:
-        domain = require_string(domain, f"{context}.domain")
-
-    response_ip = raw.get("response_ip")
-    if response_ip is not None:
-        response_ip = require_string(response_ip, f"{context}.response_ip")
-
-    protocol_hint = raw.get("protocol_hint")
-    if protocol_hint is not None:
-        protocol_hint = require_string(protocol_hint, f"{context}.protocol_hint")
-
-    effective_port = remote_port or port
-
-    if net_type in {"tcp", "udp", "ntp"} and effective_port is None:
-        raise TaintLogValidationError(
-            f"{context}: remote_port or port is required for {net_type}"
-        )
-
-    if net_type == "dns" and domain is None:
-        raise TaintLogValidationError(
-            f"{context}.domain is required for dns"
-        )
+    sample_bytes = raw.get("sample_bytes")
+    if sample_bytes is not None:
+        sample_bytes = require_string(sample_bytes, f"{context}.sample_bytes")
 
     return NetworkDependency(
-        type=net_type,
-        role=role,
-        remote_ip=remote_ip,
-        remote_port=remote_port,
         ip=ip,
         port=port,
-        domain=domain,
-        response_ip=response_ip,
-        protocol_hint=protocol_hint,
+        type=net_type,
+        sample_bytes=sample_bytes,
     )
+
 
 def parse_library_dependency(raw: Any, index: int) -> LibraryDependency:
     context = f"library_dependencies[{index}]"
+
+    # New schema: "library_dependencies": ["libc.so.6", "libpthread.so.0"]
+    if isinstance(raw, str):
+        return LibraryDependency(name=require_string(raw, context))
+
+    # Optional compatibility: allow old object format too.
     raw = require_dict(raw, context)
 
     name = require_string(raw.get("name"), f"{context}.name")
@@ -233,64 +167,21 @@ def parse_library_dependency(raw: Any, index: int) -> LibraryDependency:
     if path is not None:
         path = require_string(path, f"{context}.path")
 
-    symbols_raw = raw.get("symbols", [])
-    symbols_list = require_list(symbols_raw, f"{context}.symbols")
-
-    symbols: list[str] = []
-    for symbol_index, symbol in enumerate(symbols_list):
-        symbols.append(
-            require_string(
-                symbol,
-                f"{context}.symbols[{symbol_index}]",
-            )
-        )
-
     return LibraryDependency(
         name=name,
         path=path,
-        symbols=symbols,
     )
 
 
-def parse_syscall_event(raw: Any, index: int) -> SyscallEvent:
-    context = f"syscalls[{index}]"
-    raw = require_dict(raw, context)
+def parse_anti_analysis(raw: Any) -> AntiAnalysis:
+    raw = require_dict(raw, "anti_analysis")
 
-    name = require_string(raw.get("name"), f"{context}.name")
+    cpuinfo_check = raw.get("cpuinfo_check", False)
+    uname_check = raw.get("uname_check", False)
+    ptrace_traceme = raw.get("ptrace_traceme", False)
 
-    args = raw.get("args", [])
-    args = require_list(args, f"{context}.args")
-
-    ret = raw.get("ret")
-
-    timestamp = raw.get("timestamp")
-    if timestamp is not None and not isinstance(timestamp, int | float):
-        raise TaintLogValidationError(f"{context}.timestamp must be number or null")
-
-    pc = raw.get("pc")
-    if pc is not None:
-        pc = require_string(pc, f"{context}.pc")
-
-    return SyscallEvent(
-        name=name,
-        args=args,
-        ret=ret,
-        timestamp=timestamp,
-        pc=pc,
-    )
-
-
-def parse_anti_analysis_event(raw: Any, index: int) -> AntiAnalysisEvent:
-    context = f"anti_analysis[{index}]"
-    raw = require_dict(raw, context)
-
-    event_type = require_string(raw.get("type"), f"{context}.type")
-
-    detail = raw.get("detail")
-    if detail is not None:
-        detail = require_string(detail, f"{context}.detail")
-
-    return AntiAnalysisEvent(
-        type=event_type,
-        detail=detail,
+    return AntiAnalysis(
+        cpuinfo_check=require_bool(cpuinfo_check, "anti_analysis.cpuinfo_check"),
+        uname_check=require_bool(uname_check, "anti_analysis.uname_check"),
+        ptrace_traceme=require_bool(ptrace_traceme, "anti_analysis.ptrace_traceme"),
     )
