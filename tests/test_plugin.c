@@ -119,7 +119,6 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		fprintf(stderr, "[OEP] 0x%lx\n", oep_addr);
 		do_dump(oep_addr);
 	}
-	//fprintf(stderr, "[INSN] 0x%012lx\n", vaddr);
 }
 
 static void vcpu_mem(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *udata) {
