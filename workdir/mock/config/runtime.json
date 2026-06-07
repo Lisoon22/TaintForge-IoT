@@ -1,0 +1,12 @@
+{
+  "arch": "x86_64",
+  "rootfs": "workdir/mock/rootfs",
+  "host_binary_path": "samples/ls_x86_64",
+  "guest_binary_path": "/bin/unpacked.elf",
+  "qemu_required": false,
+  "qemu_binary_name": null,
+  "qemu_host_path": null,
+  "qemu_guest_path": null,
+  "libraries_ok": true,
+  "library_resolution_path": "workdir/mock/config/library_resolution.json"
+}
