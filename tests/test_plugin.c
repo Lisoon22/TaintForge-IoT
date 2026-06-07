@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <qemu-plugin.h>
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -33,6 +34,54 @@ gint compare_keys(gconstpointer a, gconstpointer b) {
 }
 
 static arch_t current_arch = ARCH_UNKNOWN;
+
+static GList *file_deps = NULL;
+static GList *net_deps = NULL;
+static GList *lib_deps = NULL;
+
+static char *read_guest_string(uint64_t gaddr) {
+	if (gaddr == 0) return NULL;
+
+	GString *s = g_string_new(NULL);
+	GByteArray *arr = g_byte_array_new();
+
+	for (size_t i = 0; i < 1024; i++) {
+		g_byte_array_set_size(arr, 0);
+		if (!qemu_plugin_read_memory_vaddr(gaddr + i, arr, 1)) break;
+		if (arr->len == 0) break;
+		guint8 ch = arr->data[0];
+		if (ch == '\0') break;
+		g_string_append_c(s, ch);
+	}
+
+	g_byte_array_free(arr, TRUE);
+
+	if (s->len == 0) {
+		g_string_free(s, TRUE);
+		return NULL;
+	}
+	return g_string_free(s, FALSE);
+}
+
+static bool is_valid_path(const char *s) {
+    if (!s || !*s) return false;
+    if (*s != '/') return false;
+    
+    size_t len = strlen(s);
+    if (len < 2 || len > 256) return false;
+    
+    char c = s[1];
+    if (!(isalpha((unsigned char)c) || c == '_' || c == '.')) return false;
+    
+    for (const char *p = s + 2; *p; p++) {
+        unsigned char c = *p;
+        if (c < 32 || c > 126) return false;
+        if (c == '<' || c == '>' || c == '|' || c == '*' || 
+            c == '?' || c == '"' || c == '\\' || c == ',' || 
+            c == ';' || c == '$') return false;
+    }
+    return true;
+}
 
 static uint64_t oep_addr = 0;
 
@@ -89,23 +138,75 @@ static void do_dump(uint64_t oep) {
 			in_region = true;
 		}
 		offset += written;
-		}
+	}
 	if (in_region) {
 		if (!first_region) fprintf(f_json, ",\n");
 		fprintf(f_json, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}\n", region_start, region_size, region_prot, offset - region_size);
 	}
-	fprintf(f_json, "  ]\n}\n");
+	fprintf(f_json, "  ],\n");
+
+	// files
+	fprintf(f_json, "  \"files\": [");
+	bool first = true;
+	for (GList *l = file_deps; l; l = l->next) {
+		const char *path = (char*)l->data;
+		if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
+		if (!first) fprintf(f_json, ", ");
+		fprintf(f_json, "\"%s\"", (char*)l->data);
+		first = false;
+	}
+	fprintf(f_json, "],\n");
+
+	// libraries
+	fprintf(f_json, "  \"libraries\": [");
+	first = true;
+	for (GList *l = lib_deps; l; l = l->next) {
+		const char *path = (char*)l->data;
+		if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
+		if (!first) fprintf(f_json, ", ");
+		fprintf(f_json, "\"%s\"", (char*)l->data);
+		first = false;
+	}
+	fprintf(f_json, "],\n");
+
+	// network
+	fprintf(f_json, "  \"network\": [\n");
+	first = true;
+	for (GList *l = net_deps; l; l = l->next) {
+		char *s = (char*)l->data;
+		if (!s || !*s) continue;
+		int id;
+		char name[32] = {0};
+		char op[32] = {0};
+    
+		if (sscanf(s, "socketcall:%d:%31s", &id, name) == 2) {
+			snprintf(op, sizeof(op), "socketcall");
+		}
+		else if (sscanf(s, "%31[^:]:%d:%31s", op, &id, name) == 3) {
+		} else {
+			continue;
+		}
+		if (!first) fprintf(f_json, ",\n");
+		fprintf(f_json, "    {\"op\": \"%s\", \"subcall\": %d, \"note\": \"%s\"}", op, id, name);
+		first = false;	
+	}
+	fprintf(f_json, "\n  ]\n}\n");
+	
 	fclose(f_bin);
 	fclose(f_json);
 	g_list_free(keys);
 	fprintf(stderr, "[DUMP] unpacked.bin + unpacked.json complete\n");
 }
 
+
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
-    if (oep_addr == 0) {
-        fprintf(stderr, "[EXIT] No OEP detected, dumping all exec pages\n");
-        do_dump(0);
-    }
+	if (oep_addr == 0) {
+        	fprintf(stderr, "[EXIT] No OEP detected, dumping all exec pages\n");
+        	do_dump(0);
+	}
+	g_list_free_full(file_deps, g_free);
+	g_list_free_full(lib_deps, g_free);
+	g_list_free_full(net_deps, g_free);
 }
 
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
@@ -141,7 +242,76 @@ static void vcpu_mem(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t
 
 static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
 	//x86
-	if (num == 192) { //mmap2
+	if (num == 5) {  //open
+		char *path = read_guest_string(a1);
+		if (path && *path && is_valid_path(path)) {
+			file_deps = g_list_append(file_deps, path);
+			fprintf(stderr, "[FILE] open: %s\n", path);
+			if ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache")) {
+				lib_deps = g_list_append(lib_deps, g_strdup(path));
+			}
+		} else {
+			g_free(path);
+		}
+	} else if (num == 295) {  //openat
+		char *path = read_guest_string(a2);
+		if (path && *path && is_valid_path(path)) {
+			file_deps = g_list_append(file_deps, path);
+			fprintf(stderr, "[FILE] openat: %s\n", path);
+			if ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache")) {
+				lib_deps = g_list_append(lib_deps, g_strdup(path));
+			}
+		} else {
+			g_free(path);
+		}
+	} else if (num == 33) {  // access
+		char *path = read_guest_string(a1);
+		if (path && *path && is_valid_path(path)) {
+			file_deps = g_list_append(file_deps, path);
+			fprintf(stderr, "[FILE] access: %s\n", path);
+		} else {
+			g_free(path);
+		}
+	} else if (num == 307) { //faccessat
+		char *path = read_guest_string(a2);
+		if (path && *path && is_valid_path(path)) {
+			file_deps = g_list_append(file_deps, path);
+			fprintf(stderr, "[FILE] access: %s\n", path);
+		} else {
+			g_free(path);
+		}
+	} else if (num == 102) {  //socketcall
+		int subcall = (int)a1;
+		const char *name = "unknown";
+		switch (subcall) {
+			case 1: name = "socket"; break;
+			case 2: name = "bind"; break;
+			case 3: name = "connect"; break;
+			case 4: name = "listen"; break;
+			case 5: name = "accept"; break;
+			case 9: name = "send"; break;
+			case 10: name = "recv"; break;
+			default: fprintf(stderr, "[SYSCALL] unknown num=%ld a1=0x%lx a2=0x%lx\n", num, a1, a2);
+		}
+		char *op = g_strdup_printf("socketcall:%d:%s", subcall, name);
+		net_deps = g_list_append(net_deps, op);
+		fprintf(stderr, "[NET] %s\n", op);
+	} else if (num == 359) {  /* socket */
+		net_deps = g_list_append(net_deps, g_strdup("socket:359:socket"));
+		fprintf(stderr, "[NET] socket()\n");
+	} else if (num == 361) {  /* bind */
+		net_deps = g_list_append(net_deps, g_strdup("bind:361:bind"));
+		fprintf(stderr, "[NET] bind()\n");
+	} else if (num == 362) {  /* connect */
+		net_deps = g_list_append(net_deps, g_strdup("connect:362:connect"));
+		fprintf(stderr, "[NET] connect()\n");
+	} else if (num == 363) {  /* listen */
+		net_deps = g_list_append(net_deps, g_strdup("listen:363:listen"));
+		fprintf(stderr, "[NET] listen()\n");
+	} else if (num == 364) {  /* accept */
+		net_deps = g_list_append(net_deps, g_strdup("accept:364:accept"));
+		fprintf(stderr, "[NET] accept()\n");
+	} else if (num == 192) { //mmap2
 		int prot = (int)a3;
 		if (prot & 0x2 || prot & 0x4) {
 			fprintf(stderr, "[SYSCALL] mmap2(0x%lx, 0x%lx, prot=0x%lx, flags=0x%lx, fd=%lu, offset=0x%lx)\n", a1, a2, a3, a4, a5, a6);
