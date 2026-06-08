@@ -35,9 +35,15 @@ gint compare_keys(gconstpointer a, gconstpointer b) {
 
 static arch_t current_arch = ARCH_UNKNOWN;
 
+typedef struct {
+    char *path;
+    bool write;
+} file_dep_t;
 static GList *file_deps = NULL;
 static GList *net_deps = NULL;
 static GList *lib_deps = NULL;
+static GHashTable *file_fd = NULL;
+static int next_fd = 3; 
 
 static char *read_guest_string(uint64_t gaddr) {
 	if (gaddr == 0) return NULL;
@@ -83,6 +89,24 @@ static bool is_valid_path(const char *s) {
     return true;
 }
 
+static file_dep_t *add_file_dep(const char *path, bool is_lib) {
+	for (GList *l = file_deps; l; l = l->next) {
+		file_dep_t *f = (file_dep_t*)l->data;
+		if (f->path && strcmp(f->path, path) == 0) return f;
+	}
+	file_dep_t *f = g_new0(file_dep_t, 1);
+	f->path = g_strdup(path);
+	f->write = false;
+	file_deps = g_list_append(file_deps, f);
+	if (is_lib && !strstr(path, ".cache")) {
+		for (GList *l = lib_deps; l; l = l->next) {
+			if (strcmp((char*)l->data, path) == 0) return f;
+		}
+		lib_deps = g_list_append(lib_deps, g_strdup(path));
+	}
+	return f;
+}
+
 static uint64_t oep_addr = 0;
 
 static void do_dump(uint64_t oep) {
@@ -100,7 +124,7 @@ static void do_dump(uint64_t oep) {
 
 	fprintf(f_json, "{\n");
 	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", oep);
-	fprintf(f_json, "  \"arch\": \"i386\",\n");
+	fprintf(f_json, "  \"arch\": \"x86\",\n");
 	fprintf(f_json, "  \"regions\": [\n");
 	
 	bool in_region = false;
@@ -146,19 +170,22 @@ static void do_dump(uint64_t oep) {
 	fprintf(f_json, "  ],\n");
 
 	// files
-	fprintf(f_json, "  \"files\": [");
+	fprintf(f_json, "  \"file_dependencies\": [");
 	bool first = true;
 	for (GList *l = file_deps; l; l = l->next) {
-		const char *path = (char*)l->data;
-		if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
-		if (!first) fprintf(f_json, ", ");
-		fprintf(f_json, "\"%s\"", (char*)l->data);
+		file_dep_t *f = (file_dep_t*)l->data;
+		if (!f->path) continue;
+		//if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
+		//if (!first) fprintf(f_json, ", ");
+		if (!first) fprintf(f_json, ",\n");
+		fprintf(f_json, "    {\"path\": \"%s\", \"write\": %s}", f->path, f->write ? "true" : "false");
+		//fprintf(f_json, "\"%s\"", (char*)l->data);
 		first = false;
 	}
 	fprintf(f_json, "],\n");
 
 	// libraries
-	fprintf(f_json, "  \"libraries\": [");
+	fprintf(f_json, "  \"library_dependencies\": [");
 	first = true;
 	for (GList *l = lib_deps; l; l = l->next) {
 		const char *path = (char*)l->data;
@@ -170,7 +197,7 @@ static void do_dump(uint64_t oep) {
 	fprintf(f_json, "],\n");
 
 	// network
-	fprintf(f_json, "  \"network\": [\n");
+	fprintf(f_json, "  \"network_dependencies\": [\n");
 	first = true;
 	for (GList *l = net_deps; l; l = l->next) {
 		char *s = (char*)l->data;
@@ -204,9 +231,15 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
         	fprintf(stderr, "[EXIT] No OEP detected, dumping all exec pages\n");
         	do_dump(0);
 	}
-	g_list_free_full(file_deps, g_free);
+	for (GList *l = file_deps; l; l = l->next) {
+		file_dep_t *f = (file_dep_t*)l->data;
+		g_free(f->path);
+		g_free(f);
+	}
+	g_list_free(file_deps);
 	g_list_free_full(lib_deps, g_free);
 	g_list_free_full(net_deps, g_free);
+	g_hash_table_destroy(file_fd);
 }
 
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
@@ -245,29 +278,38 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 	if (num == 5) {  //open
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
-			file_deps = g_list_append(file_deps, path);
-			fprintf(stderr, "[FILE] open: %s\n", path);
-			if ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache")) {
-				lib_deps = g_list_append(lib_deps, g_strdup(path));
-			}
+			bool is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
+			file_dep_t *f = add_file_dep(path, is_lib);
+			g_hash_table_insert(file_fd, GINT_TO_POINTER(next_fd), f);
+			fprintf(stderr, "[FILE] open: %s (fd=%d)\n", path, next_fd);
+			next_fd ++;
 		} else {
 			g_free(path);
 		}
 	} else if (num == 295) {  //openat
 		char *path = read_guest_string(a2);
 		if (path && *path && is_valid_path(path)) {
-			file_deps = g_list_append(file_deps, path);
-			fprintf(stderr, "[FILE] openat: %s\n", path);
-			if ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache")) {
-				lib_deps = g_list_append(lib_deps, g_strdup(path));
-			}
+			bool is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
+			file_dep_t *f = add_file_dep(path, is_lib);
+			g_hash_table_insert(file_fd, GINT_TO_POINTER(next_fd), f);
+			fprintf(stderr, "[FILE] openat: %s (fd=%d)\n", path, next_fd);
+			next_fd++;
 		} else {
 			g_free(path);
 		}
+	} else if (num == 4) {  // write
+		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
+		if (val) {
+			file_dep_t *f = (file_dep_t*)val;
+			f->write = true;
+			fprintf(stderr, "[FILE] write(fd=%d) -> %s\n", (int)a1, f->path);
+		}
+	} else if (num == 6) {  // close
+		g_hash_table_remove(file_fd, GINT_TO_POINTER((int)a1));
 	} else if (num == 33) {  // access
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
-			file_deps = g_list_append(file_deps, path);
+			add_file_dep(path, false);
 			fprintf(stderr, "[FILE] access: %s\n", path);
 		} else {
 			g_free(path);
@@ -275,8 +317,8 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 	} else if (num == 307) { //faccessat
 		char *path = read_guest_string(a2);
 		if (path && *path && is_valid_path(path)) {
-			file_deps = g_list_append(file_deps, path);
-			fprintf(stderr, "[FILE] access: %s\n", path);
+			add_file_dep(path, false);
+			fprintf(stderr, "[FILE] faccessat: %s\n", path);
 		} else {
 			g_free(path);
 		}
@@ -421,6 +463,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
 	
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);
+	file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
 
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
 	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
