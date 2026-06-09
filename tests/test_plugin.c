@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <qemu-plugin.h>
+#include "dta.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -24,6 +25,10 @@ typedef struct {
 } page_t;
 
 static GHashTable *pages = NULL;
+static ShadowMemory *g_shadow = NULL;
+static bool oep_found = false;
+static uint64_t oep_addr = 0;
+static __thread uint64_t g_current_ip = 0;
 
 gint compare_keys(gconstpointer a, gconstpointer b) {
 	uint64_t addr_a = (uint64_t)(uintptr_t)a;
@@ -107,7 +112,16 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 	return f;
 }
 
-static uint64_t oep_addr = 0;
+static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
+	shadow_taint_byte(g_shadow, vaddr, g_current_ip);
+
+	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) (vaddr & ~(page_size - 1)));
+	if (p) {
+		p->written = true;
+		p->write_count++;
+		p->last_write = g_current_ip;
+	}
+}
 
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
@@ -245,31 +259,27 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t vaddr = (uint64_t)(uintptr_t) udata;
 	uint64_t page = vaddr & ~(page_size - 1);
+	g_current_ip = vaddr;
+	
+	if (oep_found) return;
+	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
+	if (p && (p->prot & 0x4) && shadow_page_has_taint(g_shadow, g_current_ip)) {
+		if (shadow_is_tainted(g_shadow, vaddr)) {
+			oep_found = true;
+			oep_addr = g_current_ip;
+			char buf[256];
+			snprintf(buf, sizeof(buf), "[OEP] Detected at 0x%lx\n", g_current_ip);
+			qemu_plugin_outs(buf);
+			do_dump(oep_addr);
+		}
+	}
+
 	
 	if (oep_addr != 0) return;
-	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
 	if (p && ((p->written && (p->prot & 0x4)) || p->exec_after_write)) {
 		oep_addr = vaddr;
 		fprintf(stderr, "[OEP] 0x%lx\n", oep_addr);
 		do_dump(oep_addr);
-	}
-}
-
-static void vcpu_mem(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *udata) {
-	if (qemu_plugin_mem_is_store(info)) {
-		page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)(vaddr & ~(page_size - 1)));
-		uint64_t pg = vaddr & ~(page_size - 1);
-		if (p) {
-			p->written = true;
-			p->write_count++;
-			p->last_write = vaddr;
-		} else {
-			page_t *np = g_new0(page_t, 1);
-			np->written = true;
-			np->write_count = 1;
-			np->last_write = vaddr;
-			g_hash_table_insert(pages, (gpointer)(uintptr_t)(vaddr & ~(page_size - 1)), np);
-		}
 	}
 }
 
@@ -438,7 +448,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 		struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
 		uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
 		qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec, QEMU_PLUGIN_CB_NO_REGS, (gpointer)(uintptr_t)vaddr);
-		qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_W, NULL);
+		qemu_plugin_register_vcpu_mem_cb(insn, on_mem_write, QEMU_PLUGIN_MEM_W, QEMU_PLUGIN_CB_NO_REGS, NULL);
 	}
 }
 
@@ -461,6 +471,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 		return -1;
 	}
 	fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
+
+	g_shadow = shadow_create(32);
+	if (!g_shadow) {
+		return -1;
+	}
 	
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);
 	file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
