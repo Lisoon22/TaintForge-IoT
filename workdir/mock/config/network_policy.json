@@ -8,9 +8,18 @@
       "remote_ip": "185.62.190.0",
       "remote_port": 48101,
       "domain": null,
-      "bind_ip": "127.0.0.1",
+      "bind_ip": "10.10.0.1",
       "bind_port": 48101,
       "protocol_hint": "c2_binary"
     }
-  ]
+  ],
+  "catch_all": {
+    "enabled": true,
+    "tcp_bind_ip": "127.0.0.1",
+    "tcp_bind_port": 40000,
+    "udp_enabled": true,
+    "udp_bind_ip": "127.0.0.1",
+    "udp_bind_port": 40001,
+    "unknown_policy": "transparent_redirect_and_log"
+  }
 }

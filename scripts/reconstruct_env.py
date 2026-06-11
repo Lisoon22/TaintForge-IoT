@@ -11,6 +11,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--taint", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--disable-catch-all", action="store_true")
+    parser.add_argument("--catch-all-port", type=int, default=40000)
     parser.add_argument("--bind-ip", default="127.0.0.1")
     args = parser.parse_args()
 
@@ -27,7 +29,9 @@ def main():
 
     fs_generator.generate(taint.file_dependencies)
 
-    network_policy = build_network_policy(taint=taint, mode = "local_test", default_bind_ip = args.bind_ip)
+    check_bind_availability = args.bind_ip in {"127.0.0.1", "localhost"}
+
+    network_policy = build_network_policy(taint=taint, mode="local_test", default_bind_ip=args.bind_ip, check_bind_availability=check_bind_availability, enable_catch_all=not args.disable_catch_all, catch_all_port=args.catch_all_port)
 
     network_policy_path = config_dir / "network_policy.json"
     save_network_policy(network_policy, network_policy_path)
