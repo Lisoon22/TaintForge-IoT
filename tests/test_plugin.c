@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <qemu-plugin.h>
 #include "dta.h"
+#include <capstone/capstone.h>
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -29,6 +30,7 @@ static ShadowMemory *g_shadow = NULL;
 static bool oep_found = false;
 static uint64_t oep_addr = 0;
 static __thread uint64_t g_current_ip = 0;
+static csh cs_handle;
 
 gint compare_keys(gconstpointer a, gconstpointer b) {
 	uint64_t addr_a = (uint64_t)(uintptr_t)a;
@@ -241,10 +243,13 @@ static void do_dump(uint64_t oep) {
 
 
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
+	//emergency dump
 	if (oep_addr == 0) {
         	fprintf(stderr, "[EXIT] No OEP detected, dumping all exec pages\n");
         	do_dump(0);
 	}
+
+	//memory free
 	for (GList *l = file_deps; l; l = l->next) {
 		file_dep_t *f = (file_dep_t*)l->data;
 		g_free(f->path);
@@ -254,6 +259,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	g_list_free_full(lib_deps, g_free);
 	g_list_free_full(net_deps, g_free);
 	g_hash_table_destroy(file_fd);
+	
+	//capstone handle
+	cs_close(&cs_handle);
+	meta_free();
 }
 
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
@@ -261,7 +270,10 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t page = vaddr & ~(page_size - 1);
 	g_current_ip = vaddr;
 	
+	InsnMeta *meta = meta_lookup(vaddr);
+	
 	if (oep_found) return;
+	//DTA
 	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
 	if (p && (p->prot & 0x4) && shadow_page_has_taint(g_shadow, g_current_ip)) {
 		if (shadow_is_tainted(g_shadow, vaddr)) {
@@ -274,7 +286,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		}
 	}
 
-	
+	//HEURISTICS
 	if (oep_addr != 0) return;
 	if (p && ((p->written && (p->prot & 0x4)) || p->exec_after_write)) {
 		oep_addr = vaddr;
@@ -447,8 +459,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 	for (size_t i = 0; i < n_insns; i++) {
 		struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
 		uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
+		size_t size = qemu_plugin_insn_size(insn);
+		uint8_t *bytes = g_malloc(size);
+		size_t copied = qemu_plugin_insn_data(insn, (char*)bytes, size);
+
+		//capstone
+		InsnMeta *meta = meta_decode(bytes, copied, vaddr, cs_handle);
+		if (meta) meta_store(vaddr, meta);
+		g_free(bytes);
+
+		//callbacks
 		qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec, QEMU_PLUGIN_CB_NO_REGS, (gpointer)(uintptr_t)vaddr);
-		qemu_plugin_register_vcpu_mem_cb(insn, on_mem_write, QEMU_PLUGIN_MEM_W, QEMU_PLUGIN_CB_NO_REGS, NULL);
+		qemu_plugin_register_vcpu_mem_cb(insn, on_mem_write, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_W, NULL);
 	}
 }
 
@@ -459,7 +481,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
     int argc, char **argv)
 {
 	const char *target = info->target_name;
-
+	
+	//arch choose
 	if (strstr(target, "i386")) {
 		current_arch = ARCH_X86_32;
 	} else if (strstr(target, "arm")) {
@@ -472,17 +495,29 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	}
 	fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
 
+	//shadow mem init
 	g_shadow = shadow_create(32);
 	if (!g_shadow) {
 		return -1;
 	}
 	
+	//capstone initialization
+	if (cs_open(CS_ARCH_X86, CS_MODE_32, &cs_handle) != CS_ERR_OK) {
+		fprintf(stderr, "[PLUGIN] Capstone init failed\n");
+		return -1;
+	}
+	cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
+	meta_init();
+
+	//needed hashtables
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);
 	file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
-
+	
+	//callback funcs
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
 	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
 	
+	//exit
 	qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
 	return 0;
