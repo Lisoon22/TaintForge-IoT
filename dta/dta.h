@@ -47,7 +47,7 @@ void reg_taint_clear(RegShadow *rs, RegId rid, uint8_t byte_mask);
 bool reg_is_tainted(RegShadow *rs, RegId rid, uint8_t byte_mask);
 
 void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, RegId src, uint8_t src_mask);
-void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2);
+void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2, uint16_t insn_id);
 void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, bool mem_tainted);
 void reg_propagate_clear(RegShadow *rs, RegId dst);
 

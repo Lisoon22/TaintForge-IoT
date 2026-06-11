@@ -64,6 +64,68 @@ bool shadow_page_has_taint(ShadowMemory *sm, uint64_t addr) { //TODO optimize
 	return false;
 }
 
+void reg_taint_set(RegShadow *rs, RegId rid, uint8_t byte_mask, uint64_t ip) {
+	for (int i = 0; i < MAX_REG_BYTES; i++) {
+		if (byte_mask & (1U << i)) rs->bytes[rid][i] = true;
+	}
+	rc->src_ip[rid] = ip;
+}
+
+void reg_taint_clear(RegShadow *rs, RegId rid, uint8_t byte_mask) {
+	for (int i = 0; i < MAX_REG_BYTES; i++) {
+		if (byte_mask & (1U << i)) rs->bytes[rid][i] = false;
+	}
+}
+
+bool reg_is_tainted(RegShadow *rs, RegId rid, uint8_t byte_mask) {
+	for (int i = 0; i < MAX_REG_BYTES; i++) {
+		if ((byte_mask & (1U << i)) && rs->bytes[rid][i]) return true;
+	}
+}
+
+void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, RegId src, uint8_t src_mask) { //TODO limitations for partial regs al<-bh, movzx, xor 
+	for (int i = 0; i < MAX_REG_BYTES; i++) {
+		if (dst_mask & (1U << i)) {
+			if (src_mask & (1U << i)) {
+				rs->bytes[dst][i] = rs->bytes[src][i];
+			} else {
+				rs->bytes[dst][i] = false;
+			}
+		}
+	}
+}
+
+void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2, uint16_t insn_id) {
+	if (dst < 0 || dst >= REG_COUNT || src1 < 0 || src1 >= REG_COUNT) return;
+	if ((insn_id == X86_INS_SUB || insn_id == X86_INS_XOR) && dst == src1 && src1 == src2) {
+		reg_taint_clear(rs, dst, 0x0F);
+		return;
+	}
+	if (src2 >= 0 && src2 < REG_COUNT) {
+		for (int i = 0; i < MAX_REG_BYTES; i++) {
+			rs->bytes[dst][i] = rs->bytes[src1][i] || rs->bytes[src2][i];	
+		} 
+	} else {
+		for (int i = 0; i < MAX_REG_BYTES; i++) {
+			rs->bytes[dst][i] = rs->bytes[src1][i];
+		}
+	}
+}
+
+//mem2mem
+
+void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, bool mem_tainted) {
+	for (int i = 0; i < MAX_REG_BYTES; i++) {
+		if (dst_mask & (1U << i)) {
+			rs->bytes[dst][i] = mem_tainted;
+		}
+	}
+}
+
+void reg_propagate_clear(RegShadow *rs, RegId rid) {
+	for (int i = 0; i < MAX_REG_BYTES; i++) rs->bytes[rid][i] = false;
+}
+
 static int x86_reg_to_regid(x86_reg reg) {
 	switch (reg) {
 		case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: case X86_REG_AH:
