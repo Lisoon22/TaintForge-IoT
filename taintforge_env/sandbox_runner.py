@@ -65,8 +65,8 @@ echo "[+] Command inside chroot: {exec_part}"
 # Resource limits.
 ulimit -t 30       # CPU seconds
 ulimit -v 262144   # virtual memory in KB: 256 MB
-ulimit -n 64       # max open files
-ulimit -u 64       # max processes
+ulimit -n 256       # max open files
+ulimit -u 512       # max processes
 ulimit -f 10240    # max file size blocks
 
 # Important:

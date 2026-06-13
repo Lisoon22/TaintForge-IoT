@@ -1,0 +1,6 @@
+[self-test] TCP known -> 185.62.190.0:48101
+[self-test] TCP known response=00000000
+[self-test] TCP unknown -> 91.200.10.5:5555
+[self-test] TCP unknown response=4f4b0a
+[self-test] UDP generic -> 1.2.3.4:9999
+[self-test] UDP dns-like -> 8.8.8.8:53

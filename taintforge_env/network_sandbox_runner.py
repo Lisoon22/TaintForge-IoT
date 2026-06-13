@@ -168,11 +168,13 @@ run_sample() {{
   echo "[+] Namespace=$NS"
   echo "[+] Command inside chroot: {exec_part}"
 
-  ulimit -t 30
-  ulimit -v 262144
-  ulimit -n 64
-  ulimit -u 64
-  ulimit -f 10240
+    # Resource limits are intentionally not applied here in Orchestrator v1.
+  # Applying ulimit before sudo/ip/chroot also limits wrapper processes and
+  # can break fork/exec before the sample starts.
+  #
+  # Later this should be replaced with cgroups/prlimit/seccomp applied only
+  # to the malware process tree.
+
 
   timeout --kill-after=5s {config.timeout_seconds}s \\
     sudo ip netns exec "$NS" \\

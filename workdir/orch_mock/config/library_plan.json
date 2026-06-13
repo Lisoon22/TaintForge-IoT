@@ -1,0 +1,37 @@
+{
+  "requirements": [
+    {
+      "name": "ld-linux-x86-64.so.2",
+      "kind": "interpreter",
+      "guest_path": "/lib64/ld-linux-x86-64.so.2",
+      "sources": [
+        "elf_interpreter"
+      ]
+    },
+    {
+      "name": "libc.so.6",
+      "kind": "needed",
+      "guest_path": null,
+      "sources": [
+        "elf_needed",
+        "taint_library_dependencies"
+      ]
+    },
+    {
+      "name": "libcap.so.2",
+      "kind": "needed",
+      "guest_path": null,
+      "sources": [
+        "elf_needed"
+      ]
+    },
+    {
+      "name": "libpthread.so.0",
+      "kind": "runtime_library",
+      "guest_path": null,
+      "sources": [
+        "taint_library_dependencies"
+      ]
+    }
+  ]
+}

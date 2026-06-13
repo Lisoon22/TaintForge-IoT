@@ -47,16 +47,25 @@ def analyze_elf(path: str | Path, arch_hint: str) -> ELFInfo:
 
     return ELFInfo(path=str(path), arch_hint=arch_hint, is_dynamic=is_dynamic, interpreter=interpreter, needed_libraries=needed_libraries)
 
-def parse_interpreter(readelf_l_output: str) -> Optional[str]: 
+def parse_interpreter(readelf_l_output: str) -> Optional[str]:
     for line in readelf_l_output.splitlines():
         if "Requesting program interpreter" not in line:
             continue
 
         match = re.search(r"\[(.*?)\]", line)
-        if match:
-            return match.group(1).strip()
+        if not match:
+            continue
+
+        value = match.group(1).strip()
+
+        prefix = "Requesting program interpreter:"
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+
+        return value
 
     return None
+   
 
 def parse_needed_libraries(readelf_d_output: str) -> list[str]:
     needed: list[str] = []

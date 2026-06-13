@@ -45,7 +45,7 @@ class LibraryResolver:
             resolved = self.resolve_requirement(requirement)
 
             if resolved is None:
-                report.missing.append(MissingLibraryP(name=requirement.name, kind=requirement.kind, guest_path=requirement.guest_path, sources=requirement.sources))
+                report.missing.append(MissingLibrary(name=requirement.name, kind=requirement.kind, guest_path=requirement.guest_path, sources=requirement.sources))
                 continue
 
             self.copy_resolved_library(resolved)
