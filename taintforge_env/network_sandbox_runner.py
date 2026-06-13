@@ -175,16 +175,56 @@ run_sample() {{
   # Later this should be replaced with cgroups/prlimit/seccomp applied only
   # to the malware process tree.
 
+  STATUS_PATH="$LOG_DIR/runtime_status.json"
+  STDOUT_PATH="$LOG_DIR/runtime_stdout.log"
+  STDERR_PATH="$LOG_DIR/runtime_stderr.log"
 
-  timeout --kill-after=5s {config.timeout_seconds}s \\
-    sudo ip netns exec "$NS" \\
-      chroot "$ROOTFS" {exec_part} \\
-    > "$LOG_DIR/runtime_stdout.log" \\
-    2> "$LOG_DIR/runtime_stderr.log"
+  START_EPOCH="$(date +%s)"
+  START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+  set +e
+  timeout --kill-after=5s {config.timeout_seconds}s \
+    sudo ip netns exec "$NS" \
+      chroot "$ROOTFS" {exec_part} \
+    > "$STDOUT_PATH" \
+    2> "$STDERR_PATH"
+  EXIT_CODE="$?"
+  set -e
+
+  END_EPOCH="$(date +%s)"
+  END_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  DURATION_SECONDS="$((END_EPOCH - START_EPOCH))"
+
+  TIMED_OUT=false
+  if [ "$EXIT_CODE" -eq 124 ] || [ "$EXIT_CODE" -eq 137 ]; then
+    TIMED_OUT=true
+  fi
+
+  cat > "$STATUS_PATH" <<EOF
+{{
+  "command": "sudo ip netns exec $NS chroot $ROOTFS {exec_part}",
+  "namespace": "$NS",
+  "rootfs": "$ROOTFS",
+  "guest_command": "{exec_part}",
+  "exit_code": $EXIT_CODE,
+  "timed_out": $TIMED_OUT,
+  "timeout_seconds": {config.timeout_seconds},
+  "started_at_utc": "$START_UTC",
+  "finished_at_utc": "$END_UTC",
+  "duration_seconds": $DURATION_SECONDS,
+  "stdout_path": "$STDOUT_PATH",
+  "stderr_path": "$STDERR_PATH"
+}}
+EOF
 
   echo "[+] Finished"
-  echo "[+] stdout: $LOG_DIR/runtime_stdout.log"
-  echo "[+] stderr: $LOG_DIR/runtime_stderr.log"
+  echo "[+] exit code: $EXIT_CODE"
+  echo "[+] timed out: $TIMED_OUT"
+  echo "[+] status: $STATUS_PATH"
+  echo "[+] stdout: $STDOUT_PATH"
+  echo "[+] stderr: $STDERR_PATH"
+
+  return "$EXIT_CODE"
 }}
 
 case "${{1:-run}}" in
