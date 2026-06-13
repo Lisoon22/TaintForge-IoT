@@ -68,7 +68,7 @@ void reg_taint_set(RegShadow *rs, RegId rid, uint8_t byte_mask, uint64_t ip) {
 	for (int i = 0; i < MAX_REG_BYTES; i++) {
 		if (byte_mask & (1U << i)) rs->bytes[rid][i] = true;
 	}
-	rc->src_ip[rid] = ip;
+	rs->src_ip[rid] = ip;
 }
 
 void reg_taint_clear(RegShadow *rs, RegId rid, uint8_t byte_mask) {

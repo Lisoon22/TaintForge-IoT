@@ -31,6 +31,7 @@ static bool oep_found = false;
 static uint64_t oep_addr = 0;
 static __thread uint64_t g_current_ip = 0;
 static csh cs_handle;
+static RegShadow reg_shadow;
 
 gint compare_keys(gconstpointer a, gconstpointer b) {
 	uint64_t addr_a = (uint64_t)(uintptr_t)a;
@@ -265,34 +266,102 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	meta_free();
 }
 
+static int mask_first_reg(uint32_t mask) {
+	for (int i = 0; i < REG_COUNT; i++) {
+		if (mask & (1U << i)) return i;
+	}
+	return -1;
+}
+
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t vaddr = (uint64_t)(uintptr_t) udata;
-	uint64_t page = vaddr & ~(page_size - 1);
 	g_current_ip = vaddr;
 	
 	InsnMeta *meta = meta_lookup(vaddr);
+	if (!meta) goto fallback_oep;
 	
-	if (oep_found) return;
-	//DTA
-	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
-	if (p && (p->prot & 0x4) && shadow_page_has_taint(g_shadow, g_current_ip)) {
-		if (shadow_is_tainted(g_shadow, vaddr)) {
-			oep_found = true;
-			oep_addr = g_current_ip;
-			char buf[256];
-			snprintf(buf, sizeof(buf), "[OEP] Detected at 0x%lx\n", g_current_ip);
-			qemu_plugin_outs(buf);
-			do_dump(oep_addr);
+	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
+	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
+		int reg = mask_first_reg(meta->regs_written_mask);
+		if (reg >= 0) reg_propagate_clear(&reg_shadow, reg);
+		goto check_oep;
+	}
+	//if const have been changed we will see at mem_taint
+	if (meta->regs_read_mask == 0 && meta->regs_written_mask != 0 && !meta->has_mem_read && !meta->has_mem_write) {
+		int dst = mask_first_reg(meta->regs_written_mask);
+		if (dst >= 0) reg_propagate_clear(&reg_shadow, dst);
+		goto check_oep;
+	}
+	// lea with two registers
+	if (meta->insn_id == X86_INS_LEA) {
+		int dst = mask_first_reg(meta->regs_written_mask);
+		int src = mask_first_reg(meta->regs_read_mask);
+		if (dst >= 0 && src >= 0) {
+			propagate_reg2reg(&reg_shadow, dst, 0x0F, src, 0x0F);
+		}
+		goto check_oep;
+	}
+	//mem2reg
+	if (meta->has_mem_read && meta->regs_written_mask) {
+		int dst = mask_first_reg(meta->regs_written_mask);
+		if (dst >= 0) {
+			propagate_mem2reg(&reg_shadow, dst, 0x0F, true);
 		}
 	}
-
-	//HEURISTICS
-	if (oep_addr != 0) return;
-	if (p && ((p->written && (p->prot & 0x4)) || p->exec_after_write)) {
-		oep_addr = vaddr;
-		fprintf(stderr, "[OEP] 0x%lx\n", oep_addr);
-		do_dump(oep_addr);
+	int num_src_regs = __builtin_popcount(meta->regs_read_mask);
+	//reg2reg, count 1 in bytes representation, TODO add al, ah resolve
+	if (num_src_regs == 1 && meta->regs_written_mask) {
+		int src = mask_first_reg(meta->regs_read_mask);
+		int dst = mask_first_reg(meta->regs_written_mask);
+		if (src >= 0 && dst >= 0) {
+			propagate_reg2reg(&reg_shadow, dst, 0x0F, src, 0x0F);
+		}
+	} else if (num_src_regs >= 2 && meta->regs_written_mask) { //reg2reg with arith
+		int dst = mask_first_reg(meta->regs_written_mask);
+		int src1 = -1, src2 = -1;
+		for (int i = 0; i < REG_COUNT; i++) {
+			if (meta->regs_read_mask & (1U << i)) {
+				if (src1 < 0) {
+				       	src1 = i;
+				} else { 
+					src2 = i; 
+					break;
+				}
+			}
+		}
+		if (src1 >= 0 && dst >= 0) {
+			propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
+		}
 	}
+	check_oep:
+		if (meta->is_indirect_branch && !oep_found) { //indirect check
+			bool target_tainted = false;
+			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) { //on reg
+				target_tainted = reg_is_tainted(&reg_shadow, meta->branch_target_reg, 0x0F);
+			} else if (meta->branch_target_reg == REG_INVALID) { // on mem with reg, like [eax]
+				target_tainted = shadow_page_has_taint(g_shadow, vaddr);
+			}
+			if (target_tainted) {
+				uint64_t page = vaddr & ~(page_size - 1);
+				page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
+				if (p && (p->prot & 0x4)) {
+					oep_found = true;
+					oep_addr = vaddr;
+					fprintf(stderr, "[OEP-REG] 0x%lx\n", vaddr);
+					do_dump(oep_addr);
+					return;
+				}
+			}
+		}
+	fallback_oep: //enough for direct jumps, TODO mb add direct jump sink
+		if (oep_addr != 0) return;
+		uint64_t page = vaddr & ~(page_size - 1);
+		page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
+		if (p && ((p->written && (p->prot & 0x4)) || p->exec_after_write)) {
+			oep_addr = vaddr;
+			fprintf(stderr, "[OEP-LEGACY] 0x%lx\n", oep_addr);
+			do_dump(oep_addr);
+		}
 }
 
 static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
@@ -501,6 +570,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 		return -1;
 	}
 	
+	//register taint handler
+	memset(&reg_shadow, 0, sizeof(reg_shadow));
 	//capstone initialization
 	if (cs_open(CS_ARCH_X86, CS_MODE_32, &cs_handle) != CS_ERR_OK) {
 		fprintf(stderr, "[PLUGIN] Capstone init failed\n");
