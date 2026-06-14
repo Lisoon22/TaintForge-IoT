@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import textwrap
 import json
 import os
 import shutil
@@ -53,6 +53,22 @@ class Phase2Orchestrator:
 
         self.processes: list[subprocess.Popen] = []
 
+
+    def parse_strace_logs(self) -> None:
+        print("[+] Parsing strace logs")
+
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/parse_strace.py",
+                "--log-dir",
+                str(self.logs_dir),
+                "--out",
+                str(self.logs_dir / "syscall_events.jsonl"),
+            ],
+            check=False,
+        )
+
     def run(self) -> None:
         self.print_header()
 
@@ -83,6 +99,8 @@ class Phase2Orchestrator:
                 self.run_network_self_test()
 
             self.run_sample()
+            self.parse_strace_logs()
+            self.generate_report()
 
             self.print_run_summary()
 
@@ -113,6 +131,7 @@ class Phase2Orchestrator:
             "ss",
             "sudo",
             "conntrack",
+            "strace"
         ]
 
         missing = [tool for tool in required if shutil.which(tool) is None]
@@ -538,79 +557,82 @@ class Phase2Orchestrator:
 
         self.validate_network_self_test_events(test_config)
 
+
     @staticmethod
     def build_network_self_test_code(test_config: dict) -> str:
         config_json = json.dumps(test_config)
 
-        return f"""
-import json
-import socket
-import sys
-import time
+        return textwrap.dedent(
+            f"""
+            import json
+            import socket
+            import time
 
-config = json.loads({config_json!r})
-
-
-def tcp_test(name, host, port, payload):
-    print(f"[self-test] TCP {{name}} -> {{host}}:{{port}}")
-    sock = socket.create_connection((host, port), timeout=3)
-
-    try:
-        sock.sendall(payload)
-        sock.settimeout(3)
-        response = sock.recv(1024)
-        print(f"[self-test] TCP {{name}} response={{response.hex()}}")
-    finally:
-        sock.close()
+            config = json.loads({config_json!r})
 
 
-def udp_test(name, host, port, payload):
-    print(f"[self-test] UDP {{name}} -> {{host}}:{{port}}")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            def tcp_test(name, host, port, payload):
+                print(f"[self-test] TCP {{name}} -> {{host}}:{{port}}")
+                sock = socket.create_connection((host, port), timeout=3)
 
-    try:
-        sock.sendto(payload, (host, port))
-    finally:
-        sock.close()
+                try:
+                    sock.sendall(payload)
+                    sock.settimeout(3)
+                    response = sock.recv(1024)
+                    print(f"[self-test] TCP {{name}} response={{response.hex()}}")
+                finally:
+                    sock.close()
 
 
-known = config.get("known_target")
-if known is not None:
-    tcp_test(
-        "known",
-        known["ip"],
-        int(known["port"]),
-        b"known-self-test",
-    )
-else:
-    print("[self-test] No known TCP target in policy; skipping known TCP test")
+            def udp_test(name, host, port, payload):
+                print(f"[self-test] UDP {{name}} -> {{host}}:{{port}}")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-unknown = config["unknown_tcp_target"]
-tcp_test(
-    "unknown",
-    unknown["ip"],
-    int(unknown["port"]),
-    b"unknown-self-test",
-)
+                try:
+                    sock.sendto(payload, (host, port))
+                finally:
+                    sock.close()
 
-udp = config["udp_target"]
-udp_test(
-    "generic",
-    udp["ip"],
-    int(udp["port"]),
-    b"udp-self-test",
-)
 
-dns = config["dns_target"]
-udp_test(
-    "dns-like",
-    dns["ip"],
-    int(dns["port"]),
-    b"\\x12\\x34fake-dns-query",
-)
+            known = config.get("known_target")
+            if known is not None:
+                tcp_test(
+                    "known",
+                    known["ip"],
+                    int(known["port"]),
+                    b"known-self-test",
+                )
+            else:
+                print("[self-test] No known TCP target in policy; skipping known TCP test")
 
-time.sleep(0.2)
-"""
+            unknown = config["unknown_tcp_target"]
+            tcp_test(
+                "unknown",
+                unknown["ip"],
+                int(unknown["port"]),
+                b"unknown-self-test",
+            )
+
+            udp = config["udp_target"]
+            udp_test(
+                "generic",
+                udp["ip"],
+                int(udp["port"]),
+                b"udp-self-test",
+            )
+
+            dns = config["dns_target"]
+            udp_test(
+                "dns-like",
+                dns["ip"],
+                int(dns["port"]),
+                b"\\x12\\x34fake-dns-query",
+            )
+
+            time.sleep(0.2)
+            """
+        ).strip()
+
 
     def validate_network_self_test_events(self, test_config: dict) -> None:
         print("[+] Validating network self-test events")
@@ -786,6 +808,19 @@ time.sleep(0.2)
         print(f"[+] runtime:            {self.runtime_path}")
         print(f"[+] network runner:     {self.network_runner_path}")
 
+
+    def generate_report(self) -> None:
+        print("[+] Generating run report")
+
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/generate_report.py",
+                "--out",
+                str(self.config.out_dir),
+            ]
+        )
+
     def print_run_summary(self) -> None:
         print()
         print("[+] Run finished")
@@ -802,6 +837,8 @@ time.sleep(0.2)
             print("[!] No network_events.jsonl produced")
 
         print("[+] Useful files:")
+        print(f"    report json: {self.config.out_dir / 'report.json'}")
+        print(f"    report md: {self.config.out_dir / 'report.md'}")
         print(f"    runtime stdout: {self.logs_dir / 'runtime_stdout.log'}")
         print(f"    runtime stderr: {self.logs_dir / 'runtime_stderr.log'}")
         print(f"    transparent logger stdout: {self.logs_dir / 'transparent_logger_stdout.log'}")
@@ -886,9 +923,7 @@ time.sleep(0.2)
         )
 
         if check and result.returncode != 0:
-            raise OrchestratorError(
-                "Command failed with exit code {result.returncode}: {' '.join(cmd)}"
-            )
+            raise OrchestratorError(f"Command failed with exit code {result.returncode}: {' '.join(cmd)}")
 
         return result
 
