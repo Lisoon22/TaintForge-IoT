@@ -44,9 +44,14 @@ gint compare_keys(gconstpointer a, gconstpointer b) {
 static arch_t current_arch = ARCH_UNKNOWN;
 
 typedef struct {
-    char *path;
-    bool write;
+	char *path;
+	bool write;
 } file_dep_t;
+typedef struct {
+	char *path;
+	uint64_t base;
+	uint64_t size;
+} lib_mapping_t;
 static GList *file_deps = NULL;
 static GList *net_deps = NULL;
 static GList *lib_deps = NULL;
@@ -108,9 +113,14 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 	file_deps = g_list_append(file_deps, f);
 	if (is_lib && !strstr(path, ".cache")) {
 		for (GList *l = lib_deps; l; l = l->next) {
-			if (strcmp((char*)l->data, path) == 0) return f;
+			lib_mapping_t *lm = (lib_mapping_t*)l->data;
+			if (lm->path && strcmp(lm->path, path) == 0) return f;
 		}
-		lib_deps = g_list_append(lib_deps, g_strdup(path));
+		lib_mapping_t *lm = g_new0(lib_mapping_t, 1);
+		lm->path = g_strdup(path);
+		lm->base = 0;
+		lm->size = 0;
+		lib_deps = g_list_append(lib_deps, lm);
 	}
 	return f;
 }
@@ -205,10 +215,10 @@ static void do_dump(uint64_t oep) {
 	fprintf(f_json, "  \"library_dependencies\": [");
 	first = true;
 	for (GList *l = lib_deps; l; l = l->next) {
-		const char *path = (char*)l->data;
-		if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		if (!lm->path || !*lm->path || *lm->path != '/' || !is_valid_path(lm->path)) continue;
 		if (!first) fprintf(f_json, ", ");
-		fprintf(f_json, "\"%s\"", (char*)l->data);
+		fprintf(f_json, "{\"path\": \"%s\", \"base\": \"0x%lx\", \"size\": %lu}", lm->path, lm->base, lm->size);
 		first = false;
 	}
 	fprintf(f_json, "],\n");
@@ -257,7 +267,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 		g_free(f);
 	}
 	g_list_free(file_deps);
-	g_list_free_full(lib_deps, g_free);
+	for (GList *l = lib_deps; l; l = l->next) {
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		g_free(lm->path);
+		g_free(lm);
+	}	
+	g_list_free(lib_deps);
 	g_list_free_full(net_deps, g_free);
 	g_hash_table_destroy(file_fd);
 	
@@ -460,6 +475,29 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
 				}
 			}
+			if (a5 > 0) { //fd check
+				gpointer val = g_hash_table_lookup(file_fd, (gpointer)(uintptr_t)a5);
+				if (val) {
+					file_dep_t *f = (file_dep_t*)val;
+					for (GList *l = lib_deps; l; l = l->next) {
+						lib_mapping_t *lm = (lib_mapping_t*)l->data;
+						if (f->path && strcmp(lm->path, f->path) == 0) {
+							lm->base = a1;
+							lm->size = a2;
+							break;
+						}
+					}
+				} else { // fallback if fd was open before check
+					for (GList *l = lib_deps; l; l = l->next) {
+						lib_mapping_t *lm = (lib_mapping_t*)l->data;
+						if (lm->base == 0) {
+							lm->base = a1;
+							lm->size = a2;
+							break;
+						}
+					}
+				}
+			}
 		}
 	} else if (num == 90) { //mmap
 		GByteArray *buf = g_byte_array_new();
@@ -483,6 +521,29 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 						page_t *np = g_new0(page_t, 1);
 						np->prot = prot;
 						g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
+					}
+				}
+				if (fd > 0){
+					gpointer val = g_hash_table_lookup(file_fd, (gpointer)(uintptr_t) fd);
+					if (val) {
+						file_dep_t *f = (file_dep_t*)val;
+						for (GList *l = lib_deps; l; l = l->next) {
+							lib_mapping_t *lm = (lib_mapping_t*)l->data;
+							if (f->path && strcmp(lm->path, f->path) == 0) {
+								lm->base = addr;
+								lm->size = size;
+								break;
+							}
+						}
+					}
+				} else {
+					for (GList *l = lib_deps; l; l = l->next) {
+						lib_mapping_t *lm = (lib_mapping_t*)l->data;
+						if (lm->base == 0) {
+							lm->base = addr;
+							lm->size = size;
+							break;
+						}
 					}
 				}
 			}
