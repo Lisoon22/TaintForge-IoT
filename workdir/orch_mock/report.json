@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-13T21:41:49.508790+00:00",
+  "generated_at_utc": "2026-06-14T14:01:19.299708+00:00",
   "out_dir": "workdir/orch_mock",
   "paths": {
     "runtime": "config/runtime.json",
@@ -7,6 +7,8 @@
     "library_plan": "config/library_plan.json",
     "library_resolution": "config/library_resolution.json",
     "network_events": "logs/network_events.jsonl",
+    "syscall_events": "logs/syscall_events.jsonl",
+    "syscall_summary": "logs/syscall_events.summary.json",
     "runtime_status": "logs/runtime_status.json",
     "runtime_stdout": "logs/runtime_stdout.log",
     "runtime_stderr": "logs/runtime_stderr.log",
@@ -38,11 +40,13 @@
       "exit_code": 0,
       "timed_out": false,
       "timeout_seconds": 60,
-      "started_at_utc": "2026-06-13T21:41:49Z",
-      "finished_at_utc": "2026-06-13T21:41:49Z",
+      "started_at_utc": "2026-06-14T14:01:19Z",
+      "finished_at_utc": "2026-06-14T14:01:19Z",
       "duration_seconds": 0,
       "stdout_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stdout.log",
-      "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log"
+      "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log",
+      "strace_enabled": true,
+      "strace_prefix": "/home/lisoon/taintforge/workdir/orch_mock/logs/strace"
     },
     "stdout_preview": "bin\ndev\netc\nlib\nlib64\nproc\ntmp\nusr\nvar\n",
     "stderr_preview": ""
@@ -180,6 +184,118 @@
       "8.8.8.8:53"
     ]
   },
+  "syscalls": {
+    "events_total": 60,
+    "by_syscall": {
+      "access": 2,
+      "chdir": 1,
+      "chroot": 1,
+      "execve": 2,
+      "exit": 1,
+      "exit_group": 1,
+      "mmap": 20,
+      "mprotect": 7,
+      "newfstatat": 2,
+      "openat": 17,
+      "readlink": 6
+    },
+    "by_category": {
+      "filesystem": 30,
+      "memory": 27,
+      "other": 2,
+      "process": 1
+    },
+    "by_context": {
+      "guest": 36,
+      "host_wrapper": 24
+    },
+    "paths": [
+      ".",
+      "/",
+      "/bin/unpacked.elf",
+      "/etc/ld.so.cache",
+      "/etc/ld.so.preload",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2",
+      "/usr/lib/libc.so.6",
+      "/usr/lib/libcap.so.2",
+      "/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US/LC_IDENTIFICATION",
+      "/usr/lib/locale/locale-archive",
+      "/usr/share/locale/locale.alias"
+    ],
+    "guest_paths": [
+      ".",
+      "/",
+      "/bin/unpacked.elf",
+      "/etc/ld.so.cache",
+      "/etc/ld.so.preload",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2",
+      "/usr/lib/libc.so.6",
+      "/usr/lib/libcap.so.2",
+      "/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US/LC_IDENTIFICATION",
+      "/usr/lib/locale/locale-archive",
+      "/usr/share/locale/locale.alias"
+    ],
+    "host_wrapper_paths": [
+      "/etc/ld.so.cache",
+      "/etc/ld.so.preload",
+      "/home",
+      "/home/lisoon",
+      "/home/lisoon/taintforge",
+      "/home/lisoon/taintforge/workdir",
+      "/home/lisoon/taintforge/workdir/orch_mock",
+      "/home/lisoon/taintforge/workdir/orch_mock/rootfs",
+      "/usr/bin/chroot",
+      "/usr/lib/libc.so.6",
+      "/usr/lib/locale/locale-archive"
+    ],
+    "all_paths": [
+      ".",
+      "/",
+      "/bin/unpacked.elf",
+      "/etc/ld.so.cache",
+      "/etc/ld.so.preload",
+      "/home",
+      "/home/lisoon",
+      "/home/lisoon/taintforge",
+      "/home/lisoon/taintforge/workdir",
+      "/home/lisoon/taintforge/workdir/orch_mock",
+      "/home/lisoon/taintforge/workdir/orch_mock/rootfs",
+      "/usr/bin/chroot",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/",
+      "/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/",
+      "/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2",
+      "/usr/lib/libc.so.6",
+      "/usr/lib/libcap.so.2",
+      "/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION",
+      "/usr/lib/locale/en_US/LC_IDENTIFICATION",
+      "/usr/lib/locale/locale-archive",
+      "/usr/share/locale/locale.alias"
+    ],
+    "network_targets": [],
+    "high_risk_count": 0,
+    "high_risk_events": []
+  },
   "artifacts": {
     "payload_count": 4,
     "payload_files": [
@@ -225,7 +341,7 @@
         "path": "logs/network_events.jsonl",
         "exists": true,
         "size_bytes": 4176,
-        "sha256": "db488d7c88ecfd985a5a08a8c953eb810c0e3c859d42fa0b1b94a631b94b6189"
+        "sha256": "276a8f9126ee6444058a09015ff4f02d97e0932f26c467d195b81fd03857399f"
       },
       {
         "path": "logs/network_self_test_stderr.log",
@@ -242,8 +358,8 @@
       {
         "path": "logs/runtime_status.json",
         "exists": true,
-        "size_bytes": 605,
-        "sha256": "69862b277bb7a17d59963cd0a53e94dc27868d81ba4948669f005aa5f2325be1"
+        "size_bytes": 707,
+        "sha256": "7f1ec2f6c9cff08190dec9081b7d84a77d09fb3b4aed640663d879244f0bf0e8"
       },
       {
         "path": "logs/runtime_stderr.log",
@@ -256,6 +372,24 @@
         "exists": true,
         "size_bytes": 39,
         "sha256": "2aadb2f74103af1f3914a0aedd0c023c5f566f4dbc7e5b8b5a9f8f9fe10639f7"
+      },
+      {
+        "path": "logs/strace.18037",
+        "exists": true,
+        "size_bytes": 5342,
+        "sha256": "65b2bbb463735338b1bce1a8cb0ef4f1f1898706ec1efafef679ff817c75416b"
+      },
+      {
+        "path": "logs/syscall_events.jsonl",
+        "exists": true,
+        "size_bytes": 30845,
+        "sha256": "00c759f04bf2fbb49e54869244bbad55266a1429eed7fa4992e3bed71d63aa2b"
+      },
+      {
+        "path": "logs/syscall_events.summary.json",
+        "exists": true,
+        "size_bytes": 3302,
+        "sha256": "45e30df414582bee5595d23fd6ecb258368179e5e64bd35f49760f4fc1f47536"
       },
       {
         "path": "logs/transparent_logger_stderr.log",

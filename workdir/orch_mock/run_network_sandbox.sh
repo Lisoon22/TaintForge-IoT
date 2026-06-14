@@ -120,9 +120,35 @@ run_sample() {
   START_EPOCH="$(date +%s)"
   START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
+    STRACE_PREFIX="$LOG_DIR/strace"
+  STRACE_ENABLED=false
+
+  if command -v strace >/dev/null 2>&1; then
+    STRACE_ENABLED=true
+  fi
+
   set +e
-  timeout --kill-after=5s 60s     sudo ip netns exec "$NS"       chroot "$ROOTFS" /bin/unpacked.elf     > "$STDOUT_PATH"     2> "$STDERR_PATH"
-  EXIT_CODE="$?"
+
+  if [ "$STRACE_ENABLED" = true ]; then
+    timeout --kill-after=5s 60s \
+      sudo ip netns exec "$NS" \
+        strace -ff \
+          -o "$STRACE_PREFIX" \
+          -s 256 \
+          -e trace=%file,%process,%network,ptrace,mmap,mprotect \
+          chroot "$ROOTFS" /bin/unpacked.elf \
+      > "$STDOUT_PATH" \
+      2> "$STDERR_PATH"
+    EXIT_CODE="$?"
+  else
+    timeout --kill-after=5s 60s \
+      sudo ip netns exec "$NS" \
+        chroot "$ROOTFS" /bin/unpacked.elf \
+      > "$STDOUT_PATH" \
+      2> "$STDERR_PATH"
+    EXIT_CODE="$?"
+  fi
+
   set -e
 
   END_EPOCH="$(date +%s)"
@@ -147,7 +173,9 @@ run_sample() {
   "finished_at_utc": "$END_UTC",
   "duration_seconds": $DURATION_SECONDS,
   "stdout_path": "$STDOUT_PATH",
-  "stderr_path": "$STDERR_PATH"
+  "stderr_path": "$STDERR_PATH",
+  "strace_enabled": $STRACE_ENABLED,
+  "strace_prefix": "$STRACE_PREFIX"
 }
 EOF
 
@@ -157,6 +185,8 @@ EOF
   echo "[+] status: $STATUS_PATH"
   echo "[+] stdout: $STDOUT_PATH"
   echo "[+] stderr: $STDERR_PATH"
+  echo "[+] strace enabled: $STRACE_ENABLED"
+  echo "[+] strace prefix: $STRACE_PREFIX"
 
   return "$EXIT_CODE"
 }

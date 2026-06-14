@@ -27,9 +27,106 @@ class RunReportGenerator:
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.network_events_path = self.logs_dir / "network_events.jsonl"
         self.runtime_status_path = self.logs_dir / "runtime_status.json"
+        self.syscall_events_path = self.logs_dir / "syscall_events.jsonl"
+        self.syscall_summary_path = self.logs_dir / "syscall_events.summary.json"
 
         self.report_json_path = self.out_dir / "report.json"
         self.report_md_path = self.out_dir / "report.md"
+
+    def build_syscalls_section(
+        self,
+        syscall_events: list[dict[str, Any]],
+        syscall_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        if syscall_summary:
+            return {
+                "events_total": syscall_summary.get("events_total", len(syscall_events)),
+                "by_syscall": syscall_summary.get("by_syscall", {}),
+                "by_category": syscall_summary.get("by_category", {}),
+                "by_context": syscall_summary.get("by_context", {}),
+                "paths": syscall_summary.get("paths", []),
+                "guest_paths": syscall_summary.get(
+                    "guest_paths",
+                    syscall_summary.get("paths", []),
+                ),
+                "host_wrapper_paths": syscall_summary.get("host_wrapper_paths", []),
+                "all_paths": syscall_summary.get("all_paths", []),
+                "network_targets": syscall_summary.get("network_targets", []),
+                "high_risk_count": syscall_summary.get("high_risk_count", 0),
+                "high_risk_events": syscall_summary.get("high_risk_events", []),
+            }
+
+        by_syscall = Counter(
+            str(event.get("syscall", "unknown"))
+            for event in syscall_events
+        )
+
+        by_category = Counter(
+            str(event.get("category", "unknown"))
+            for event in syscall_events
+        )
+
+        paths = sorted(
+            {
+                path
+                for event in syscall_events
+                for path in event.get("paths", [])
+                if path
+            }
+        )
+        guest_paths = sorted(
+            {
+                path
+                for event in syscall_events
+                if event.get("execution_context") == "guest"
+                for path in event.get("paths", [])
+                if path
+            }
+        )
+
+        host_wrapper_paths = sorted(
+            {
+                path
+                for event in syscall_events
+                if event.get("execution_context") == "host_wrapper"
+                for path in event.get("paths", [])
+                if path
+            }
+        )
+
+        by_context = Counter(
+            str(event.get("execution_context", "unknown"))
+            for event in syscall_events
+        )
+
+        network_targets = sorted(
+            {
+                f"{event.get('remote_ip')}:{event.get('remote_port')}"
+                for event in syscall_events
+                if event.get("remote_ip") is not None
+                and event.get("remote_port") is not None
+            }
+        )
+
+        high_risk_events = [
+            event
+            for event in syscall_events
+            if event.get("high_risk")
+        ]
+
+        return {
+            "events_total": len(syscall_events),
+            "by_syscall": dict(by_syscall),
+            "by_category": dict(by_category),
+            "paths": paths,
+            "network_targets": network_targets,
+            "high_risk_count": len(high_risk_events),
+            "high_risk_events": high_risk_events[:50],
+            "by_context": dict(by_context),
+            "guest_paths": guest_paths,
+            "host_wrapper_paths": host_wrapper_paths,
+            "all_paths": paths,
+        }
 
     def generate(self) -> dict[str, Any]:
         if not self.out_dir.exists():
@@ -41,6 +138,8 @@ class RunReportGenerator:
         library_resolution = self.load_json_optional(self.library_resolution_path)
         network_events = self.load_jsonl_optional(self.network_events_path)
         runtime_status = self.load_json_optional(self.runtime_status_path)
+        syscall_events = self.load_jsonl_optional(self.syscall_events_path)
+        syscall_summary = self.load_json_optional(self.syscall_summary_path)
 
         report = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -54,6 +153,10 @@ class RunReportGenerator:
             "network": self.build_network_section(
                 network_policy=network_policy,
                 network_events=network_events,
+            ),
+            "syscalls": self.build_syscalls_section(
+                syscall_events=syscall_events,
+                syscall_summary=syscall_summary,
             ),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
@@ -72,6 +175,8 @@ class RunReportGenerator:
             "library_plan": self.rel(self.library_plan_path),
             "library_resolution": self.rel(self.library_resolution_path),
             "network_events": self.rel(self.network_events_path),
+            "syscall_events": self.rel(self.syscall_events_path),
+            "syscall_summary": self.rel(self.syscall_summary_path),
             "runtime_status": self.rel(self.runtime_status_path),
             "runtime_stdout": self.rel(self.logs_dir / "runtime_stdout.log"),
             "runtime_stderr": self.rel(self.logs_dir / "runtime_stderr.log"),
@@ -267,6 +372,7 @@ class RunReportGenerator:
         runtime = report["runtime"]
         libraries = report["libraries"]
         network = report["network"]
+        syscalls = report["syscalls"]
         artifacts = report["artifacts"]
         security = report["security"]
         logs = report["logs"]
@@ -399,6 +505,97 @@ class RunReportGenerator:
         else:
             lines.append("- No network events recorded.")
         lines.append("")
+
+        lines.append("## Syscalls")
+        lines.append("")
+        lines.append(f"- Total syscall events: `{syscalls.get('events_total')}`")
+        lines.append(f"- High-risk events: `{syscalls.get('high_risk_count')}`")
+        lines.append("")
+
+        lines.append("### Syscalls by execution context")
+        lines.append("")
+        by_context = syscalls.get("by_context") or {}
+        if by_context:
+            for name, count in sorted(by_context.items()):
+                lines.append(f"- `{name}`: `{count}`")
+        else:
+            lines.append("- No execution context data recorded.")
+        lines.append("")
+
+
+        lines.append("### Syscalls by category")
+        lines.append("")
+        by_category = syscalls.get("by_category") or {}
+        if by_category:
+            for name, count in sorted(by_category.items()):
+                lines.append(f"- `{name}`: `{count}`")
+        else:
+            lines.append("- No syscall events recorded.")
+        lines.append("")
+
+        lines.append("### Top syscalls")
+        lines.append("")
+        by_syscall = syscalls.get("by_syscall") or {}
+        if by_syscall:
+            top_syscalls = sorted(
+                by_syscall.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:20]
+
+            for name, count in top_syscalls:
+                lines.append(f"- `{name}`: `{count}`")
+        else:
+            lines.append("- No syscall events recorded.")
+        lines.append("")
+
+        guest_paths = syscalls.get("guest_paths") or syscalls.get("paths") or []
+        lines.append("### Observed guest filesystem paths")
+        lines.append("")
+        if guest_paths:
+            for path in guest_paths[:50]:
+                lines.append(f"- `{path}`")
+            if len(guest_paths) > 50:
+                lines.append(f"- ... truncated, total guest paths: `{len(guest_paths)}`")
+        else:
+            lines.append("- No guest filesystem paths recorded.")
+        lines.append("")
+
+        host_wrapper_paths = syscalls.get("host_wrapper_paths") or []
+        lines.append("### Observed host wrapper paths before chroot")
+        lines.append("")
+        if host_wrapper_paths:
+            for path in host_wrapper_paths[:50]:
+                lines.append(f"- `{path}`")
+            if len(host_wrapper_paths) > 50:
+                lines.append(
+                    f"- ... truncated, total host wrapper paths: `{len(host_wrapper_paths)}`"
+                )
+        else:
+            lines.append("- No host wrapper paths recorded.")
+        lines.append("")
+        lines.append("")
+
+        high_risk = syscalls.get("high_risk_events") or []
+        lines.append("### High-risk syscall events")
+        lines.append("")
+        if high_risk:
+            lines.append("| Syscall | Result | Source | Raw |")
+            lines.append("|---|---|---|---|")
+
+            for event in high_risk[:20]:
+                raw = str(event.get("raw", "")).replace("|", "\\|")
+                lines.append(
+                    "| "
+                    f"`{event.get('syscall')}` | "
+                    f"`{event.get('result')}` | "
+                    f"`{event.get('source_file')}:{event.get('line_number')}` | "
+                    f"`{raw[:160]}` |"
+                )
+        else:
+            lines.append("- No high-risk syscall events recorded.")
+        lines.append("")
+
 
         lines.append("## Artifacts")
         lines.append("")

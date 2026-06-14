@@ -1,6 +1,6 @@
 # TaintForge-IoT Phase 2 Run Report
 
-Generated at UTC: `2026-06-13T21:41:49.508790+00:00`
+Generated at UTC: `2026-06-14T14:01:19.299708+00:00`
 Output directory: `workdir/orch_mock`
 
 ## Runtime
@@ -19,8 +19,8 @@ Output directory: `workdir/orch_mock`
 - Timed out: `False`
 - Timeout seconds: `60`
 - Duration seconds: `0`
-- Started at UTC: `2026-06-13T21:41:49Z`
-- Finished at UTC: `2026-06-13T21:41:49Z`
+- Started at UTC: `2026-06-14T14:01:19Z`
+- Finished at UTC: `2026-06-14T14:01:19Z`
 - Command: `sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf`
 
 ### Host binary metadata
@@ -74,6 +74,78 @@ Output directory: `workdir/orch_mock`
 - `tcp_data`: `2`
 - `tcp_response`: `2`
 - `udp_datagram`: `2`
+
+## Syscalls
+
+- Total syscall events: `60`
+- High-risk events: `0`
+
+### Syscalls by execution context
+
+- `guest`: `36`
+- `host_wrapper`: `24`
+
+### Syscalls by category
+
+- `filesystem`: `30`
+- `memory`: `27`
+- `other`: `2`
+- `process`: `1`
+
+### Top syscalls
+
+- `mmap`: `20`
+- `openat`: `17`
+- `mprotect`: `7`
+- `readlink`: `6`
+- `access`: `2`
+- `execve`: `2`
+- `newfstatat`: `2`
+- `chdir`: `1`
+- `chroot`: `1`
+- `exit`: `1`
+- `exit_group`: `1`
+
+### Observed guest filesystem paths
+
+- `.`
+- `/`
+- `/bin/unpacked.elf`
+- `/etc/ld.so.cache`
+- `/etc/ld.so.preload`
+- `/usr/lib/glibc-hwcaps/x86-64-v2/`
+- `/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2`
+- `/usr/lib/glibc-hwcaps/x86-64-v3/`
+- `/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2`
+- `/usr/lib/libc.so.6`
+- `/usr/lib/libcap.so.2`
+- `/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION`
+- `/usr/lib/locale/en.utf8/LC_IDENTIFICATION`
+- `/usr/lib/locale/en/LC_IDENTIFICATION`
+- `/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION`
+- `/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION`
+- `/usr/lib/locale/en_US/LC_IDENTIFICATION`
+- `/usr/lib/locale/locale-archive`
+- `/usr/share/locale/locale.alias`
+
+### Observed host wrapper paths before chroot
+
+- `/etc/ld.so.cache`
+- `/etc/ld.so.preload`
+- `/home`
+- `/home/lisoon`
+- `/home/lisoon/taintforge`
+- `/home/lisoon/taintforge/workdir`
+- `/home/lisoon/taintforge/workdir/orch_mock`
+- `/home/lisoon/taintforge/workdir/orch_mock/rootfs`
+- `/usr/bin/chroot`
+- `/usr/lib/libc.so.6`
+- `/usr/lib/locale/locale-archive`
+
+
+### High-risk syscall events
+
+- No high-risk syscall events recorded.
 
 ## Artifacts
 

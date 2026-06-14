@@ -53,6 +53,22 @@ class Phase2Orchestrator:
 
         self.processes: list[subprocess.Popen] = []
 
+
+    def parse_strace_logs(self) -> None:
+        print("[+] Parsing strace logs")
+
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/parse_strace.py",
+                "--log-dir",
+                str(self.logs_dir),
+                "--out",
+                str(self.logs_dir / "syscall_events.jsonl"),
+            ],
+            check=False,
+        )
+
     def run(self) -> None:
         self.print_header()
 
@@ -83,6 +99,7 @@ class Phase2Orchestrator:
                 self.run_network_self_test()
 
             self.run_sample()
+            self.parse_strace_logs()
             self.generate_report()
 
             self.print_run_summary()
@@ -114,6 +131,7 @@ class Phase2Orchestrator:
             "ss",
             "sudo",
             "conntrack",
+            "strace"
         ]
 
         missing = [tool for tool in required if shutil.which(tool) is None]

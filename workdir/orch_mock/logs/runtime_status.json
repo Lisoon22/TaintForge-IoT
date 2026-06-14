@@ -6,9 +6,11 @@
   "exit_code": 0,
   "timed_out": false,
   "timeout_seconds": 60,
-  "started_at_utc": "2026-06-13T21:41:49Z",
-  "finished_at_utc": "2026-06-13T21:41:49Z",
+  "started_at_utc": "2026-06-14T14:01:19Z",
+  "finished_at_utc": "2026-06-14T14:01:19Z",
   "duration_seconds": 0,
   "stdout_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stdout.log",
-  "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log"
+  "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log",
+  "strace_enabled": true,
+  "strace_prefix": "/home/lisoon/taintforge/workdir/orch_mock/logs/strace"
 }
