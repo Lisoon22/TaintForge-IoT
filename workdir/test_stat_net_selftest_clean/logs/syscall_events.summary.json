@@ -1,0 +1,78 @@
+{
+  "generated_at_utc": "2026-06-15T22:09:49.881519+00:00",
+  "events_total": 45,
+  "by_syscall": {
+    "access": 1,
+    "chdir": 1,
+    "chroot": 1,
+    "connect": 1,
+    "execve": 2,
+    "exit": 1,
+    "exit_group": 1,
+    "mmap": 17,
+    "mprotect": 6,
+    "open": 1,
+    "openat": 4,
+    "readlink": 7,
+    "readlinkat": 1,
+    "socket": 1
+  },
+  "by_category": {
+    "filesystem": 17,
+    "memory": 23,
+    "network": 2,
+    "other": 2,
+    "process": 1
+  },
+  "by_context": {
+    "guest": 21,
+    "host_wrapper": 24
+  },
+  "paths": [
+    "/",
+    "/bin/unpacked.elf",
+    "/proc/self/exe",
+    "/tmp/testfile.txt"
+  ],
+  "guest_paths": [
+    "/",
+    "/bin/unpacked.elf",
+    "/proc/self/exe",
+    "/tmp/testfile.txt"
+  ],
+  "host_wrapper_paths": [
+    "/etc/ld.so.cache",
+    "/etc/ld.so.preload",
+    "/home",
+    "/home/lisoon",
+    "/home/lisoon/taintforge",
+    "/home/lisoon/taintforge/workdir",
+    "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean",
+    "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/rootfs",
+    "/usr/bin/chroot",
+    "/usr/lib/libc.so.6",
+    "/usr/lib/locale/locale-archive"
+  ],
+  "all_paths": [
+    "/",
+    "/bin/unpacked.elf",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.preload",
+    "/home",
+    "/home/lisoon",
+    "/home/lisoon/taintforge",
+    "/home/lisoon/taintforge/workdir",
+    "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean",
+    "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/rootfs",
+    "/proc/self/exe",
+    "/tmp/testfile.txt",
+    "/usr/bin/chroot",
+    "/usr/lib/libc.so.6",
+    "/usr/lib/locale/locale-archive"
+  ],
+  "network_targets": [
+    "127.0.0.1:80"
+  ],
+  "high_risk_count": 0,
+  "high_risk_events": []
+}

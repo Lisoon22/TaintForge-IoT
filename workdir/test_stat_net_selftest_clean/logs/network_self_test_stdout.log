@@ -1,0 +1,5 @@
+[self-test] No known TCP target in policy; skipping known TCP test
+[self-test] TCP unknown -> 91.200.10.5:5555
+[self-test] TCP unknown response=4f4b0a
+[self-test] UDP generic -> 1.2.3.4:9999
+[self-test] UDP dns-like -> 8.8.8.8:53

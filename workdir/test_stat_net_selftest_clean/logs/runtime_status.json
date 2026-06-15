@@ -1,0 +1,16 @@
+{
+  "command": "sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/rootfs /bin/unpacked.elf",
+  "namespace": "tf-iot-ns",
+  "rootfs": "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/rootfs",
+  "guest_command": "/bin/unpacked.elf",
+  "exit_code": 0,
+  "timed_out": false,
+  "timeout_seconds": 60,
+  "started_at_utc": "2026-06-15T22:09:49Z",
+  "finished_at_utc": "2026-06-15T22:09:49Z",
+  "duration_seconds": 0,
+  "stdout_path": "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/logs/runtime_stdout.log",
+  "stderr_path": "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/logs/runtime_stderr.log",
+  "strace_enabled": true,
+  "strace_prefix": "/home/lisoon/taintforge/workdir/test_stat_net_selftest_clean/logs/strace"
+}

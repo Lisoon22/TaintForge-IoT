@@ -1,0 +1,14 @@
+{
+  "mode": "local_test",
+  "allow_internet": false,
+  "services": [],
+  "catch_all": {
+    "enabled": true,
+    "tcp_bind_ip": "127.0.0.1",
+    "tcp_bind_port": 40000,
+    "udp_enabled": true,
+    "udp_bind_ip": "127.0.0.1",
+    "udp_bind_port": 40001,
+    "unknown_policy": "transparent_redirect_and_log"
+  }
+}

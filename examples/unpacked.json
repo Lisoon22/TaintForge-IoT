@@ -1,0 +1,15 @@
+{
+  "oep": "0x804ae0c",
+  "arch": "x86",
+  "regions": [
+    {"addr": "0x8048000", "size": 4096, "prot": 1, "offset": 0},
+    {"addr": "0x8049000", "size": 462848, "prot": 5, "offset": 4096},
+    {"addr": "0x80ba000", "size": 196608, "prot": 1, "offset": 466944},
+    {"addr": "0x80ea000", "size": 28672, "prot": 3, "offset": 663552}
+  ],
+  "file_dependencies": [    {"path": "/proc/self/exe", "write": false}],
+  "library_dependencies": [],
+  "network_dependencies": [
+
+  ]
+}

@@ -1,0 +1,209 @@
+{
+  "generated_at_utc": "2026-06-15T22:19:53.077386+00:00",
+  "out_dir": "workdir/test_stat_net",
+  "paths": {
+    "runtime": "config/runtime.json",
+    "network_policy": "config/network_policy.json",
+    "library_plan": "config/library_plan.json",
+    "library_resolution": "config/library_resolution.json",
+    "network_events": "logs/network_events.jsonl",
+    "syscall_events": "logs/syscall_events.jsonl",
+    "syscall_summary": "logs/syscall_events.summary.json",
+    "runtime_status": "logs/runtime_status.json",
+    "runtime_stdout": "logs/runtime_stdout.log",
+    "runtime_stderr": "logs/runtime_stderr.log",
+    "report_json": "report.json",
+    "report_md": "report.md"
+  },
+  "runtime": {
+    "arch": "x86",
+    "rootfs": "workdir/test_stat_net/rootfs",
+    "host_binary_path": "samples/test_stat",
+    "host_binary": {
+      "path": "samples/test_stat",
+      "exists": true,
+      "size_bytes": 337628,
+      "sha256": "0569944931f33c70438b3487cafd04f6d2568119bad0f88e71d940d6d4eb9c88"
+    },
+    "guest_binary_path": "/bin/unpacked.elf",
+    "qemu_required": false,
+    "qemu_binary_name": null,
+    "qemu_host_path": null,
+    "qemu_guest_path": null,
+    "libraries_ok": true,
+    "library_resolution_path": "workdir/test_stat_net/config/library_resolution.json",
+    "status": {
+      "command": "sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/test_stat_net/rootfs /bin/unpacked.elf",
+      "namespace": "tf-iot-ns",
+      "rootfs": "/home/lisoon/taintforge/workdir/test_stat_net/rootfs",
+      "guest_command": "/bin/unpacked.elf",
+      "exit_code": 255,
+      "timed_out": false,
+      "timeout_seconds": 60,
+      "started_at_utc": "2026-06-15T22:00:34Z",
+      "finished_at_utc": "2026-06-15T22:00:34Z",
+      "duration_seconds": 0,
+      "stdout_path": "/home/lisoon/taintforge/workdir/test_stat_net/logs/runtime_stdout.log",
+      "stderr_path": "/home/lisoon/taintforge/workdir/test_stat_net/logs/runtime_stderr.log",
+      "strace_enabled": true,
+      "strace_prefix": "/home/lisoon/taintforge/workdir/test_stat_net/logs/strace"
+    },
+    "stdout_preview": "",
+    "stderr_preview": "Cannot open network namespace \"tf-iot-ns\": No such file or directory\n"
+  },
+  "libraries": {
+    "requirements_count": 0,
+    "resolved_count": 0,
+    "missing_count": 0,
+    "requirements": [],
+    "resolved": [],
+    "missing": []
+  },
+  "network": {
+    "mode": "local_test",
+    "allow_internet": false,
+    "services_count": 0,
+    "services": [],
+    "catch_all": {
+      "enabled": true,
+      "tcp_bind_ip": "127.0.0.1",
+      "tcp_bind_port": 40000,
+      "udp_enabled": true,
+      "udp_bind_ip": "127.0.0.1",
+      "udp_bind_port": 40001,
+      "unknown_policy": "transparent_redirect_and_log"
+    },
+    "events_total": 0,
+    "events_by_type": {},
+    "listener_types": {},
+    "known_tcp_events": 0,
+    "unknown_tcp_events": 0,
+    "udp_datagrams": 0,
+    "dns_datagrams": 0,
+    "known_tcp_targets": [],
+    "unknown_tcp_targets": [],
+    "udp_targets": []
+  },
+  "syscalls": {
+    "events_total": 21,
+    "by_syscall": {
+      "chdir": 1,
+      "execve": 1,
+      "mmap": 8,
+      "open": 1,
+      "readlink": 1,
+      "mprotect": 3,
+      "readlinkat": 1,
+      "openat": 1,
+      "socket": 1,
+      "connect": 1,
+      "exit_group": 1,
+      "exit": 1
+    },
+    "by_category": {
+      "filesystem": 6,
+      "memory": 11,
+      "network": 2,
+      "other": 1,
+      "process": 1
+    },
+    "paths": [
+      "/",
+      "/bin/unpacked.elf",
+      "/proc/self/exe",
+      "/tmp/testfile.txt"
+    ],
+    "network_targets": [
+      "127.0.0.1:80"
+    ],
+    "network_attempts_count": 1,
+    "network_attempts": [
+      {
+        "syscall": "connect",
+        "category": "network",
+        "remote_ip": "127.0.0.1",
+        "remote_port": 80,
+        "target": "127.0.0.1:80",
+        "result": "-1 ECONNREFUSED (Connection refused)",
+        "raw": "connect(3, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = -1 ECONNREFUSED (Connection refused)"
+      }
+    ],
+    "high_risk_count": 0,
+    "high_risk_events": []
+  },
+  "artifacts": {
+    "payload_count": 0,
+    "payload_files": [],
+    "log_files": [
+      {
+        "path": "logs/runtime_status.json",
+        "exists": true,
+        "size_bytes": 729,
+        "sha256": "77789fdc5ac49f31fc5341eff8e229b550c609605e4a428dc421b9328d50577e"
+      },
+      {
+        "path": "logs/runtime_stderr.log",
+        "exists": true,
+        "size_bytes": 69,
+        "sha256": "5edf242bd128dc73b28ae18e41d0d9b7f62361b65e27d5615942b989f26b4fdb"
+      },
+      {
+        "path": "logs/runtime_stdout.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "logs/strace.2031",
+        "exists": true,
+        "size_bytes": 3557,
+        "sha256": "5c44c4acdf80933ba52cd5229f27db2f07e304a7846457968cbef9df40f85824"
+      },
+      {
+        "path": "logs/syscall_events.jsonl",
+        "exists": true,
+        "size_bytes": 21652,
+        "sha256": "36247b9101946c813b3732d8f395c05291e16e88ceaea06fd73b584b2ae621a7"
+      },
+      {
+        "path": "logs/syscall_events.summary.json",
+        "exists": true,
+        "size_bytes": 1664,
+        "sha256": "1af079509b1360378ea2aad8b4087e8fec145bf3cd7b8bf75e6562e24ddef265"
+      },
+      {
+        "path": "logs/transparent_logger_stderr.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "logs/transparent_logger_stdout.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  "logs": {
+    "runtime_stdout": "",
+    "runtime_stderr": "Cannot open network namespace \"tf-iot-ns\": No such file or directory\n",
+    "network_self_test_stdout": "",
+    "network_self_test_stderr": "",
+    "transparent_logger_stdout": "",
+    "transparent_logger_stderr": "",
+    "network_emulator_stdout": "",
+    "network_emulator_stderr": ""
+  },
+  "security": {
+    "chroot_enabled": true,
+    "network_namespace_enabled": true,
+    "iptables_default_deny_expected": true,
+    "host_ip_forwarding_expected": false,
+    "allow_internet": false,
+    "known_endpoint_dnat": true,
+    "tcp_catch_all_redirect": true,
+    "udp_catch_all_redirect": true,
+    "resource_limits": "disabled_in_v1_timeout_only"
+  }
+}

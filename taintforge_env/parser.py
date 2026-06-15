@@ -51,7 +51,21 @@ def parse_taint_log(raw: dict[str, Any]) -> TaintLog:
 
     oep = require_string(raw.get("oep"), "oep")
     arch = validate_arch(raw.get("arch"))
-    base = require_string(raw.get("base"), "base")
+    base_value = raw.get("base")
+
+    if base_value is None:
+        regions_raw = raw.get("regions", [])
+        if not regions_raw:
+            raise TaintLogValidationError("base is missing and regions is empty")
+
+        region_addrs = []
+        for idx, region in enumerate(regions_raw):
+            addr = require_string(region.get("addr"), f"regions[{idx}].addr")
+            region_addrs.append(int(addr, 16))
+
+        base = hex(min(region_addrs))
+    else:
+        base = require_string(base_value, "base")
 
     regions = [
         parse_memory_region(item, index=i)

@@ -54,6 +54,33 @@ class Phase2Orchestrator:
         self.processes: list[subprocess.Popen] = []
 
 
+
+    def clear_network_self_test_artifacts(self) -> None:
+        print("[+] Clearing network self-test artifacts before malware run")
+
+        events_path = self.logs_dir / "network_events.jsonl"
+        archive_path = self.logs_dir / "network_self_test_events.jsonl"
+
+        if events_path.exists():
+            shutil.copy2(events_path, archive_path)
+            events_path.unlink()
+
+        for path in self.logs_dir.glob("*self_test*.bin"):
+            path.unlink(missing_ok=True)
+
+        for path in self.logs_dir.glob("*self-test*.bin"):
+            path.unlink(missing_ok=True)
+
+        for path in self.logs_dir.glob("catchall_tcp_91_200_10_5_5555_conn_*.bin"):
+            path.unlink(missing_ok=True)
+
+        for path in self.logs_dir.glob("udp_udp_1_2_3_4_9999_dgram_*.bin"):
+            path.unlink(missing_ok=True)
+
+        for path in self.logs_dir.glob("dns_udp_8_8_8_8_53_dgram_*.bin"):
+            path.unlink(missing_ok=True)
+
+
     def parse_strace_logs(self) -> None:
         print("[+] Parsing strace logs")
 
@@ -81,9 +108,17 @@ class Phase2Orchestrator:
                 self.print_build_summary()
                 return
 
+            if self.config.network_mode == "none":
+                self.ensure_sudo()
+                self.run_sample_direct()
+                self.parse_strace_logs()
+                self.generate_report()
+                self.print_run_summary()
+                return
+
             if self.config.network_mode != "controlled":
                 raise OrchestratorError(
-                    f"Only controlled network mode is supported now, got: {self.config.network_mode}"
+                    f"Unsupported network mode: {self.config.network_mode}"
                 )
 
             self.ensure_sudo()
@@ -97,8 +132,10 @@ class Phase2Orchestrator:
 
             if self.config.self_test_network:
                 self.run_network_self_test()
+                self.clear_network_self_test_artifacts()
 
             self.run_sample()
+
             self.parse_strace_logs()
             self.generate_report()
 
@@ -126,13 +163,20 @@ class Phase2Orchestrator:
 
         required = [
             "readelf",
-            "ip",
-            "iptables",
-            "ss",
             "sudo",
-            "conntrack",
-            "strace"
+            "strace",
+            "timeout",
+            "chroot",
+            "mount",
         ]
+
+        if self.config.network_mode == "controlled":
+            required.extend([
+                "ip",
+                "iptables",
+                "ss",
+                "conntrack",
+            ])
 
         missing = [tool for tool in required if shutil.which(tool) is None]
 
@@ -168,7 +212,11 @@ class Phase2Orchestrator:
         self.analyze_libraries()
         self.resolve_libraries()
         self.prepare_runtime()
-        self.generate_network_runner()
+
+        if self.config.network_mode == "controlled":
+            self.generate_network_runner()
+        else:
+            print("[+] Network sandbox runner skipped")
 
     def reconstruct_env(self) -> None:
         print("[+] Reconstructing rootfs and network policy")
@@ -727,6 +775,83 @@ class Phase2Orchestrator:
             return True
 
         return False
+    
+    def run_sample_direct(self) -> None:
+        print("[+] Running sample directly without network sandbox")
+
+        runtime = json.loads(self.runtime_path.read_text(encoding="utf-8"))
+
+        rootfs = Path(runtime["rootfs"])
+        if not rootfs.is_absolute():
+            rootfs = self.project_root / rootfs
+
+        guest_binary = runtime.get("guest_binary", "/bin/unpacked.elf")
+        qemu_required = bool(runtime.get("qemu_required", False))
+
+        if qemu_required:
+            raise OrchestratorError(
+                "Direct run for qemu_required=True is not implemented yet. "
+                "Use controlled network mode or add direct QEMU launcher."
+            )
+
+        proc_dir = rootfs / "proc"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+
+        stdout_path = self.logs_dir / "runtime_stdout.log"
+        stderr_path = self.logs_dir / "runtime_stderr.log"
+        strace_base = self.logs_dir / "strace"
+
+        mounted_proc = False
+
+        try:
+            if not proc_dir.is_mount():
+                self.run_command([
+                    "sudo",
+                    "mount",
+                    "-t",
+                    "proc",
+                    "proc",
+                    str(proc_dir),
+                ])
+                mounted_proc = True
+
+            cmd = [
+                "sudo",
+                "timeout",
+                str(self.config.timeout_seconds),
+                "strace",
+                "-ff",
+                "-o",
+                str(strace_base),
+                "chroot",
+                str(rootfs),
+                guest_binary,
+            ]
+
+            print("[cmd]", " ".join(cmd))
+
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, \
+                stderr_path.open("w", encoding="utf-8") as stderr_file:
+                result = subprocess.run(
+                    cmd,
+                    cwd=self.project_root,
+                    text=True,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                )
+
+            if result.returncode != 0:
+                print(
+                    f"[!] Direct sample runner exited with code {result.returncode}. "
+                    "For malware this can be normal: crash/timeout/non-zero exit."
+                )
+
+        finally:
+            if mounted_proc:
+                self.run_command(
+                    ["sudo", "umount", str(proc_dir)],
+                    check=False,
+                )
 
     def run_sample(self) -> None:
         print("[+] Running sample")
