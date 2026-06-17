@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+def is_malware_syscall_event(event: dict) -> bool:
+    context = event.get("context") or event.get("execution_context")
+    return context == "guest"
 
 PREVIEW_CHARS = 4000
 
@@ -74,30 +77,6 @@ class RunReportGenerator:
                 if path
             }
         )
-        guest_paths = sorted(
-            {
-                path
-                for event in syscall_events
-                if event.get("execution_context") == "guest"
-                for path in event.get("paths", [])
-                if path
-            }
-        )
-
-        host_wrapper_paths = sorted(
-            {
-                path
-                for event in syscall_events
-                if event.get("execution_context") == "host_wrapper"
-                for path in event.get("paths", [])
-                if path
-            }
-        )
-
-        by_context = Counter(
-            str(event.get("execution_context", "unknown"))
-            for event in syscall_events
-        )
 
         network_targets = sorted(
             {
@@ -107,6 +86,27 @@ class RunReportGenerator:
                 and event.get("remote_port") is not None
             }
         )
+
+        network_attempts = []
+
+        for event in syscall_events:
+            remote_ip = event.get("remote_ip")
+            remote_port = event.get("remote_port")
+
+            if remote_ip is None or remote_port is None:
+                continue
+
+            network_attempts.append(
+                {
+                    "syscall": event.get("syscall"),
+                    "category": event.get("category"),
+                    "remote_ip": remote_ip,
+                    "remote_port": remote_port,
+                    "target": f"{remote_ip}:{remote_port}",
+                    "result": event.get("result"),
+                    "raw": event.get("raw"),
+                }
+            )
 
         high_risk_events = [
             event
@@ -120,14 +120,11 @@ class RunReportGenerator:
             "by_category": dict(by_category),
             "paths": paths,
             "network_targets": network_targets,
+            "network_attempts_count": len(network_attempts),
+            "network_attempts": network_attempts[:100],
             "high_risk_count": len(high_risk_events),
             "high_risk_events": high_risk_events[:50],
-            "by_context": dict(by_context),
-            "guest_paths": guest_paths,
-            "host_wrapper_paths": host_wrapper_paths,
-            "all_paths": paths,
         }
-
     def generate(self) -> dict[str, Any]:
         if not self.out_dir.exists():
             raise ReportGenerationError(f"out_dir does not exist: {self.out_dir}")
@@ -138,8 +135,13 @@ class RunReportGenerator:
         library_resolution = self.load_json_optional(self.library_resolution_path)
         network_events = self.load_jsonl_optional(self.network_events_path)
         runtime_status = self.load_json_optional(self.runtime_status_path)
-        syscall_events = self.load_jsonl_optional(self.syscall_events_path)
+        raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path)
         syscall_summary = self.load_json_optional(self.syscall_summary_path)
+
+        syscall_events = [
+            e for e in raw_syscall_events
+            if is_malware_syscall_event(e)
+        ]
 
         report = {
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -156,7 +158,7 @@ class RunReportGenerator:
             ),
             "syscalls": self.build_syscalls_section(
                 syscall_events=syscall_events,
-                syscall_summary=syscall_summary,
+                syscall_summary={},
             ),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
@@ -497,6 +499,26 @@ class RunReportGenerator:
         lines.append(f"- UDP targets: `{network.get('udp_targets')}`")
         lines.append("")
 
+        network_attempts = syscalls.get("network_attempts") or []
+        lines.append("### Network attempts from malware syscalls")
+        lines.append("")
+        if network_attempts:
+            lines.append("| Syscall | Target | Result |")
+            lines.append("|---|---|---|")
+
+            for event in network_attempts[:50]:
+                target = event.get("target")
+                lines.append(
+                    "| "
+                    f"`{event.get('syscall')}` | "
+                    f"`{target}` | "
+                    f"`{event.get('result')}` |"
+                )
+        else:
+            lines.append("- No network attempts recorded from malware syscalls.")
+        lines.append("")
+
+
         lines.append("### Event types")
         lines.append("")
         if network["events_by_type"]:
@@ -511,17 +533,6 @@ class RunReportGenerator:
         lines.append(f"- Total syscall events: `{syscalls.get('events_total')}`")
         lines.append(f"- High-risk events: `{syscalls.get('high_risk_count')}`")
         lines.append("")
-
-        lines.append("### Syscalls by execution context")
-        lines.append("")
-        by_context = syscalls.get("by_context") or {}
-        if by_context:
-            for name, count in sorted(by_context.items()):
-                lines.append(f"- `{name}`: `{count}`")
-        else:
-            lines.append("- No execution context data recorded.")
-        lines.append("")
-
 
         lines.append("### Syscalls by category")
         lines.append("")
@@ -549,31 +560,16 @@ class RunReportGenerator:
             lines.append("- No syscall events recorded.")
         lines.append("")
 
-        guest_paths = syscalls.get("guest_paths") or syscalls.get("paths") or []
-        lines.append("### Observed guest filesystem paths")
+        malware_paths = syscalls.get("paths") or []
+        lines.append("### Observed malware filesystem paths")
         lines.append("")
-        if guest_paths:
-            for path in guest_paths[:50]:
+        if malware_paths:
+            for path in malware_paths[:50]:
                 lines.append(f"- `{path}`")
-            if len(guest_paths) > 50:
-                lines.append(f"- ... truncated, total guest paths: `{len(guest_paths)}`")
+            if len(malware_paths) > 50:
+                lines.append(f"- ... truncated, total malware paths: `{len(malware_paths)}`")
         else:
-            lines.append("- No guest filesystem paths recorded.")
-        lines.append("")
-
-        host_wrapper_paths = syscalls.get("host_wrapper_paths") or []
-        lines.append("### Observed host wrapper paths before chroot")
-        lines.append("")
-        if host_wrapper_paths:
-            for path in host_wrapper_paths[:50]:
-                lines.append(f"- `{path}`")
-            if len(host_wrapper_paths) > 50:
-                lines.append(
-                    f"- ... truncated, total host wrapper paths: `{len(host_wrapper_paths)}`"
-                )
-        else:
-            lines.append("- No host wrapper paths recorded.")
-        lines.append("")
+            lines.append("- No malware filesystem paths recorded.")
         lines.append("")
 
         high_risk = syscalls.get("high_risk_events") or []

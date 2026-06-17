@@ -1,0 +1,12 @@
+{
+  "arch": "x86",
+  "rootfs": "workdir/test_stat_net_selftest_clean/rootfs",
+  "host_binary_path": "samples/test_stat",
+  "guest_binary_path": "/bin/unpacked.elf",
+  "qemu_required": false,
+  "qemu_binary_name": null,
+  "qemu_host_path": null,
+  "qemu_guest_path": null,
+  "libraries_ok": true,
+  "library_resolution_path": "workdir/test_stat_net_selftest_clean/config/library_resolution.json"
+}

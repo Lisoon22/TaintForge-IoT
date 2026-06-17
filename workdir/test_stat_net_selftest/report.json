@@ -1,0 +1,248 @@
+{
+  "generated_at_utc": "2026-06-15T22:05:13.847905+00:00",
+  "out_dir": "workdir/test_stat_net_selftest",
+  "paths": {
+    "runtime": "config/runtime.json",
+    "network_policy": "config/network_policy.json",
+    "library_plan": "config/library_plan.json",
+    "library_resolution": "config/library_resolution.json",
+    "network_events": "logs/network_events.jsonl",
+    "syscall_events": "logs/syscall_events.jsonl",
+    "syscall_summary": "logs/syscall_events.summary.json",
+    "runtime_status": "logs/runtime_status.json",
+    "runtime_stdout": "logs/runtime_stdout.log",
+    "runtime_stderr": "logs/runtime_stderr.log",
+    "report_json": "report.json",
+    "report_md": "report.md"
+  },
+  "runtime": {
+    "arch": "x86",
+    "rootfs": "workdir/test_stat_net_selftest/rootfs",
+    "host_binary_path": "samples/test_stat",
+    "host_binary": {
+      "path": "samples/test_stat",
+      "exists": true,
+      "size_bytes": 337628,
+      "sha256": "0569944931f33c70438b3487cafd04f6d2568119bad0f88e71d940d6d4eb9c88"
+    },
+    "guest_binary_path": "/bin/unpacked.elf",
+    "qemu_required": false,
+    "qemu_binary_name": null,
+    "qemu_host_path": null,
+    "qemu_guest_path": null,
+    "libraries_ok": true,
+    "library_resolution_path": "workdir/test_stat_net_selftest/config/library_resolution.json",
+    "status": {
+      "command": "sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/test_stat_net_selftest/rootfs /bin/unpacked.elf",
+      "namespace": "tf-iot-ns",
+      "rootfs": "/home/lisoon/taintforge/workdir/test_stat_net_selftest/rootfs",
+      "guest_command": "/bin/unpacked.elf",
+      "exit_code": 0,
+      "timed_out": false,
+      "timeout_seconds": 60,
+      "started_at_utc": "2026-06-15T22:05:13Z",
+      "finished_at_utc": "2026-06-15T22:05:13Z",
+      "duration_seconds": 0,
+      "stdout_path": "/home/lisoon/taintforge/workdir/test_stat_net_selftest/logs/runtime_stdout.log",
+      "stderr_path": "/home/lisoon/taintforge/workdir/test_stat_net_selftest/logs/runtime_stderr.log",
+      "strace_enabled": true,
+      "strace_prefix": "/home/lisoon/taintforge/workdir/test_stat_net_selftest/logs/strace"
+    },
+    "stdout_preview": "привет\n",
+    "stderr_preview": ""
+  },
+  "libraries": {
+    "requirements_count": 0,
+    "resolved_count": 0,
+    "missing_count": 0,
+    "requirements": [],
+    "resolved": [],
+    "missing": []
+  },
+  "network": {
+    "mode": "local_test",
+    "allow_internet": false,
+    "services_count": 0,
+    "services": [],
+    "catch_all": {
+      "enabled": true,
+      "tcp_bind_ip": "127.0.0.1",
+      "tcp_bind_port": 40000,
+      "udp_enabled": true,
+      "udp_bind_ip": "127.0.0.1",
+      "udp_bind_port": 40001,
+      "unknown_policy": "transparent_redirect_and_log"
+    },
+    "events_total": 6,
+    "events_by_type": {
+      "tcp_connection_open": 1,
+      "tcp_data": 1,
+      "tcp_response": 1,
+      "udp_datagram": 2,
+      "tcp_connection_close": 1
+    },
+    "listener_types": {
+      "catch_all_transparent": 4,
+      "udp_transparent": 2
+    },
+    "known_tcp_events": 0,
+    "unknown_tcp_events": 4,
+    "udp_datagrams": 2,
+    "dns_datagrams": 1,
+    "known_tcp_targets": [],
+    "unknown_tcp_targets": [
+      "91.200.10.5:5555"
+    ],
+    "udp_targets": [
+      "1.2.3.4:9999",
+      "8.8.8.8:53"
+    ]
+  },
+  "syscalls": {
+    "events_total": 21,
+    "by_syscall": {
+      "chdir": 1,
+      "execve": 1,
+      "mmap": 8,
+      "open": 1,
+      "readlink": 1,
+      "mprotect": 3,
+      "readlinkat": 1,
+      "openat": 1,
+      "socket": 1,
+      "connect": 1,
+      "exit_group": 1,
+      "exit": 1
+    },
+    "by_category": {
+      "filesystem": 6,
+      "memory": 11,
+      "network": 2,
+      "other": 1,
+      "process": 1
+    },
+    "paths": [
+      "/",
+      "/bin/unpacked.elf",
+      "/proc/self/exe",
+      "/tmp/testfile.txt"
+    ],
+    "network_targets": [
+      "127.0.0.1:80"
+    ],
+    "high_risk_count": 0,
+    "high_risk_events": []
+  },
+  "artifacts": {
+    "payload_count": 3,
+    "payload_files": [
+      {
+        "path": "logs/catchall_tcp_91_200_10_5_5555_conn_1.bin",
+        "exists": true,
+        "size_bytes": 17,
+        "sha256": "edd51a1653cf3d9c842d92d39e8c524e60a93fa860eecdeb20185f230de20051"
+      },
+      {
+        "path": "logs/dns_udp_8_8_8_8_53_dgram_2.bin",
+        "exists": true,
+        "size_bytes": 16,
+        "sha256": "165fa948be2b7e54631d9e574e5931e28a09b002fa19437998d62299d66f91d1"
+      },
+      {
+        "path": "logs/udp_udp_1_2_3_4_9999_dgram_1.bin",
+        "exists": true,
+        "size_bytes": 13,
+        "sha256": "ff0b68f5c8cefbc338da4ead9bfe082a2e57b68301ec4b3f5e4ad59779ae508e"
+      }
+    ],
+    "log_files": [
+      {
+        "path": "logs/network_events.jsonl",
+        "exists": true,
+        "size_bytes": 2531,
+        "sha256": "629cafa46037949ebe4633328f5eb6ae5e00dbfcd0322072792aa336c922a213"
+      },
+      {
+        "path": "logs/network_self_test_stderr.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "logs/network_self_test_stdout.log",
+        "exists": true,
+        "size_bytes": 230,
+        "sha256": "1c8a214b68daef73cd5256b9a6408fc25dc000b8c84d57c83c974c4c0682e66e"
+      },
+      {
+        "path": "logs/runtime_status.json",
+        "exists": true,
+        "size_bytes": 772,
+        "sha256": "8e7247174f3989e895dd8062fd9d6aefbd713bb4b65518444f53ee96bb2ebb09"
+      },
+      {
+        "path": "logs/runtime_stderr.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "logs/runtime_stdout.log",
+        "exists": true,
+        "size_bytes": 13,
+        "sha256": "647d6340949f31f15dd8c75cfbb55c087e0d3cbcf31844e3af05def6051d077e"
+      },
+      {
+        "path": "logs/strace.3804",
+        "exists": true,
+        "size_bytes": 3593,
+        "sha256": "815f5f7250b0df5a8814defdcc1e732e9d16925c96ee7e6fbc63eb1a24e13bfa"
+      },
+      {
+        "path": "logs/syscall_events.jsonl",
+        "exists": true,
+        "size_bytes": 21760,
+        "sha256": "6c10cd517cdc5a5e363312d5a8672fa912cad37751b375ce17b2569ab765c5c3"
+      },
+      {
+        "path": "logs/syscall_events.summary.json",
+        "exists": true,
+        "size_bytes": 1700,
+        "sha256": "36981f6601899d0a9aed1bbadf7606de99389a91207c880600180f7b4a6ebc0f"
+      },
+      {
+        "path": "logs/transparent_logger_stderr.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "logs/transparent_logger_stdout.log",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ]
+  },
+  "logs": {
+    "runtime_stdout": "привет\n",
+    "runtime_stderr": "",
+    "network_self_test_stdout": "[self-test] No known TCP target in policy; skipping known TCP test\n[self-test] TCP unknown -> 91.200.10.5:5555\n[self-test] TCP unknown response=4f4b0a\n[self-test] UDP generic -> 1.2.3.4:9999\n[self-test] UDP dns-like -> 8.8.8.8:53\n",
+    "network_self_test_stderr": "",
+    "transparent_logger_stdout": "",
+    "transparent_logger_stderr": "",
+    "network_emulator_stdout": "",
+    "network_emulator_stderr": ""
+  },
+  "security": {
+    "chroot_enabled": true,
+    "network_namespace_enabled": true,
+    "iptables_default_deny_expected": true,
+    "host_ip_forwarding_expected": false,
+    "allow_internet": false,
+    "known_endpoint_dnat": true,
+    "tcp_catch_all_redirect": true,
+    "udp_catch_all_redirect": true,
+    "resource_limits": "disabled_in_v1_timeout_only"
+  }
+}
