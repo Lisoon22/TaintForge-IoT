@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-14T14:01:19.299708+00:00",
+  "generated_at_utc": "2026-06-17T21:38:23.110927+00:00",
   "out_dir": "workdir/orch_mock",
   "paths": {
     "runtime": "config/runtime.json",
@@ -13,7 +13,10 @@
     "runtime_stdout": "logs/runtime_stdout.log",
     "runtime_stderr": "logs/runtime_stderr.log",
     "report_json": "report.json",
-    "report_md": "report.md"
+    "report_md": "report.md",
+    "rootfs_snapshot_before": "logs/rootfs_snapshot_before.json",
+    "rootfs_snapshot_after": "logs/rootfs_snapshot_after.json",
+    "rootfs_diff": "logs/rootfs_diff.json"
   },
   "runtime": {
     "arch": "x86_64",
@@ -40,8 +43,8 @@
       "exit_code": 0,
       "timed_out": false,
       "timeout_seconds": 60,
-      "started_at_utc": "2026-06-14T14:01:19Z",
-      "finished_at_utc": "2026-06-14T14:01:19Z",
+      "started_at_utc": "2026-06-17T21:38:22Z",
+      "finished_at_utc": "2026-06-17T21:38:22Z",
       "duration_seconds": 0,
       "stdout_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stdout.log",
       "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log",
@@ -94,7 +97,7 @@
       {
         "name": "ld-linux-x86-64.so.2",
         "kind": "interpreter",
-        "source_path": "sysroots/x86_64/lib64/ld-linux-x86-64.so.2",
+        "source_path": "/home/lisoon/taintforge/sysroots/x86_64/lib64/ld-linux-x86-64.so.2",
         "guest_path": "/lib64/ld-linux-x86-64.so.2",
         "sources": [
           "elf_interpreter"
@@ -103,7 +106,7 @@
       {
         "name": "libc.so.6",
         "kind": "needed",
-        "source_path": "sysroots/x86_64/usr/lib/libc.so.6",
+        "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libc.so.6",
         "guest_path": "/usr/lib/libc.so.6",
         "sources": [
           "elf_needed",
@@ -113,7 +116,7 @@
       {
         "name": "libcap.so.2",
         "kind": "needed",
-        "source_path": "sysroots/x86_64/usr/lib/libcap.so.2",
+        "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libcap.so.2",
         "guest_path": "/usr/lib/libcap.so.2",
         "sources": [
           "elf_needed"
@@ -122,7 +125,7 @@
       {
         "name": "libpthread.so.0",
         "kind": "runtime_library",
-        "source_path": "sysroots/x86_64/usr/lib/libpthread.so.0",
+        "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libpthread.so.0",
         "guest_path": "/usr/lib/libpthread.so.0",
         "sources": [
           "taint_library_dependencies"
@@ -156,58 +159,40 @@
       "udp_bind_port": 40001,
       "unknown_policy": "transparent_redirect_and_log"
     },
-    "events_total": 10,
-    "events_by_type": {
-      "tcp_connection_open": 2,
-      "tcp_data": 2,
-      "tcp_response": 2,
-      "tcp_connection_close": 2,
-      "udp_datagram": 2
-    },
-    "listener_types": {
-      "known": 4,
-      "catch_all_transparent": 4,
-      "udp_transparent": 2
-    },
-    "known_tcp_events": 4,
-    "unknown_tcp_events": 4,
-    "udp_datagrams": 2,
-    "dns_datagrams": 1,
-    "known_tcp_targets": [
-      "185.62.190.0:48101"
-    ],
-    "unknown_tcp_targets": [
-      "91.200.10.5:5555"
-    ],
-    "udp_targets": [
-      "1.2.3.4:9999",
-      "8.8.8.8:53"
-    ]
+    "events_total": 0,
+    "events_by_type": {},
+    "listener_types": {},
+    "known_tcp_events": 0,
+    "unknown_tcp_events": 0,
+    "udp_datagrams": 0,
+    "dns_datagrams": 0,
+    "dns_queries": [],
+    "dns_responses_sent": 0,
+    "known_tcp_targets": [],
+    "unknown_tcp_targets": [],
+    "udp_targets": [],
+    "http_requests_count": 0,
+    "http_hosts": [],
+    "http_requests": []
   },
   "syscalls": {
-    "events_total": 60,
+    "events_total": 36,
     "by_syscall": {
-      "access": 2,
       "chdir": 1,
-      "chroot": 1,
-      "execve": 2,
-      "exit": 1,
-      "exit_group": 1,
-      "mmap": 20,
-      "mprotect": 7,
+      "execve": 1,
+      "access": 1,
+      "openat": 14,
       "newfstatat": 2,
-      "openat": 17,
-      "readlink": 6
+      "mmap": 11,
+      "mprotect": 4,
+      "exit_group": 1,
+      "exit": 1
     },
     "by_category": {
-      "filesystem": 30,
-      "memory": 27,
-      "other": 2,
+      "filesystem": 19,
+      "memory": 15,
+      "other": 1,
       "process": 1
-    },
-    "by_context": {
-      "guest": 36,
-      "host_wrapper": 24
     },
     "paths": [
       ".",
@@ -230,100 +215,23 @@
       "/usr/lib/locale/locale-archive",
       "/usr/share/locale/locale.alias"
     ],
-    "guest_paths": [
-      ".",
-      "/",
-      "/bin/unpacked.elf",
-      "/etc/ld.so.cache",
-      "/etc/ld.so.preload",
-      "/usr/lib/glibc-hwcaps/x86-64-v2/",
-      "/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2",
-      "/usr/lib/glibc-hwcaps/x86-64-v3/",
-      "/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2",
-      "/usr/lib/libc.so.6",
-      "/usr/lib/libcap.so.2",
-      "/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en.utf8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US/LC_IDENTIFICATION",
-      "/usr/lib/locale/locale-archive",
-      "/usr/share/locale/locale.alias"
-    ],
-    "host_wrapper_paths": [
-      "/etc/ld.so.cache",
-      "/etc/ld.so.preload",
-      "/home",
-      "/home/lisoon",
-      "/home/lisoon/taintforge",
-      "/home/lisoon/taintforge/workdir",
-      "/home/lisoon/taintforge/workdir/orch_mock",
-      "/home/lisoon/taintforge/workdir/orch_mock/rootfs",
-      "/usr/bin/chroot",
-      "/usr/lib/libc.so.6",
-      "/usr/lib/locale/locale-archive"
-    ],
-    "all_paths": [
-      ".",
-      "/",
-      "/bin/unpacked.elf",
-      "/etc/ld.so.cache",
-      "/etc/ld.so.preload",
-      "/home",
-      "/home/lisoon",
-      "/home/lisoon/taintforge",
-      "/home/lisoon/taintforge/workdir",
-      "/home/lisoon/taintforge/workdir/orch_mock",
-      "/home/lisoon/taintforge/workdir/orch_mock/rootfs",
-      "/usr/bin/chroot",
-      "/usr/lib/glibc-hwcaps/x86-64-v2/",
-      "/usr/lib/glibc-hwcaps/x86-64-v2/libcap.so.2",
-      "/usr/lib/glibc-hwcaps/x86-64-v3/",
-      "/usr/lib/glibc-hwcaps/x86-64-v3/libcap.so.2",
-      "/usr/lib/libc.so.6",
-      "/usr/lib/libcap.so.2",
-      "/usr/lib/locale/en.UTF-8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en.utf8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US.UTF-8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US.utf8/LC_IDENTIFICATION",
-      "/usr/lib/locale/en_US/LC_IDENTIFICATION",
-      "/usr/lib/locale/locale-archive",
-      "/usr/share/locale/locale.alias"
-    ],
     "network_targets": [],
+    "network_attempts_count": 0,
+    "network_attempts": [],
     "high_risk_count": 0,
     "high_risk_events": []
   },
+  "filesystem": {
+    "created_count": 0,
+    "modified_count": 0,
+    "deleted_count": 0,
+    "created": [],
+    "modified": [],
+    "deleted": []
+  },
   "artifacts": {
-    "payload_count": 4,
-    "payload_files": [
-      {
-        "path": "logs/catchall_tcp_91_200_10_5_5555_conn_1.bin",
-        "exists": true,
-        "size_bytes": 17,
-        "sha256": "edd51a1653cf3d9c842d92d39e8c524e60a93fa860eecdeb20185f230de20051"
-      },
-      {
-        "path": "logs/dns_udp_8_8_8_8_53_dgram_2.bin",
-        "exists": true,
-        "size_bytes": 16,
-        "sha256": "165fa948be2b7e54631d9e574e5931e28a09b002fa19437998d62299d66f91d1"
-      },
-      {
-        "path": "logs/tcp_48101_conn_1.bin",
-        "exists": true,
-        "size_bytes": 15,
-        "sha256": "b4f77b4fd378b4eb2f65f1c089234e38c31aa61f46baa0f2aa8faafeca0c0bcb"
-      },
-      {
-        "path": "logs/udp_udp_1_2_3_4_9999_dgram_1.bin",
-        "exists": true,
-        "size_bytes": 13,
-        "sha256": "ff0b68f5c8cefbc338da4ead9bfe082a2e57b68301ec4b3f5e4ad59779ae508e"
-      }
-    ],
+    "payload_count": 0,
+    "payload_files": [],
     "log_files": [
       {
         "path": "logs/network_emulator_stderr.log",
@@ -338,10 +246,10 @@
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
       {
-        "path": "logs/network_events.jsonl",
+        "path": "logs/network_self_test_events.jsonl",
         "exists": true,
-        "size_bytes": 4176,
-        "sha256": "276a8f9126ee6444058a09015ff4f02d97e0932f26c467d195b81fd03857399f"
+        "size_bytes": 6620,
+        "sha256": "751611a2e713f559820d556628805062a6ecfe1e2264867b79ef84e5b603c7aa"
       },
       {
         "path": "logs/network_self_test_stderr.log",
@@ -352,14 +260,32 @@
       {
         "path": "logs/network_self_test_stdout.log",
         "exists": true,
-        "size_bytes": 247,
-        "sha256": "b9e6fab01b4ed6b8ee94f8239bcad51289b40fddc080569e053e1f42f926d27d"
+        "size_bytes": 703,
+        "sha256": "d0617cc9a51b07cb27fe00f03bb70babb13017a9e1097469a7ab51102ce3a0fa"
+      },
+      {
+        "path": "logs/rootfs_diff.json",
+        "exists": true,
+        "size_bytes": 272,
+        "sha256": "59faf4fc7a9ea6985aebe17b338bf91daed8e76d15a932de3e4d18f1c5245277"
+      },
+      {
+        "path": "logs/rootfs_snapshot_after.json",
+        "exists": true,
+        "size_bytes": 7697,
+        "sha256": "880f8f11aef4cff27895ba2389d7139a5149d240d431f57c795e09c0d56e4fc0"
+      },
+      {
+        "path": "logs/rootfs_snapshot_before.json",
+        "exists": true,
+        "size_bytes": 7697,
+        "sha256": "1f21f2a9ad517bd5f146de804a3303681f009041b632939d3d97fa208fbcb701"
       },
       {
         "path": "logs/runtime_status.json",
         "exists": true,
         "size_bytes": 707,
-        "sha256": "7f1ec2f6c9cff08190dec9081b7d84a77d09fb3b4aed640663d879244f0bf0e8"
+        "sha256": "10fb0b5065593d91fe9916b25fa205a8919c414fdcec805b80ea236eeabd11dd"
       },
       {
         "path": "logs/runtime_stderr.log",
@@ -374,22 +300,22 @@
         "sha256": "2aadb2f74103af1f3914a0aedd0c023c5f566f4dbc7e5b8b5a9f8f9fe10639f7"
       },
       {
-        "path": "logs/strace.18037",
+        "path": "logs/strace.82068",
         "exists": true,
         "size_bytes": 5342,
-        "sha256": "65b2bbb463735338b1bce1a8cb0ef4f1f1898706ec1efafef679ff817c75416b"
+        "sha256": "1cb9086c1473fdf36092d23c5b50e3dcfdee82cb0d1aa6c97e5ea4b759d6b5f5"
       },
       {
         "path": "logs/syscall_events.jsonl",
         "exists": true,
         "size_bytes": 30845,
-        "sha256": "00c759f04bf2fbb49e54869244bbad55266a1429eed7fa4992e3bed71d63aa2b"
+        "sha256": "9e32462a5a8e3611bbe7f6721f5cbf73247c045be06f7e9ffddf1f22ecfb6be6"
       },
       {
         "path": "logs/syscall_events.summary.json",
         "exists": true,
         "size_bytes": 3302,
-        "sha256": "45e30df414582bee5595d23fd6ecb258368179e5e64bd35f49760f4fc1f47536"
+        "sha256": "8ddd883825377778b694ad4eaf1e4ac4632645d032ff0bc217d4e2c110676938"
       },
       {
         "path": "logs/transparent_logger_stderr.log",
@@ -408,7 +334,7 @@
   "logs": {
     "runtime_stdout": "bin\ndev\netc\nlib\nlib64\nproc\ntmp\nusr\nvar\n",
     "runtime_stderr": "",
-    "network_self_test_stdout": "[self-test] TCP known -> 185.62.190.0:48101\n[self-test] TCP known response=00000000\n[self-test] TCP unknown -> 91.200.10.5:5555\n[self-test] TCP unknown response=4f4b0a\n[self-test] UDP generic -> 1.2.3.4:9999\n[self-test] UDP dns-like -> 8.8.8.8:53\n",
+    "network_self_test_stdout": "[self-test] TCP known -> 185.62.190.0:48101\n[self-test] TCP known response=00000000\n[self-test] TCP unknown -> 91.200.10.5:5555\n[self-test] TCP unknown response=4f4b0a\n[self-test] TCP http -> 93.184.216.34:80\n[self-test] TCP http response=485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e6e656374696f6e3a20636c6f73650d0a436f6e74656e742d4c656e6774683a2033330d0a0d0a5461696e74466f7267652d496f542066616b65204854545020736572766963650a\n[self-test] UDP generic -> 1.2.3.4:9999\n[self-test] UDP dns-like -> 8.8.8.8:53\n[self-test] UDP dns-like response_from=8.8.8.8:53 response=123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000003c00040a0a0001\n",
     "network_self_test_stderr": "",
     "transparent_logger_stdout": "",
     "transparent_logger_stderr": "",

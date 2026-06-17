@@ -1,6 +1,6 @@
 # TaintForge-IoT Phase 2 Run Report
 
-Generated at UTC: `2026-06-14T14:01:19.299708+00:00`
+Generated at UTC: `2026-06-17T21:38:23.110927+00:00`
 Output directory: `workdir/orch_mock`
 
 ## Runtime
@@ -19,8 +19,8 @@ Output directory: `workdir/orch_mock`
 - Timed out: `False`
 - Timeout seconds: `60`
 - Duration seconds: `0`
-- Started at UTC: `2026-06-14T14:01:19Z`
-- Finished at UTC: `2026-06-14T14:01:19Z`
+- Started at UTC: `2026-06-17T21:38:22Z`
+- Finished at UTC: `2026-06-17T21:38:22Z`
 - Command: `sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf`
 
 ### Host binary metadata
@@ -39,21 +39,23 @@ Output directory: `workdir/orch_mock`
 
 | Name | Kind | Guest path | Source path |
 |---|---|---|---|
-| ld-linux-x86-64.so.2 | interpreter | `/lib64/ld-linux-x86-64.so.2` | `sysroots/x86_64/lib64/ld-linux-x86-64.so.2` |
-| libc.so.6 | needed | `/usr/lib/libc.so.6` | `sysroots/x86_64/usr/lib/libc.so.6` |
-| libcap.so.2 | needed | `/usr/lib/libcap.so.2` | `sysroots/x86_64/usr/lib/libcap.so.2` |
-| libpthread.so.0 | runtime_library | `/usr/lib/libpthread.so.0` | `sysroots/x86_64/usr/lib/libpthread.so.0` |
+| ld-linux-x86-64.so.2 | interpreter | `/lib64/ld-linux-x86-64.so.2` | `/home/lisoon/taintforge/sysroots/x86_64/lib64/ld-linux-x86-64.so.2` |
+| libc.so.6 | needed | `/usr/lib/libc.so.6` | `/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libc.so.6` |
+| libcap.so.2 | needed | `/usr/lib/libcap.so.2` | `/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libcap.so.2` |
+| libpthread.so.0 | runtime_library | `/usr/lib/libpthread.so.0` | `/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libpthread.so.0` |
 
 ## Network
 
 - Mode: `local_test`
 - Allow internet: `False`
 - Known services: `1`
-- Total events: `10`
-- Known TCP events: `4`
-- Unknown TCP events: `4`
-- UDP datagrams: `2`
-- DNS datagrams: `1`
+- Total events: `0`
+- Known TCP events: `0`
+- Unknown TCP events: `0`
+- UDP datagrams: `0`
+- DNS datagrams: `0`
+- DNS responses sent: `0`
+- DNS queries: `[]`
 
 ### Known services
 
@@ -63,50 +65,47 @@ Output directory: `workdir/orch_mock`
 
 ### Observed targets
 
-- Known TCP targets: `['185.62.190.0:48101']`
-- Unknown TCP targets: `['91.200.10.5:5555']`
-- UDP targets: `['1.2.3.4:9999', '8.8.8.8:53']`
+- Known TCP targets: `[]`
+- Unknown TCP targets: `[]`
+- UDP targets: `[]`
+
+### Network attempts from malware syscalls
+
+- No network attempts recorded from malware syscalls.
+
+### Observed HTTP requests
+
+- No HTTP requests recorded.
 
 ### Event types
 
-- `tcp_connection_close`: `2`
-- `tcp_connection_open`: `2`
-- `tcp_data`: `2`
-- `tcp_response`: `2`
-- `udp_datagram`: `2`
+- No network events recorded.
 
 ## Syscalls
 
-- Total syscall events: `60`
+- Total syscall events: `36`
 - High-risk events: `0`
-
-### Syscalls by execution context
-
-- `guest`: `36`
-- `host_wrapper`: `24`
 
 ### Syscalls by category
 
-- `filesystem`: `30`
-- `memory`: `27`
-- `other`: `2`
+- `filesystem`: `19`
+- `memory`: `15`
+- `other`: `1`
 - `process`: `1`
 
 ### Top syscalls
 
-- `mmap`: `20`
-- `openat`: `17`
-- `mprotect`: `7`
-- `readlink`: `6`
-- `access`: `2`
-- `execve`: `2`
+- `openat`: `14`
+- `mmap`: `11`
+- `mprotect`: `4`
 - `newfstatat`: `2`
 - `chdir`: `1`
-- `chroot`: `1`
-- `exit`: `1`
+- `execve`: `1`
+- `access`: `1`
 - `exit_group`: `1`
+- `exit`: `1`
 
-### Observed guest filesystem paths
+### Observed malware filesystem paths
 
 - `.`
 - `/`
@@ -128,35 +127,31 @@ Output directory: `workdir/orch_mock`
 - `/usr/lib/locale/locale-archive`
 - `/usr/share/locale/locale.alias`
 
-### Observed host wrapper paths before chroot
-
-- `/etc/ld.so.cache`
-- `/etc/ld.so.preload`
-- `/home`
-- `/home/lisoon`
-- `/home/lisoon/taintforge`
-- `/home/lisoon/taintforge/workdir`
-- `/home/lisoon/taintforge/workdir/orch_mock`
-- `/home/lisoon/taintforge/workdir/orch_mock/rootfs`
-- `/usr/bin/chroot`
-- `/usr/lib/libc.so.6`
-- `/usr/lib/locale/locale-archive`
-
-
 ### High-risk syscall events
 
 - No high-risk syscall events recorded.
 
+## Filesystem mutations
+
+- Created files/entries: `0`
+- Modified files/entries: `0`
+- Deleted files/entries: `0`
+
+### Created entries
+
+- No created entries.
+
+### Modified entries
+
+- No modified entries.
+
+### Deleted entries
+
+- No deleted entries.
+
 ## Artifacts
 
-- Payload files: `4`
-
-| File | Size | SHA256 |
-|---|---:|---|
-| `logs/catchall_tcp_91_200_10_5_5555_conn_1.bin` | 17 | `edd51a1653cf3d9c842d92d39e8c524e60a93fa860eecdeb20185f230de20051` |
-| `logs/dns_udp_8_8_8_8_53_dgram_2.bin` | 16 | `165fa948be2b7e54631d9e574e5931e28a09b002fa19437998d62299d66f91d1` |
-| `logs/tcp_48101_conn_1.bin` | 15 | `b4f77b4fd378b4eb2f65f1c089234e38c31aa61f46baa0f2aa8faafeca0c0bcb` |
-| `logs/udp_udp_1_2_3_4_9999_dgram_1.bin` | 13 | `ff0b68f5c8cefbc338da4ead9bfe082a2e57b68301ec4b3f5e4ad59779ae508e` |
+- Payload files: `0`
 
 ## Security model
 
@@ -198,7 +193,10 @@ var
 [self-test] TCP known response=00000000
 [self-test] TCP unknown -> 91.200.10.5:5555
 [self-test] TCP unknown response=4f4b0a
+[self-test] TCP http -> 93.184.216.34:80
+[self-test] TCP http response=485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e6e656374696f6e3a20636c6f73650d0a436f6e74656e742d4c656e6774683a2033330d0a0d0a5461696e74466f7267652d496f542066616b65204854545020736572766963650a
 [self-test] UDP generic -> 1.2.3.4:9999
 [self-test] UDP dns-like -> 8.8.8.8:53
+[self-test] UDP dns-like response_from=8.8.8.8:53 response=123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000003c00040a0a0001
 
 ```

@@ -3,7 +3,7 @@
     {
       "name": "ld-linux-x86-64.so.2",
       "kind": "interpreter",
-      "source_path": "sysroots/x86_64/lib64/ld-linux-x86-64.so.2",
+      "source_path": "/home/lisoon/taintforge/sysroots/x86_64/lib64/ld-linux-x86-64.so.2",
       "guest_path": "/lib64/ld-linux-x86-64.so.2",
       "sources": [
         "elf_interpreter"
@@ -12,7 +12,7 @@
     {
       "name": "libc.so.6",
       "kind": "needed",
-      "source_path": "sysroots/x86_64/usr/lib/libc.so.6",
+      "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libc.so.6",
       "guest_path": "/usr/lib/libc.so.6",
       "sources": [
         "elf_needed",
@@ -22,7 +22,7 @@
     {
       "name": "libcap.so.2",
       "kind": "needed",
-      "source_path": "sysroots/x86_64/usr/lib/libcap.so.2",
+      "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libcap.so.2",
       "guest_path": "/usr/lib/libcap.so.2",
       "sources": [
         "elf_needed"
@@ -31,7 +31,7 @@
     {
       "name": "libpthread.so.0",
       "kind": "runtime_library",
-      "source_path": "sysroots/x86_64/usr/lib/libpthread.so.0",
+      "source_path": "/home/lisoon/taintforge/sysroots/x86_64/usr/lib/libpthread.so.0",
       "guest_path": "/usr/lib/libpthread.so.0",
       "sources": [
         "taint_library_dependencies"
