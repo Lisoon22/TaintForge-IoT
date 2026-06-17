@@ -1,25 +1,14 @@
 {
-  "oep": "0x4010fb",
+  "oep": "0x804ae0c",
   "arch": "x86",
   "regions": [
-    {"addr": "0x400000", "size": 4096, "prot": 1, "offset": 0},
-    {"addr": "0x401000", "size": 4096, "prot": 5, "offset": 4096},
-    {"addr": "0x402000", "size": 8192, "prot": 1, "offset": 8192},
-    {"addr": "0x404000", "size": 4096, "prot": 3, "offset": 16384},
-    {"addr": "0x40805000", "size": 4096, "prot": 1, "offset": 20480},
-    {"addr": "0x40806000", "size": 155648, "prot": 5, "offset": 24576},
-    {"addr": "0x4082c000", "size": 69632, "prot": 1, "offset": 180224},
-    {"addr": "0x4083d000", "size": 4096, "prot": 3, "offset": 249856},
-    {"addr": "0x4088e000", "size": 1683456, "prot": 5, "offset": 253952},
-    {"addr": "0x40a9f000", "size": 8192, "prot": 1, "offset": 1937408},
-    {"addr": "0x40aa1000", "size": 24576, "prot": 3, "offset": 1945600}
+    {"addr": "0x8048000", "size": 4096, "prot": 1, "offset": 0},
+    {"addr": "0x8049000", "size": 462848, "prot": 5, "offset": 4096},
+    {"addr": "0x80ba000", "size": 196608, "prot": 1, "offset": 466944},
+    {"addr": "0x80ea000", "size": 28672, "prot": 3, "offset": 663552}
   ],
-  "file_dependencies": [    {"path": "/proc/self/exe", "write": false},
-    {"path": "/lib/ld-linux.so.2", "write": false},
-    {"path": "/etc/ld.so.preload", "write": false},
-    {"path": "/etc/ld.so.cache", "write": false},
-    {"path": "/usr/lib32/libc.so.6", "write": false}],
-  "library_dependencies": [{"path": "/lib/ld-linux.so.2", "base": "0x4083b000", "size": 9400}, {"path": "/usr/lib32/libc.so.6", "base": "0x4088e000", "size": 1683456}],
+  "file_dependencies": [    {"path": "/proc/self/exe", "write": false}],
+  "library_dependencies": [],
   "network_dependencies": [
 
   ]
