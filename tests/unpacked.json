@@ -1,0 +1,17 @@
+{
+  "oep": "0x0",
+  "arch": "x86",
+  "regions": [
+    {"addr": "0x80ea000", "size": 12288, "prot": 1, "offset": 0}
+  ],
+  "file_dependencies": [    {"path": "/tmp/testfile.txt", "write": true}],
+  "library_dependencies": [],
+  "network_dependencies": [
+    {"op":"recv","fd":0},
+    {"op":"recv","fd":135207040},
+    {"op":"recv","fd":0},
+    {"op":"recv","fd":135342208},
+    {"op":"recv","fd":135344128},
+    {"op":"connect","fd":3,"ip":"127.0.0.1","port":80,"type":"tcp"}
+  ]
+}
