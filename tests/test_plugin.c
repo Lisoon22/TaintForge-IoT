@@ -82,10 +82,6 @@ static GHashTable *g_sockets = NULL;
 static GHashTable *file_fd = NULL;
 static int next_fd = 3; 
 
-static net_dep_t *socket_info_lookup(int fd) {
-	return g_hash_table_lookup(g_sockets, GINT_TO_POINTER(fd));
-}
-
 static bool parse_guest_sockaddr(uint64_t gaddr, int addrlen, char *ip_out, size_t ip_size, uint16_t *port_out) {
 	if (addrlen <= 0 || gaddr == 0 || !ip_out || !port_out) return false;
 	memset(ip_out, 0, ip_size);
@@ -195,65 +191,91 @@ static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint
 	}
 }
 
+static bool bin_dumped = false;
+static GString *saved_reg = NULL;
+
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
 	keys = g_list_sort(keys, compare_keys);
+	static uint64_t base_addr = 0;
 	
-	FILE *f_bin = fopen("unpacked.bin", "wb");
-	FILE *f_json = fopen("unpacked.json", "w");
-	if (!f_bin || !f_json) {
-		if (f_bin) fclose(f_bin);
-		if (f_json) fclose(f_json);
-		g_list_free(keys);
-		return;
+	if (!bin_dumped) {
+		FILE *f_bin = fopen("unpacked.bin", "wb");
+		if (f_bin) {
+			for (GList *k = keys; k; k = k->next) {
+				uint64_t addr = (uint64_t)(uintptr_t)k->data;
+				page_t *p = g_hash_table_lookup(pages, k->data);
+				if (!p) continue;
+				GByteArray *data = g_byte_array_new();
+				if (qemu_plugin_read_memory_vaddr(addr, data, page_size) && data->len > 0) {
+					fwrite(data->data, 1, data->len, f_bin);
+				}
+				g_byte_array_free(data, TRUE);
+			}
+			fclose(f_bin);
+			bin_dumped = true;
+		}
 	}
 
+	if (!saved_reg) {
+		saved_reg= g_string_new(NULL);
+		g_string_append(saved_reg, "  \"regions\": [\n");
+		bool in_region = false;
+		bool first_region = true;
+		uint64_t offset = 0;
+		uint64_t region_start = 0;
+		uint64_t region_size = 0;
+		int region_prot = 0;
+
+		for (GList *k = keys; k; k = k->next) {
+			uint64_t addr = (uint64_t)(uintptr_t)k->data;
+			page_t *p = g_hash_table_lookup(pages, k->data);
+			if (!p) continue;
+
+			GByteArray *data = g_byte_array_new();
+			size_t written = 0;
+			bool ok = qemu_plugin_read_memory_vaddr(addr, data, page_size);
+			if (ok && data->len > 0) {
+				written = data->len;
+			} else {
+				written = 0;
+			}
+			g_byte_array_free(data, TRUE);
+			if (written == 0) continue;
+
+			if (in_region && addr == region_start + region_size && p->prot == region_prot) {
+				region_size += written;
+			} else {
+				if (in_region) {
+					if (!first_region) g_string_append(saved_reg, ",\n");
+					first_region = false;
+					g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}", region_start, region_size, region_prot, offset - region_size);
+				}
+				region_start = addr;
+				region_size = written;
+				region_prot = p->prot;
+				in_region = true;
+			}
+			offset += written;
+		}
+		if (in_region) {
+			if (!first_region) g_string_append(saved_reg, ",\n");
+			g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}\n", region_start, region_size, region_prot, offset - region_size);
+		}
+		g_string_append(saved_reg, "  ],\n");
+	}
+
+	FILE *f_json = fopen("unpacked.json", "w");
+	if (!f_json) { g_list_free(keys); return; }
+
+	if (base_addr == 0) {
+		base_addr = oep & ~(page_size - 1);
+	}
 	fprintf(f_json, "{\n");
 	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", oep);
 	fprintf(f_json, "  \"arch\": \"x86\",\n");
-	fprintf(f_json, "  \"regions\": [\n");
-	
-	bool in_region = false;
-	bool first_region = true;
-	uint64_t offset = 0;
-	uint64_t region_start = 0;
-	uint64_t region_size = 0;
-	int region_prot = 0;
-
-	for (GList *k = keys; k; k = k->next) {
-		uint64_t addr = (uint64_t)(uintptr_t)k->data;
-		page_t *p = g_hash_table_lookup(pages, k->data);
-		if (!p) continue;
-
-		GByteArray *data = g_byte_array_new();
-		bool ok = qemu_plugin_read_memory_vaddr(addr, data, page_size);
-		size_t written = 0;
-		if (ok && data->len > 0) {
-			written = fwrite(data->data, 1, data->len, f_bin);
-		}
-		g_byte_array_free(data, TRUE);
-		if (written == 0) continue;
-
-		if (in_region && addr == region_start + region_size && p->prot == region_prot) {
-			region_size += written;
-		} else {
-			if (in_region) {
-				if (!first_region) fprintf(f_json, ",\n");
-				first_region = false;
-				fprintf(f_json, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}", region_start, region_size, region_prot, offset - region_size);
-			}
-			region_start = addr;
-			region_size = written;
-			region_prot = p->prot;
-			in_region = true;
-		}
-		offset += written;
-	}
-	if (in_region) {
-		if (!first_region) fprintf(f_json, ",\n");
-		fprintf(f_json, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}\n", region_start, region_size, region_prot, offset - region_size);
-	}
-	fprintf(f_json, "  ],\n");
+	fprintf(f_json, "  \"base\": \"0x%lx\",\n", base_addr);
+	fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
 
 	// files
 	fprintf(f_json, "  \"file_dependencies\": [");
@@ -307,7 +329,6 @@ static void do_dump(uint64_t oep) {
 	}
 	fprintf(f_json, "\n  ]\n}\n");
 
-	fclose(f_bin);
 	fclose(f_json);
 	g_list_free(keys);
 	fprintf(stderr, "[DUMP] unpacked.bin + unpacked.json complete\n");
@@ -315,11 +336,8 @@ static void do_dump(uint64_t oep) {
 
 
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
-	//emergency dump
-	if (oep_addr == 0) {
-        	fprintf(stderr, "[EXIT] No OEP detected, dumping all exec pages\n");
-        	do_dump(0);
-	}
+	//dump check
+	do_dump(oep_addr);
 	//memory free
 	for (GList *l = file_deps; l; l = l->next) {
 		file_dep_t *f = (file_dep_t*)l->data;
@@ -352,6 +370,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 		}
 	}
 	g_hash_table_destroy(g_sockets);
+	if (saved_reg) {
+		g_string_free(saved_reg, TRUE);
+	}
 	
 	//capstone handle
 	cs_close(&cs_handle);
@@ -532,7 +553,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					char ip[INET6_ADDRSTRLEN] = {0};
 					uint16_t port = 0;
 					if (parse_guest_sockaddr(addr_ptr, addrlen, ip, sizeof(ip), &port)) {
-						net_dep_t *n = socket_info_lookup(fd);
+						net_dep_t *n = g_hash_table_lookup(g_sockets, GINT_TO_POINTER(fd));
 						if (!n) {
 							n = g_new0(net_dep_t, 1);
 							n->fd = fd;
@@ -558,7 +579,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					char ip[INET6_ADDRSTRLEN] = {0};
 					uint16_t port = 0;
 					if (parse_guest_sockaddr(addr_ptr, addrlen, ip, sizeof(ip), &port)) {
-						net_dep_t *n = socket_info_lookup(fd);
+						net_dep_t *n = g_hash_table_lookup(g_sockets, GINT_TO_POINTER(fd));
 						if (!n) {
 							n = g_new0(net_dep_t, 1);
 							n->fd = fd;
@@ -674,17 +695,17 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 
 			default: fprintf(stderr, "[SYSCALL] unknown socketcall subcall=%d\n", subcall);
 		}
-	} else if (num == 359 || num == 41) {  /* socket */
+	} else if ((is_i386 && num == 359) || (!is_i386 && num == 41)) {  /* socket */
 		pending_socket_domain = (int)a1;
-		pending_socket_type   = (int)a2;
+		pending_socket_type = (int)a2;
 		fprintf(stderr, "[NET] socket(domain=%ld, type=%ld)\n", a1, a2);
-	} else if (num == 361|| num == 49) {  /* bind */
+	} else if ((is_i386 && num == 361)|| (!is_i386 && num == 49)) {  /* bind */
 		int fd = (int)a1;
 		char ip[INET6_ADDRSTRLEN] = {0};
 		uint16_t port = 0;
 
 		if (parse_guest_sockaddr(a2, (int)a3, ip, sizeof(ip), &port)) {
-			net_dep_t *n = socket_info_lookup(fd);
+			net_dep_t *n = g_hash_table_lookup(g_sockets, GINT_TO_POINTER(fd));
 			if (!n) {
 				n = g_new0(net_dep_t, 1);
 				n->fd = fd;
@@ -701,13 +722,13 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		} else {
 			fprintf(stderr, "[NET] bind fd=%d: malformed sockaddr\n", fd);
 		}
-	} else if (num == 362 || num == 42) {  /* connect */
+	} else if ((is_i386 && num == 362) || (!is_i386 && num == 42)) {  /* connect */
 		int fd = (int)a1;
 		char ip[INET6_ADDRSTRLEN] = {0};
 		uint16_t port = 0;
 
 		if (parse_guest_sockaddr(a2, (int)a3, ip, sizeof(ip), &port)) {
-			net_dep_t *n = socket_info_lookup(fd);
+			net_dep_t *n = g_hash_table_lookup(g_sockets, GINT_TO_POINTER(fd));
 			if (!n) {
 				n = g_new0(net_dep_t, 1);
 				n->fd = fd;
@@ -726,25 +747,25 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		} else {
 			fprintf(stderr, "[NET] connect fd=%d: malformed sockaddr\n", fd);
 		}
-	} else if (num == 363 || num == 50) {  /* listen */
+	} else if ((is_i386 && num == 363) || (!is_i386 && num == 50)) {  /* listen */
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op, "listen", sizeof(event->op));
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] listen fd=%d\n", (int)a1);
-	} else if (num == 364 || num == 43) {  /* accept */
+	} else if ((is_i386 && num == 364) || (!is_i386 && num == 43)) {  /* accept */
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op, "accept", sizeof(event->op));
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] accept fd=%d\n", (int)a1);
-	} else if (num == 288) {  // accept4
+	} else if (!is_i386 && num == 288) {  // accept4
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op, "accept4", sizeof(event->op));
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] accept4 fd=%d flags=%ld\n", (int)a1, a3);
-	} else if (num == 44) {  // sendto
+	} else if ((is_i386 && num ==369) || (!is_i386 && num == 44)) {  // sendto
 		char ip[INET6_ADDRSTRLEN] = {0};
 		uint16_t port = 0;
 		if (a5 && parse_guest_sockaddr(a5, (int)a6, ip, sizeof(ip), &port)) {
@@ -762,13 +783,13 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			net_deps = g_list_append(net_deps, event);
 			fprintf(stderr, "[NET] sendto fd=%d (no addr)\n", (int)a1);
 		}
-	} else if (num == 45) {  // recvfrom
+	} else if ((is_i386 && num == 372) || (!is_i386 && num == 45)) {  // recvfrom
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op, "recv", sizeof(event->op));
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] recvfrom fd=%d\n", (int)a1);
-	} else if (num == 48) {  // shutdown
+	} else if ((is_i386 && num == 373) || (!is_i386 && num == 48)) {  // shutdown
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op, "shutdown", sizeof(event->op));
@@ -933,7 +954,11 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
 			g_strlcpy(n->op, "socket", sizeof(n->op));
 			n->domain = pending_socket_domain;
 			n->type = pending_socket_type;
-			g_hash_table_insert(g_sockets, (gpointer) (uintptr_t)(n->fd), n);
+			g_hash_table_insert(g_sockets, (gpointer)(uintptr_t)(n->fd), n);
+			net_dep_t *event = g_new0(net_dep_t, 1);
+			memcpy(event, n, sizeof(net_dep_t));
+			event->payload_hex = NULL;
+			net_deps = g_list_append(net_deps, event);
 			pending_socket_domain = -1;
 			pending_socket_type = -1;
 		}
@@ -945,6 +970,13 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
 			n->domain = pending_socket_domain;
 			n->type = pending_socket_type;
 			g_hash_table_insert(g_sockets, (gpointer) (uintptr_t)(n->fd), n);
+			pending_socketcall_subcall = -1;
+			pending_socket_domain = -1;
+			pending_socket_type = -1;
+			net_dep_t *event = g_new0(net_dep_t, 1);
+			memcpy(event, n, sizeof(net_dep_t));
+			event->payload_hex = NULL;
+			net_deps = g_list_append(net_deps, event);
 			pending_socketcall_subcall = -1;
 			pending_socket_domain = -1;
 			pending_socket_type = -1;
