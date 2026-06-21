@@ -32,9 +32,27 @@ class RunReportGenerator:
         self.runtime_status_path = self.logs_dir / "runtime_status.json"
         self.syscall_events_path = self.logs_dir / "syscall_events.jsonl"
         self.syscall_summary_path = self.logs_dir / "syscall_events.summary.json"
+        self.rootfs_snapshot_before_path = self.logs_dir / "rootfs_snapshot_before.json"
+        self.rootfs_snapshot_after_path = self.logs_dir / "rootfs_snapshot_after.json"
+        self.rootfs_diff_path = self.logs_dir / "rootfs_diff.json"
 
         self.report_json_path = self.out_dir / "report.json"
         self.report_md_path = self.out_dir / "report.md"
+
+
+    def build_filesystem_section(self, rootfs_diff: dict[str, Any]) -> dict[str, Any]:
+        created = rootfs_diff.get("created", [])
+        modified = rootfs_diff.get("modified", [])
+        deleted = rootfs_diff.get("deleted", [])
+
+        return {
+            "created_count": rootfs_diff.get("created_count", len(created)),
+            "modified_count": rootfs_diff.get("modified_count", len(modified)),
+            "deleted_count": rootfs_diff.get("deleted_count", len(deleted)),
+            "created": created[:100],
+            "modified": modified[:100],
+            "deleted": deleted[:100],
+        }
 
     def build_syscalls_section(
         self,
@@ -137,6 +155,7 @@ class RunReportGenerator:
         runtime_status = self.load_json_optional(self.runtime_status_path)
         raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path)
         syscall_summary = self.load_json_optional(self.syscall_summary_path)
+        rootfs_diff = self.load_json_optional(self.rootfs_diff_path)
 
         syscall_events = [
             e for e in raw_syscall_events
@@ -160,6 +179,7 @@ class RunReportGenerator:
                 syscall_events=syscall_events,
                 syscall_summary={},
             ),
+            "filesystem": self.build_filesystem_section(rootfs_diff),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
             "security": self.build_security_section(network_policy),
@@ -184,6 +204,9 @@ class RunReportGenerator:
             "runtime_stderr": self.rel(self.logs_dir / "runtime_stderr.log"),
             "report_json": self.rel(self.report_json_path),
             "report_md": self.rel(self.report_md_path),
+            "rootfs_snapshot_before": self.rel(self.rootfs_snapshot_before_path),
+            "rootfs_snapshot_after": self.rel(self.rootfs_snapshot_after_path),
+            "rootfs_diff": self.rel(self.rootfs_diff_path),
         }
 
     def build_runtime_section(self, runtime: dict[str, Any], runtime_status: dict[str, Any]) -> dict[str, Any]:
@@ -266,6 +289,47 @@ class RunReportGenerator:
             if event.get("udp_role") == "dns"
         ]
 
+        http_events = [
+            event for event in network_events
+            if event.get("event") == "tcp_data"
+            and event.get("http_parse_ok") is True
+        ]
+
+        http_hosts = sorted(
+            {
+                event.get("http_host")
+                for event in http_events
+                if event.get("http_host")
+            }
+        )
+
+        http_requests = [
+            {
+                "method": event.get("http_method"),
+                "host": event.get("http_host"),
+                "path": event.get("http_path"),
+                "user_agent": event.get("http_user_agent"),
+                "original_remote_ip": event.get("original_remote_ip"),
+                "original_remote_port": event.get("original_remote_port"),
+                "payload_file": event.get("payload_file"),
+            }
+            for event in http_events
+        ]
+
+        dns_queries = sorted(
+            {
+                event.get("dns_query")
+                for event in dns_events
+                if event.get("dns_query")
+            }
+        )
+
+        dns_responses_sent = sum(
+            1
+            for event in dns_events
+            if event.get("dns_response_sent") is True
+        )
+
         return {
             "mode": network_policy.get("mode"),
             "allow_internet": network_policy.get("allow_internet"),
@@ -279,9 +343,14 @@ class RunReportGenerator:
             "unknown_tcp_events": len(unknown_tcp_events),
             "udp_datagrams": len(udp_events),
             "dns_datagrams": len(dns_events),
+            "dns_queries": dns_queries,
+            "dns_responses_sent": dns_responses_sent,
             "known_tcp_targets": self.unique_targets(known_tcp_events),
             "unknown_tcp_targets": self.unique_targets(unknown_tcp_events),
             "udp_targets": self.unique_targets(udp_events),
+            "http_requests_count": len(http_requests),
+            "http_hosts": http_hosts,
+            "http_requests": http_requests[:100],
         }
 
     def build_artifacts_section(
@@ -375,6 +444,7 @@ class RunReportGenerator:
         libraries = report["libraries"]
         network = report["network"]
         syscalls = report["syscalls"]
+        filesystem = report["filesystem"]
         artifacts = report["artifacts"]
         security = report["security"]
         logs = report["logs"]
@@ -471,6 +541,8 @@ class RunReportGenerator:
         lines.append(f"- Unknown TCP events: `{network.get('unknown_tcp_events')}`")
         lines.append(f"- UDP datagrams: `{network.get('udp_datagrams')}`")
         lines.append(f"- DNS datagrams: `{network.get('dns_datagrams')}`")
+        lines.append(f"- DNS responses sent: `{network.get('dns_responses_sent')}`")
+        lines.append(f"- DNS queries: `{network.get('dns_queries')}`")
         lines.append("")
 
         if network["services"]:
@@ -516,6 +588,30 @@ class RunReportGenerator:
                 )
         else:
             lines.append("- No network attempts recorded from malware syscalls.")
+        lines.append("")
+
+        http_requests = network.get("http_requests") or []
+        lines.append("### Observed HTTP requests")
+        lines.append("")
+        if http_requests:
+            lines.append("| Method | Host | Path | Original target | User-Agent |")
+            lines.append("|---|---|---|---|---|")
+
+            for item in http_requests[:50]:
+                original_target = (
+                    f"{item.get('original_remote_ip')}:{item.get('original_remote_port')}"
+                )
+
+                lines.append(
+                    "| "
+                    f"`{item.get('method')}` | "
+                    f"`{item.get('host')}` | "
+                    f"`{item.get('path')}` | "
+                    f"`{original_target}` | "
+                    f"`{item.get('user_agent')}` |"
+                )
+        else:
+            lines.append("- No HTTP requests recorded.")
         lines.append("")
 
 
@@ -592,6 +688,68 @@ class RunReportGenerator:
             lines.append("- No high-risk syscall events recorded.")
         lines.append("")
 
+        lines.append("## Filesystem mutations")
+        lines.append("")
+        lines.append(f"- Created files/entries: `{filesystem.get('created_count')}`")
+        lines.append(f"- Modified files/entries: `{filesystem.get('modified_count')}`")
+        lines.append(f"- Deleted files/entries: `{filesystem.get('deleted_count')}`")
+        lines.append("")
+
+        created = filesystem.get("created") or []
+        lines.append("### Created entries")
+        lines.append("")
+        if created:
+            lines.append("| Path | Type | Size | SHA256 |")
+            lines.append("|---|---|---:|---|")
+
+            for item in created[:50]:
+                lines.append(
+                    "| "
+                    f"`{item.get('path')}` | "
+                    f"`{item.get('type')}` | "
+                    f"{item.get('size')} | "
+                    f"`{item.get('sha256')}` |"
+                )
+        else:
+            lines.append("- No created entries.")
+        lines.append("")
+
+        modified = filesystem.get("modified") or []
+        lines.append("### Modified entries")
+        lines.append("")
+        if modified:
+            lines.append("| Path | Changes |")
+            lines.append("|---|---|")
+
+            for item in modified[:50]:
+                changes = ", ".join(sorted((item.get("changes") or {}).keys()))
+                lines.append(
+                    "| "
+                    f"`{item.get('path')}` | "
+                    f"`{changes}` |"
+                )
+        else:
+            lines.append("- No modified entries.")
+        lines.append("")
+
+        deleted = filesystem.get("deleted") or []
+        lines.append("### Deleted entries")
+        lines.append("")
+        if deleted:
+            lines.append("| Path | Type | Size | SHA256 |")
+            lines.append("|---|---|---:|---|")
+
+            for item in deleted[:50]:
+                lines.append(
+                    "| "
+                    f"`{item.get('path')}` | "
+                    f"`{item.get('type')}` | "
+                    f"{item.get('size')} | "
+                    f"`{item.get('sha256')}` |"
+                )
+        else:
+            lines.append("- No deleted entries.")
+        lines.append("")
 
         lines.append("## Artifacts")
         lines.append("")

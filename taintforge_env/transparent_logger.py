@@ -13,6 +13,104 @@ IP_RECVORIGDSTADDR = 20
 
 PREVIEW_BYTES = 64
 TCP_RESPONSE = b"OK\n"
+HTTP_METHODS = {
+    "GET",
+    "POST",
+    "HEAD",
+    "PUT",
+    "DELETE",
+    "OPTIONS",
+    "PATCH",
+}
+
+
+def parse_http_request(data: bytes) -> dict:
+    try:
+        text = data.decode("iso-8859-1", errors="replace")
+    except Exception as e:
+        return {
+            "http_parse_ok": False,
+            "http_parse_error": f"decode_failed:{e}",
+        }
+
+    if "\r\n" in text:
+        lines = text.split("\r\n")
+        header_separator = "\r\n\r\n"
+    else:
+        lines = text.split("\n")
+        header_separator = "\n\n"
+
+    if not lines:
+        return {
+            "http_parse_ok": False,
+            "http_parse_error": "empty_request",
+        }
+
+    request_line = lines[0].strip()
+    parts = request_line.split()
+
+    if len(parts) < 3:
+        return {
+            "http_parse_ok": False,
+            "http_parse_error": "bad_request_line",
+            "http_request_line": request_line,
+        }
+
+    method, path, version = parts[0], parts[1], parts[2]
+
+    if method.upper() not in HTTP_METHODS:
+        return {
+            "http_parse_ok": False,
+            "http_parse_error": "unknown_method",
+            "http_request_line": request_line,
+        }
+
+    headers: dict[str, str] = {}
+
+    for line in lines[1:]:
+        line = line.strip()
+
+        if not line:
+            break
+
+        if ":" not in line:
+            continue
+
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+
+    body = b""
+    marker = header_separator.encode("iso-8859-1")
+
+    if marker in data:
+        body = data.split(marker, 1)[1]
+
+    return {
+        "http_parse_ok": True,
+        "http_method": method.upper(),
+        "http_path": path,
+        "http_version": version,
+        "http_host": headers.get("host"),
+        "http_user_agent": headers.get("user-agent"),
+        "http_content_type": headers.get("content-type"),
+        "http_body_size": len(body),
+        "http_body_hex_preview": body[:PREVIEW_BYTES].hex(),
+        "http_request_line": request_line,
+    }
+
+
+def build_http_response() -> bytes:
+    body = b"TaintForge-IoT fake HTTP service\n"
+
+    return (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Connection: close\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode("ascii")
+        + b"\r\n"
+        + body
+    )
+
 
 
 def lookup_udp_original_destination_conntrack(
@@ -105,6 +203,183 @@ def guess_udp_role(port: int | None) -> str:
         return "ntp"
 
     return "udp"
+
+DNS_QTYPE_NAMES = {
+    1: "A",
+    2: "NS",
+    5: "CNAME",
+    12: "PTR",
+    15: "MX",
+    16: "TXT",
+    28: "AAAA",
+}
+
+
+def parse_dns_query(packet: bytes) -> dict:
+    if len(packet) < 12:
+        return {
+            "dns_parse_ok": False,
+            "dns_parse_error": "packet_too_short",
+        }
+
+    try:
+        transaction_id, flags, qdcount, ancount, nscount, arcount = struct.unpack(
+            "!HHHHHH",
+            packet[:12],
+        )
+    except struct.error as e:
+        return {
+            "dns_parse_ok": False,
+            "dns_parse_error": f"header_unpack_failed:{e}",
+        }
+
+    if qdcount < 1:
+        return {
+            "dns_parse_ok": False,
+            "dns_parse_error": "no_questions",
+            "dns_transaction_id": transaction_id,
+        }
+
+    offset = 12
+    labels: list[str] = []
+
+    try:
+        while True:
+            if offset >= len(packet):
+                return {
+                    "dns_parse_ok": False,
+                    "dns_parse_error": "qname_out_of_bounds",
+                    "dns_transaction_id": transaction_id,
+                }
+
+            length = packet[offset]
+            offset += 1
+
+            if length == 0:
+                break
+
+            if length & 0xC0:
+                return {
+                    "dns_parse_ok": False,
+                    "dns_parse_error": "compressed_qname_not_supported",
+                    "dns_transaction_id": transaction_id,
+                }
+
+            if offset + length > len(packet):
+                return {
+                    "dns_parse_ok": False,
+                    "dns_parse_error": "label_out_of_bounds",
+                    "dns_transaction_id": transaction_id,
+                }
+
+            labels.append(
+                packet[offset:offset + length].decode("ascii", errors="replace")
+            )
+            offset += length
+
+        if offset + 4 > len(packet):
+            return {
+                "dns_parse_ok": False,
+                "dns_parse_error": "question_tail_out_of_bounds",
+                "dns_transaction_id": transaction_id,
+            }
+
+        qtype, qclass = struct.unpack("!HH", packet[offset:offset + 4])
+
+        return {
+            "dns_parse_ok": True,
+            "dns_transaction_id": transaction_id,
+            "dns_flags": flags,
+            "dns_qdcount": qdcount,
+            "dns_query": ".".join(labels),
+            "dns_qtype": qtype,
+            "dns_qtype_name": DNS_QTYPE_NAMES.get(qtype, str(qtype)),
+            "dns_qclass": qclass,
+            "dns_question_end_offset": offset + 4,
+        }
+
+    except Exception as e:
+        return {
+            "dns_parse_ok": False,
+            "dns_parse_error": f"unexpected:{type(e).__name__}:{e}",
+            "dns_transaction_id": transaction_id,
+        }
+
+
+def build_dns_empty_response(query_packet: bytes, info: dict) -> bytes | None:
+    try:
+        transaction_id = int(info["dns_transaction_id"])
+        query_flags = int(info.get("dns_flags", 0))
+        question_end = int(info["dns_question_end_offset"])
+    except Exception:
+        return None
+
+    question = query_packet[12:question_end]
+
+    # QR=1, RA=1, RD copied from query, RCODE=0, ANCOUNT=0.
+    response_flags = 0x8000 | 0x0080 | (query_flags & 0x0100)
+
+    header = struct.pack(
+        "!HHHHHH",
+        transaction_id,
+        response_flags,
+        1,
+        0,
+        0,
+        0,
+    )
+
+    return header + question
+
+
+def build_dns_a_response(
+    query_packet: bytes,
+    answer_ip: str = "10.10.0.1",
+    ttl: int = 60,
+) -> bytes | None:
+    info = parse_dns_query(query_packet)
+
+    if not info.get("dns_parse_ok"):
+        return None
+
+    qtype = int(info.get("dns_qtype", 0))
+    qclass = int(info.get("dns_qclass", 0))
+
+    # MVP: only answer IN A queries. For AAAA/TXT/etc return valid empty response.
+    if qtype != 1 or qclass != 1:
+        return build_dns_empty_response(query_packet, info)
+
+    transaction_id = int(info["dns_transaction_id"])
+    query_flags = int(info.get("dns_flags", 0))
+    question_end = int(info["dns_question_end_offset"])
+
+    question = query_packet[12:question_end]
+
+    # QR=1, RA=1, RD copied from query, RCODE=0.
+    response_flags = 0x8000 | 0x0080 | (query_flags & 0x0100)
+
+    header = struct.pack(
+        "!HHHHHH",
+        transaction_id,
+        response_flags,
+        1,  # QDCOUNT
+        1,  # ANCOUNT
+        0,
+        0,
+    )
+
+    answer_name = b"\xC0\x0C"
+    answer_type = 1
+    answer_class = 1
+    answer_rdata = bytes(int(part) for part in answer_ip.split("."))
+
+    answer = (
+        answer_name
+        + struct.pack("!HHIH", answer_type, answer_class, ttl, len(answer_rdata))
+        + answer_rdata
+    )
+
+    return header + question + answer
 
 def is_redirected_udp_destination(
     original_ip: str | None,
@@ -219,25 +494,36 @@ class TransparentTCPLogger:
                     f.write(data)
                     f.flush()
 
-                    append_jsonl_event(
-                        self.events_log_path,
-                        {
-                            "event": "tcp_data",
-                            "listener_type": "catch_all_transparent",
-                            "connection_id": conn_id,
-                            "peer_host": peer_host,
-                            "peer_port": peer_port,
-                            "bind_ip": self.bind_ip,
-                            "bind_port": self.bind_port,
-                            "original_remote_ip": original_ip,
-                            "original_remote_port": original_port,
-                            "payload_file": payload_file,
-                            "bytes_received": len(data),
-                            "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
-                        },
-                    )
+                    http_info = parse_http_request(data)
 
-                    writer.write(TCP_RESPONSE)
+                    data_event = {
+                        "event": "tcp_data",
+                        "listener_type": "catch_all_transparent",
+                        "connection_id": conn_id,
+                        "peer_host": peer_host,
+                        "peer_port": peer_port,
+                        "bind_ip": self.bind_ip,
+                        "bind_port": self.bind_port,
+                        "original_remote_ip": original_ip,
+                        "original_remote_port": original_port,
+                        "payload_file": payload_file,
+                        "bytes_received": len(data),
+                        "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
+                    }
+
+                    if http_info.get("http_parse_ok"):
+                        data_event.update(http_info)
+
+                    append_jsonl_event(self.events_log_path, data_event)
+
+                    if http_info.get("http_parse_ok"):
+                        response = build_http_response()
+                        response_type = "http_200_ok"
+                    else:
+                        response = TCP_RESPONSE
+                        response_type = "generic_ok"
+
+                    writer.write(response)
                     await writer.drain()
 
                     append_jsonl_event(
@@ -253,8 +539,9 @@ class TransparentTCPLogger:
                             "original_remote_ip": original_ip,
                             "original_remote_port": original_port,
                             "payload_file": payload_file,
-                            "bytes_sent": len(TCP_RESPONSE),
-                            "response_hex_preview": TCP_RESPONSE.hex(),
+                            "bytes_sent": len(response),
+                            "response_type": response_type,
+                            "response_hex_preview": response[:PREVIEW_BYTES].hex(),
                         },
                     )
 
@@ -383,25 +670,52 @@ class TransparentUDPLogger:
             payload_path = self.log_dir / payload_file
             payload_path.write_bytes(data)
 
-            append_jsonl_event(
-                self.events_log_path,
-                {
-                    "event": "udp_datagram",
-                    "listener_type": "udp_transparent",
-                    "datagram_id": datagram_id,
-                    "udp_role": udp_role,
-                    "peer_host": peer_host,
-                    "peer_port": peer_port,
-                    "bind_ip": self.bind_ip,
-                    "bind_port": self.bind_port,
-                    "original_remote_ip": original_ip,
-                    "original_remote_port": original_port,
-                    "original_destination_source": original_destination_source,
-                    "payload_file": payload_file,
-                    "bytes_received": len(data),
-                    "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
-                },
-            )
+            dns_info: dict = {}
+            dns_response: bytes | None = None
+            dns_answer_ip = "10.10.0.1"
+
+            if udp_role == "dns":
+                dns_info = parse_dns_query(data)
+
+                if dns_info.get("dns_parse_ok"):
+                    dns_response = build_dns_a_response(
+                        query_packet=data,
+                        answer_ip=dns_answer_ip,
+                    )
+
+                    dns_info["dns_answer_ip"] = dns_answer_ip
+                    dns_info["dns_response_sent"] = dns_response is not None
+                else:
+                    dns_info["dns_response_sent"] = False
+
+            event = {
+                "event": "udp_datagram",
+                "listener_type": "udp_transparent",
+                "datagram_id": datagram_id,
+                "udp_role": udp_role,
+                "peer_host": peer_host,
+                "peer_port": peer_port,
+                "bind_ip": self.bind_ip,
+                "bind_port": self.bind_port,
+                "original_remote_ip": original_ip,
+                "original_remote_port": original_port,
+                "original_destination_source": original_destination_source,
+                "payload_file": payload_file,
+                "bytes_received": len(data),
+                "payload_hex_preview": data[:PREVIEW_BYTES].hex(),
+            }
+
+            event.update(dns_info)
+
+            if dns_response is not None and self.sock is not None:
+                try:
+                    self.sock.sendto(dns_response, peer)
+                except OSError as e:
+                    event["dns_response_sent"] = False
+                    event["dns_response_error"] = str(e)
+
+            append_jsonl_event(self.events_log_path, event)
+
 
     @staticmethod
     def extract_udp_original_destination(

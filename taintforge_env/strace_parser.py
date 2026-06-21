@@ -272,7 +272,7 @@ def parse_strace_line(
             raw=line,
             args="",
             result=signal_match.group("signal"),
-            execution_context=execution_contex
+            execution_context=execution_context
         )
 
     return None

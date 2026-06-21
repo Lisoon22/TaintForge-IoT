@@ -53,7 +53,55 @@ class Phase2Orchestrator:
 
         self.processes: list[subprocess.Popen] = []
 
+    def snapshot_rootfs_before(self) -> None:
+        print("[+] Snapshotting rootfs before malware run")
 
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/rootfs_diff.py",
+                "snapshot",
+                "--rootfs",
+                str(self.rootfs_dir),
+                "--out",
+                str(self.logs_dir / "rootfs_snapshot_before.json"),
+            ],
+            check=False,
+        )
+
+    def snapshot_rootfs_after(self) -> None:
+        print("[+] Snapshotting rootfs after malware run")
+
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/rootfs_diff.py",
+                "snapshot",
+                "--rootfs",
+                str(self.rootfs_dir),
+                "--out",
+                str(self.logs_dir / "rootfs_snapshot_after.json"),
+            ],
+            check=False,
+        )
+
+    def diff_rootfs(self) -> None:
+        print("[+] Diffing rootfs mutations")
+
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/rootfs_diff.py",
+                "diff",
+                "--before",
+                str(self.logs_dir / "rootfs_snapshot_before.json"),
+                "--after",
+                str(self.logs_dir / "rootfs_snapshot_after.json"),
+                "--out",
+                str(self.logs_dir / "rootfs_diff.json"),
+            ],
+            check=False,
+        )
 
     def clear_network_self_test_artifacts(self) -> None:
         print("[+] Clearing network self-test artifacts before malware run")
@@ -78,6 +126,9 @@ class Phase2Orchestrator:
             path.unlink(missing_ok=True)
 
         for path in self.logs_dir.glob("dns_udp_8_8_8_8_53_dgram_*.bin"):
+            path.unlink(missing_ok=True)
+
+        for path in self.logs_dir.glob("catchall_tcp_93_184_216_34_80_conn_*.bin"):
             path.unlink(missing_ok=True)
 
 
@@ -110,7 +161,10 @@ class Phase2Orchestrator:
 
             if self.config.network_mode == "none":
                 self.ensure_sudo()
+                self.snapshot_rootfs_before()
                 self.run_sample_direct()
+                self.snapshot_rootfs_after()
+                self.diff_rootfs()
                 self.parse_strace_logs()
                 self.generate_report()
                 self.print_run_summary()
@@ -134,7 +188,10 @@ class Phase2Orchestrator:
                 self.run_network_self_test()
                 self.clear_network_self_test_artifacts()
 
+            self.snapshot_rootfs_before()
             self.run_sample()
+            self.snapshot_rootfs_after()
+            self.diff_rootfs()
 
             self.parse_strace_logs()
             self.generate_report()
@@ -558,6 +615,12 @@ class Phase2Orchestrator:
                 "ip": "8.8.8.8",
                 "port": 53,
             },
+            "http_target": {
+                "ip": "93.184.216.34",
+                "port": 80,
+                "host": "example.com",
+                "path": "/tf-self-test",
+            },
         }
 
         code = self.build_network_self_test_code(test_config)
@@ -632,14 +695,52 @@ class Phase2Orchestrator:
                     sock.close()
 
 
-            def udp_test(name, host, port, payload):
+            def udp_test(name, host, port, payload, expect_response=False):
                 print(f"[self-test] UDP {{name}} -> {{host}}:{{port}}")
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
                 try:
                     sock.sendto(payload, (host, port))
+
+                    if expect_response:
+                        sock.settimeout(3)
+                        response, peer = sock.recvfrom(4096)
+                        print(
+                            f"[self-test] UDP {{name}} response_from={{peer[0]}}:{{peer[1]}} "
+                            f"response={{response.hex()}}"
+                        )
                 finally:
                     sock.close()
+
+
+            def build_dns_query(domain):
+                transaction_id = b"\\x12\\x34"
+                flags = b"\\x01\\x00"
+                qdcount = b"\\x00\\x01"
+                ancount = b"\\x00\\x00"
+                nscount = b"\\x00\\x00"
+                arcount = b"\\x00\\x00"
+
+                qname = b""
+                for label in domain.split("."):
+                    encoded = label.encode("ascii")
+                    qname += bytes([len(encoded)]) + encoded
+                qname += b"\\x00"
+
+                qtype = b"\\x00\\x01"
+                qclass = b"\\x00\\x01"
+
+                return (
+                    transaction_id
+                    + flags
+                    + qdcount
+                    + ancount
+                    + nscount
+                    + arcount
+                    + qname
+                    + qtype
+                    + qclass
+                )
 
 
             known = config.get("known_target")
@@ -661,6 +762,24 @@ class Phase2Orchestrator:
                 b"unknown-self-test",
             )
 
+            http = config["http_target"]
+            tcp_test(
+                "http",
+                http["ip"],
+                int(http["port"]),
+                (
+                    b"GET "
+                    + http["path"].encode("ascii")
+                    + b" HTTP/1.1\\r\\n"
+                    + b"Host: "
+                    + http["host"].encode("ascii")
+                    + b"\\r\\n"
+                    + b"User-Agent: TaintForge-SelfTest\\r\\n"
+                    + b"Connection: close\\r\\n"
+                    + b"\\r\\n"
+                ),
+            )
+
             udp = config["udp_target"]
             udp_test(
                 "generic",
@@ -674,13 +793,13 @@ class Phase2Orchestrator:
                 "dns-like",
                 dns["ip"],
                 int(dns["port"]),
-                b"\\x12\\x34fake-dns-query",
+                build_dns_query("example.com"),
+                expect_response=True,
             )
 
             time.sleep(0.2)
             """
         ).strip()
-
 
     def validate_network_self_test_events(self, test_config: dict) -> None:
         print("[+] Validating network self-test events")
@@ -726,6 +845,26 @@ class Phase2Orchestrator:
                 "Self-test failed: unknown TCP catch-all event was not logged"
             )
 
+
+        http = test_config["http_target"]
+
+        http_seen = any(
+            event.get("event") == "tcp_data"
+            and event.get("listener_type") == "catch_all_transparent"
+            and event.get("original_remote_ip") == http["ip"]
+            and int(event.get("original_remote_port") or 0) == int(http["port"])
+            and event.get("http_parse_ok") is True
+            and event.get("http_method") == "GET"
+            and event.get("http_path") == http["path"]
+            and event.get("http_host") == http["host"]
+            for event in events
+        )
+
+        if not http_seen:
+            raise OrchestratorError(
+                "Self-test failed: HTTP request was not parsed by transparent TCP logger"
+            )
+
         udp = test_config["udp_target"]
         if not self.has_event(
             events,
@@ -747,6 +886,22 @@ class Phase2Orchestrator:
         ):
             raise OrchestratorError(
                 "Self-test failed: DNS-like UDP event was not logged"
+            )
+
+        dns_response_seen = any(
+            event.get("listener_type") == "udp_transparent"
+            and event.get("udp_role") == "dns"
+            and event.get("original_remote_ip") == dns["ip"]
+            and int(event.get("original_remote_port") or 0) == int(dns["port"])
+            and event.get("dns_parse_ok") is True
+            and event.get("dns_query") == "example.com"
+            and event.get("dns_response_sent") is True
+            for event in events
+        )
+
+        if not dns_response_seen:
+            raise OrchestratorError(
+                "Self-test failed: DNS query was logged, but fake DNS response was not sent"
             )
 
         print("[+] Network self-test passed")
@@ -1071,7 +1226,7 @@ class Phase2Orchestrator:
 
         if check and result.returncode != 0:
             raise OrchestratorError(
-                "Command failed with exit code {result.returncode}: {' '.join(cmd)}\n{result.stderr}"
+                f"Command failed with exit code {result.returncode}: {' '.join(cmd)}\n{result.stderr}"
             )
 
         return result.stdout
