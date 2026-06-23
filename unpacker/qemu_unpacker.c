@@ -80,7 +80,10 @@ static GList *net_deps = NULL;
 static GList *lib_deps = NULL;
 static GHashTable *g_sockets = NULL;
 static GHashTable *file_fd = NULL;
-static int next_fd = 3; 
+//fd
+static char *pending_open_path = NULL;
+static bool pending_open_is_lib = false;
+static bool pending_open_write = false;
 
 static bool parse_guest_sockaddr(uint64_t gaddr, int addrlen, char *ip_out, size_t ip_size, uint16_t *port_out) {
 	if (addrlen <= 0 || gaddr == 0 || !ip_out || !port_out) return false;
@@ -374,6 +377,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 		g_string_free(saved_reg, TRUE);
 	}
 	
+	//fd
+	g_free(pending_open_path);
+
 	//capstone handle
 	cs_close(&cs_handle);
 	meta_free();
@@ -482,36 +488,48 @@ static int pending_socketcall_subcall = -1;
 static int pending_socket_domain = -1;
 static int pending_socket_type = -1;
 
+//for dup fd check
+static int pending_dup_fd = -1;
+
 static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
 	//x86
 	if (num == 5) {  //open
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
-			bool is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
-			file_dep_t *f = add_file_dep(path, is_lib);
-			g_hash_table_insert(file_fd, GINT_TO_POINTER(next_fd), f);
-			fprintf(stderr, "[FILE] open: %s (fd=%d)\n", path, next_fd);
-			next_fd ++;
+			pending_open_is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
+			pending_open_write = ((int)a2 & (1 | 2)) != 0; // w | r
+			pending_open_path = g_strdup(path);
+			g_free(path);
 		} else {
 			g_free(path);
 		}
 	} else if (num == 295) {  //openat
 		char *path = read_guest_string(a2);
 		if (path && *path && is_valid_path(path)) {
-			bool is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
-			file_dep_t *f = add_file_dep(path, is_lib);
-			g_hash_table_insert(file_fd, GINT_TO_POINTER(next_fd), f);
-			fprintf(stderr, "[FILE] openat: %s (fd=%d)\n", path, next_fd);
-			next_fd++;
+			pending_open_is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
+			pending_open_write = ((int)a3 & (1 | 2)) != 0; // w | r
+			pending_open_path = g_strdup(path);
+			g_free(path);
 		} else {
 			g_free(path);
 		}
-	} else if (num == 4) {  // write
+	} else if (num == 4 || num == 146 || num == 181) {  // write, writev pwrite
 		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
 		if (val) {
 			file_dep_t *f = (file_dep_t*)val;
 			f->write = true;
-			fprintf(stderr, "[FILE] write(fd=%d) -> %s\n", (int)a1, f->path);
+		}
+	} else if ((is_i386 && num == 41) || (!is_i386 && num == 32)) {  // dup
+		pending_dup_fd = (int)a1;
+	} else if ((is_i386 && num == 63) || (!is_i386 && num == 33)) {  // dup2
+		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
+		if (val) {
+			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)a2), val);
+		}
+	} else if ((is_i386 && num == 330) || (!is_i386 && num == 292)) {  // dup3
+		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
+		if (val) {
+			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)a2), val);
 		}
 	} else if (num == 6) {  // close
 		g_hash_table_remove(file_fd, GINT_TO_POINTER((int)a1));
@@ -519,7 +537,6 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
 			add_file_dep(path, false);
-			fprintf(stderr, "[FILE] access: %s\n", path);
 		} else {
 			g_free(path);
 		}
@@ -527,7 +544,6 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		char *path = read_guest_string(a2);
 		if (path && *path && is_valid_path(path)) {
 			add_file_dep(path, false);
-			fprintf(stderr, "[FILE] faccessat: %s\n", path);
 		} else {
 			g_free(path);
 		}
@@ -944,10 +960,30 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
 	if ((int64_t)ret < 0) {
 		pending_socketcall_subcall = -1;
 		pending_socket_domain = -1;
+		pending_dup_fd = -1;
+		g_free(pending_open_path);
+		pending_open_path = NULL;
 		return;
 	}
 
-	if (num == 359 || num == 41) {  // socket
+	if (pending_open_path) {
+		file_dep_t *f = add_file_dep(pending_open_path, pending_open_is_lib);
+		f->write = pending_open_write;
+		g_hash_table_insert(file_fd, GINT_TO_POINTER((int)ret), f);
+		g_free(pending_open_path);
+		pending_open_path = NULL;
+	}
+
+	if (pending_dup_fd >= 0) { //dup
+		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER(pending_dup_fd));
+		if (val) {
+			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)ret), val);
+		}
+		pending_dup_fd = -1;
+		return;
+	}
+
+	if ((is_i386 && num == 359) || (!is_i386 && num == 41)) {  // socket
 		if (pending_socket_domain != -1) {
 			net_dep_t *n = g_new0(net_dep_t, 1);
 			n->fd = (int)ret;
