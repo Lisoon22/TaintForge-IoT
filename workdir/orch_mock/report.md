@@ -1,6 +1,6 @@
 # TaintForge-IoT Phase 2 Run Report
 
-Generated at UTC: `2026-06-17T21:38:23.110927+00:00`
+Generated at UTC: `2026-06-20T15:55:13.984390+00:00`
 Output directory: `workdir/orch_mock`
 
 ## Runtime
@@ -19,9 +19,9 @@ Output directory: `workdir/orch_mock`
 - Timed out: `False`
 - Timeout seconds: `60`
 - Duration seconds: `0`
-- Started at UTC: `2026-06-17T21:38:22Z`
-- Finished at UTC: `2026-06-17T21:38:22Z`
-- Command: `sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf`
+- Started at UTC: `2026-06-20T15:55:13Z`
+- Finished at UTC: `2026-06-20T15:55:13Z`
+- Command: `sudo ip netns exec tf-iot-ns unshare --pid --mount --uts --ipc chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf`
 
 ### Host binary metadata
 
@@ -155,28 +155,29 @@ Output directory: `workdir/orch_mock`
 
 ## Security model
 
+- `isolation_ready`: `True`
 - `chroot_enabled`: `True`
 - `network_namespace_enabled`: `True`
+- `pid_namespace_enabled`: `True`
+- `mount_namespace_enabled`: `True`
+- `uts_namespace_enabled`: `True`
+- `ipc_namespace_enabled`: `True`
+- `user_namespace_enabled`: `False`
+- `mount_propagation`: `private`
+- `sandbox_hostname`: `taintforge-iot`
+- `proc_mode`: `static_rootfs_stubs`
 - `iptables_default_deny_expected`: `True`
 - `host_ip_forwarding_expected`: `False`
 - `allow_internet`: `False`
 - `known_endpoint_dnat`: `True`
 - `tcp_catch_all_redirect`: `True`
 - `udp_catch_all_redirect`: `True`
-- `resource_limits`: `disabled_in_v1_timeout_only`
-
+- `strace_enabled`: `True`
+- `resource_limits`: `{"cpu_seconds": 30, "file_size_blocks": 10240, "open_files": 256, "processes": 256, "processes_enforcement": "best_effort_for_uid_0", "virtual_memory_kb": 524288}`
+- `limitations`: `["malware still runs as UID 0 inside chroot", "no user namespace", "no seccomp filter", "no cgroup memory or process enforcement", "chroot and namespaces are not a virtual machine boundary"]`
 ## Runtime stdout preview
 
 ```text
-bin
-dev
-etc
-lib
-lib64
-proc
-tmp
-usr
-var
 
 ```
 
@@ -193,10 +194,7 @@ var
 [self-test] TCP known response=00000000
 [self-test] TCP unknown -> 91.200.10.5:5555
 [self-test] TCP unknown response=4f4b0a
-[self-test] TCP http -> 93.184.216.34:80
-[self-test] TCP http response=485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e6e656374696f6e3a20636c6f73650d0a436f6e74656e742d4c656e6774683a2033330d0a0d0a5461696e74466f7267652d496f542066616b65204854545020736572766963650a
 [self-test] UDP generic -> 1.2.3.4:9999
 [self-test] UDP dns-like -> 8.8.8.8:53
-[self-test] UDP dns-like response_from=8.8.8.8:53 response=123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000003c00040a0a0001
 
 ```

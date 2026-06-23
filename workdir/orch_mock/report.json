@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-06-17T21:38:23.110927+00:00",
+  "generated_at_utc": "2026-06-20T15:55:13.984390+00:00",
   "out_dir": "workdir/orch_mock",
   "paths": {
     "runtime": "config/runtime.json",
@@ -10,6 +10,7 @@
     "syscall_events": "logs/syscall_events.jsonl",
     "syscall_summary": "logs/syscall_events.summary.json",
     "runtime_status": "logs/runtime_status.json",
+    "security_status": "logs/security_status.json",
     "runtime_stdout": "logs/runtime_stdout.log",
     "runtime_stderr": "logs/runtime_stderr.log",
     "report_json": "report.json",
@@ -36,22 +37,25 @@
     "libraries_ok": true,
     "library_resolution_path": "workdir/orch_mock/config/library_resolution.json",
     "status": {
-      "command": "sudo ip netns exec tf-iot-ns chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf",
+      "command": "sudo ip netns exec tf-iot-ns unshare --pid --mount --uts --ipc chroot /home/lisoon/taintforge/workdir/orch_mock/rootfs /bin/unpacked.elf",
       "namespace": "tf-iot-ns",
       "rootfs": "/home/lisoon/taintforge/workdir/orch_mock/rootfs",
       "guest_command": "/bin/unpacked.elf",
       "exit_code": 0,
       "timed_out": false,
       "timeout_seconds": 60,
-      "started_at_utc": "2026-06-17T21:38:22Z",
-      "finished_at_utc": "2026-06-17T21:38:22Z",
+      "started_at_utc": "2026-06-20T15:55:13Z",
+      "finished_at_utc": "2026-06-20T15:55:13Z",
       "duration_seconds": 0,
       "stdout_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stdout.log",
       "stderr_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/runtime_stderr.log",
       "strace_enabled": true,
-      "strace_prefix": "/home/lisoon/taintforge/workdir/orch_mock/logs/strace"
+      "strace_prefix": "/home/lisoon/taintforge/workdir/orch_mock/logs/strace",
+      "isolation_ready": true,
+      "security_status_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/security_status.json",
+      "resource_limits_path": "/home/lisoon/taintforge/workdir/orch_mock/logs/resource_limits.txt"
     },
-    "stdout_preview": "bin\ndev\netc\nlib\nlib64\nproc\ntmp\nusr\nvar\n",
+    "stdout_preview": "",
     "stderr_preview": ""
   },
   "libraries": {
@@ -246,10 +250,16 @@
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
       {
+        "path": "logs/network_events.jsonl",
+        "exists": true,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
         "path": "logs/network_self_test_events.jsonl",
         "exists": true,
-        "size_bytes": 6620,
-        "sha256": "751611a2e713f559820d556628805062a6ecfe1e2264867b79ef84e5b603c7aa"
+        "size_bytes": 4339,
+        "sha256": "d6417077d6471014dd577f9dd3a5d30f47caccef9765c2ce44dbe54f24de47f7"
       },
       {
         "path": "logs/network_self_test_stderr.log",
@@ -260,62 +270,44 @@
       {
         "path": "logs/network_self_test_stdout.log",
         "exists": true,
-        "size_bytes": 703,
-        "sha256": "d0617cc9a51b07cb27fe00f03bb70babb13017a9e1097469a7ab51102ce3a0fa"
+        "size_bytes": 247,
+        "sha256": "b9e6fab01b4ed6b8ee94f8239bcad51289b40fddc080569e053e1f42f926d27d"
       },
       {
-        "path": "logs/rootfs_diff.json",
+        "path": "logs/resource_limits.txt",
         "exists": true,
-        "size_bytes": 272,
-        "sha256": "59faf4fc7a9ea6985aebe17b338bf91daed8e76d15a932de3e4d18f1c5245277"
-      },
-      {
-        "path": "logs/rootfs_snapshot_after.json",
-        "exists": true,
-        "size_bytes": 7697,
-        "sha256": "880f8f11aef4cff27895ba2389d7139a5149d240d431f57c795e09c0d56e4fc0"
-      },
-      {
-        "path": "logs/rootfs_snapshot_before.json",
-        "exists": true,
-        "size_bytes": 7697,
-        "sha256": "1f21f2a9ad517bd5f146de804a3303681f009041b632939d3d97fa208fbcb701"
+        "size_bytes": 800,
+        "sha256": "18bf50574383de0720bff7420a29d2add62528af35ca2d04edc453e5e667b8fc"
       },
       {
         "path": "logs/runtime_status.json",
         "exists": true,
-        "size_bytes": 707,
-        "sha256": "10fb0b5065593d91fe9916b25fa205a8919c414fdcec805b80ea236eeabd11dd"
+        "size_bytes": 961,
+        "sha256": "47bb11a5c067659b3c5f096e26260a3f5512195b10c67618fbc37cd25259dc7c"
       },
       {
-        "path": "logs/runtime_stderr.log",
+        "path": "logs/security_status.json",
         "exists": true,
-        "size_bytes": 0,
-        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        "size_bytes": 818,
+        "sha256": "dc63a092b4b8c4af20bf238d1e814ab3ee0ececbe4ccd7476b9cbfbe03052674"
       },
       {
-        "path": "logs/runtime_stdout.log",
-        "exists": true,
-        "size_bytes": 39,
-        "sha256": "2aadb2f74103af1f3914a0aedd0c023c5f566f4dbc7e5b8b5a9f8f9fe10639f7"
-      },
-      {
-        "path": "logs/strace.82068",
+        "path": "logs/strace.8",
         "exists": true,
         "size_bytes": 5342,
-        "sha256": "1cb9086c1473fdf36092d23c5b50e3dcfdee82cb0d1aa6c97e5ea4b759d6b5f5"
+        "sha256": "a3ea785de1db2ea9f39e3d0617bb7915d70cf27b0cb3eddf75fcc0f79bd8a568"
       },
       {
         "path": "logs/syscall_events.jsonl",
         "exists": true,
-        "size_bytes": 30845,
-        "sha256": "9e32462a5a8e3611bbe7f6721f5cbf73247c045be06f7e9ffddf1f22ecfb6be6"
+        "size_bytes": 30605,
+        "sha256": "c37e13a9004f447a63e43667249ddcda1d7e696f61e462a72974b715d030e1d4"
       },
       {
         "path": "logs/syscall_events.summary.json",
         "exists": true,
         "size_bytes": 3302,
-        "sha256": "8ddd883825377778b694ad4eaf1e4ac4632645d032ff0bc217d4e2c110676938"
+        "sha256": "77ab4730cdd125591adcf5a619263bf67fda6defc9779ded1c18ab1d4d29682b"
       },
       {
         "path": "logs/transparent_logger_stderr.log",
@@ -332,9 +324,9 @@
     ]
   },
   "logs": {
-    "runtime_stdout": "bin\ndev\netc\nlib\nlib64\nproc\ntmp\nusr\nvar\n",
+    "runtime_stdout": "",
     "runtime_stderr": "",
-    "network_self_test_stdout": "[self-test] TCP known -> 185.62.190.0:48101\n[self-test] TCP known response=00000000\n[self-test] TCP unknown -> 91.200.10.5:5555\n[self-test] TCP unknown response=4f4b0a\n[self-test] TCP http -> 93.184.216.34:80\n[self-test] TCP http response=485454502f312e3120323030204f4b0d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e6e656374696f6e3a20636c6f73650d0a436f6e74656e742d4c656e6774683a2033330d0a0d0a5461696e74466f7267652d496f542066616b65204854545020736572766963650a\n[self-test] UDP generic -> 1.2.3.4:9999\n[self-test] UDP dns-like -> 8.8.8.8:53\n[self-test] UDP dns-like response_from=8.8.8.8:53 response=123481800001000100000000076578616d706c6503636f6d0000010001c00c000100010000003c00040a0a0001\n",
+    "network_self_test_stdout": "[self-test] TCP known -> 185.62.190.0:48101\n[self-test] TCP known response=00000000\n[self-test] TCP unknown -> 91.200.10.5:5555\n[self-test] TCP unknown response=4f4b0a\n[self-test] UDP generic -> 1.2.3.4:9999\n[self-test] UDP dns-like -> 8.8.8.8:53\n",
     "network_self_test_stderr": "",
     "transparent_logger_stdout": "",
     "transparent_logger_stderr": "",
@@ -342,14 +334,38 @@
     "network_emulator_stderr": ""
   },
   "security": {
+    "isolation_ready": true,
     "chroot_enabled": true,
     "network_namespace_enabled": true,
+    "pid_namespace_enabled": true,
+    "mount_namespace_enabled": true,
+    "uts_namespace_enabled": true,
+    "ipc_namespace_enabled": true,
+    "user_namespace_enabled": false,
+    "mount_propagation": "private",
+    "sandbox_hostname": "taintforge-iot",
+    "proc_mode": "static_rootfs_stubs",
     "iptables_default_deny_expected": true,
     "host_ip_forwarding_expected": false,
     "allow_internet": false,
     "known_endpoint_dnat": true,
     "tcp_catch_all_redirect": true,
     "udp_catch_all_redirect": true,
-    "resource_limits": "disabled_in_v1_timeout_only"
+    "strace_enabled": true,
+    "resource_limits": {
+      "cpu_seconds": 30,
+      "virtual_memory_kb": 524288,
+      "open_files": 256,
+      "processes": 256,
+      "processes_enforcement": "best_effort_for_uid_0",
+      "file_size_blocks": 10240
+    },
+    "limitations": [
+      "malware still runs as UID 0 inside chroot",
+      "no user namespace",
+      "no seccomp filter",
+      "no cgroup memory or process enforcement",
+      "chroot and namespaces are not a virtual machine boundary"
+    ]
   }
 }

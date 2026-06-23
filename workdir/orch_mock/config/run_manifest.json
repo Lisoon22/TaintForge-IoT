@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "run_id": "20260620T155511Z-5840bd1a-a87cf3",
+  "created_at_utc": "2026-06-20T15:55:11.629772+00:00",
+  "inputs": {
+    "taint": {
+      "path": "/home/lisoon/taintforge/examples/mock.json",
+      "size_bytes": 920,
+      "sha256": "9a3a2a884620e8babbe996449f48b6e2f905357a66d19c457f0d5ece6c5353d6"
+    },
+    "binary": {
+      "path": "/home/lisoon/taintforge/samples/ls_x86_64",
+      "size_bytes": 162472,
+      "sha256": "5840bd1ad992bbb96dc0037c39b44177294c3bb8e6bfdfcec7814c92af1e5bde"
+    },
+    "sysroot": {
+      "path": "/home/lisoon/taintforge/sysroots/x86_64",
+      "exists": true
+    }
+  },
+  "output": {
+    "path": "/home/lisoon/taintforge/workdir/orch_mock"
+  },
+  "execution": {
+    "timeout_seconds": 60,
+    "build_only": false,
+    "allow_missing_libraries": false,
+    "self_test_network": true
+  },
+  "network": {
+    "mode": "emulated",
+    "bind_ip": "10.10.0.1",
+    "namespace": "tf-iot-ns",
+    "catch_all_port": 40000,
+    "udp_catch_all_port": 40001,
+    "egress_policy": null
+  }
+}

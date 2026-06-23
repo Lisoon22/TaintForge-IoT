@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "mode": "brokered_record",
+  "capture_kind": "local_test",
+  "default_action": "deny",
+  "listen_port": 41000,
+  "target": {
+    "original_ip": "198.51.100.10",
+    "original_port": 48101,
+    "upstream_ip": "127.0.0.1",
+    "upstream_port": 49001
+  },
+  "limits": {
+    "max_connections": 1,
+    "connect_timeout_seconds": 3,
+    "session_timeout_seconds": 15,
+    "idle_timeout_seconds": 3,
+    "max_client_bytes": 65536,
+    "max_server_bytes": 1048576
+  },
+  "live_capture_acknowledged": false
+}

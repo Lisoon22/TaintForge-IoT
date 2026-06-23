@@ -1,0 +1,29 @@
+{
+  "generated_at_utc": "2026-06-20T15:55:13Z",
+  "isolation_ready": true,
+  "network_namespace": true,
+  "pid_namespace": true,
+  "mount_namespace": true,
+  "uts_namespace": true,
+  "ipc_namespace": true,
+  "user_namespace": false,
+  "mount_propagation": "private",
+  "sandbox_hostname": "taintforge-iot",
+  "proc_mode": "static_rootfs_stubs",
+  "strace_enabled": true,
+  "resource_limits": {
+    "cpu_seconds": 30,
+    "virtual_memory_kb": 524288,
+    "open_files": 256,
+    "processes": 256,
+    "processes_enforcement": "best_effort_for_uid_0",
+    "file_size_blocks": 10240
+  },
+  "limitations": [
+    "malware still runs as UID 0 inside chroot",
+    "no user namespace",
+    "no seccomp filter",
+    "no cgroup memory or process enforcement",
+    "chroot and namespaces are not a virtual machine boundary"
+  ]
+}

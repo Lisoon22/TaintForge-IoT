@@ -101,53 +101,119 @@ setup_netns() {
 }
 
 run_sample() {
-  echo "[+] Starting sample in controlled network sandbox"
+  echo "[+] Starting sample in hardened controlled sandbox"
   echo "[+] ROOTFS=$ROOTFS"
   echo "[+] Namespace=$NS"
   echo "[+] Command inside chroot: /bin/unpacked.elf"
 
-    # Resource limits are intentionally not applied here in Orchestrator v1.
-  # Applying ulimit before sudo/ip/chroot also limits wrapper processes and
-  # can break fork/exec before the sample starts.
-  #
-  # Later this should be replaced with cgroups/prlimit/seccomp applied only
-  # to the malware process tree.
-
   STATUS_PATH="$LOG_DIR/runtime_status.json"
+  SECURITY_STATUS_PATH="$LOG_DIR/security_status.json"
+  RESOURCE_LIMITS_PATH="$LOG_DIR/resource_limits.txt"
   STDOUT_PATH="$LOG_DIR/runtime_stdout.log"
   STDERR_PATH="$LOG_DIR/runtime_stderr.log"
+  STRACE_PREFIX="$LOG_DIR/strace"
 
   START_EPOCH="$(date +%s)"
   START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-    STRACE_PREFIX="$LOG_DIR/strace"
   STRACE_ENABLED=false
+  TRACE_MODE="plain"
 
   if command -v strace >/dev/null 2>&1; then
     STRACE_ENABLED=true
+    TRACE_MODE="strace"
   fi
+
+  rm -f "$SECURITY_STATUS_PATH"
+  rm -f "$RESOURCE_LIMITS_PATH"
 
   set +e
 
-  if [ "$STRACE_ENABLED" = true ]; then
-    timeout --kill-after=5s 60s \
-      sudo ip netns exec "$NS" \
-        strace -ff \
-          -o "$STRACE_PREFIX" \
-          -s 256 \
-          -e trace=%file,%process,%network,ptrace,mmap,mprotect \
-          chroot "$ROOTFS" /bin/unpacked.elf \
-      > "$STDOUT_PATH" \
-      2> "$STDERR_PATH"
-    EXIT_CODE="$?"
-  else
-    timeout --kill-after=5s 60s \
-      sudo ip netns exec "$NS" \
-        chroot "$ROOTFS" /bin/unpacked.elf \
-      > "$STDOUT_PATH" \
-      2> "$STDERR_PATH"
-    EXIT_CODE="$?"
-  fi
+  timeout --kill-after=5s 60s \
+    sudo ip netns exec "$NS" \
+      unshare \
+        --fork \
+        --pid \
+        --mount \
+        --uts \
+        --ipc \
+        --kill-child=SIGKILL \
+        /bin/bash -c '
+          set -euo pipefail
+
+          ROOTFS="$1"
+          LOG_DIR="$2"
+          TRACE_MODE="$3"
+          shift 3
+
+          # Prevent mounts made in this namespace from propagating
+          # back into the host mount namespace.
+          mount --make-rprivate /
+
+          # Fake device identity inside the private UTS namespace.
+          hostname taintforge-iot
+
+          # These limits are applied after sudo/ip/unshare.
+          # Therefore they affect strace and the malware process tree,
+          # not the privileged host-side wrappers.
+          ulimit -t 30
+          ulimit -v 524288
+          ulimit -n 256
+          ulimit -f 10240
+
+          # RLIMIT_NPROC is best-effort for UID 0.
+          ulimit -u 256 2>/dev/null || true
+
+          umask 077
+
+          ulimit -a > "$LOG_DIR/resource_limits.txt" 2>&1 || true
+
+          STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          cat > "$LOG_DIR/security_status.json" <<EOF
+{
+  "generated_at_utc": "$STARTED_AT",
+  "isolation_ready": true,
+  "network_namespace": true,
+  "pid_namespace": true,
+  "mount_namespace": true,
+  "uts_namespace": true,
+  "ipc_namespace": true,
+  "user_namespace": false,
+  "mount_propagation": "private",
+  "sandbox_hostname": "taintforge-iot",
+  "proc_mode": "static_rootfs_stubs",
+  "strace_enabled": $([ "$TRACE_MODE" = "strace" ] && echo true || echo false),
+  "resource_limits": {
+    "cpu_seconds": 30,
+    "virtual_memory_kb": 524288,
+    "open_files": 256,
+    "processes": 256,
+    "processes_enforcement": "best_effort_for_uid_0",
+    "file_size_blocks": 10240
+  },
+  "limitations": [
+    "malware still runs as UID 0 inside chroot",
+    "no user namespace",
+    "no seccomp filter",
+    "no cgroup memory or process enforcement",
+    "chroot and namespaces are not a virtual machine boundary"
+  ]
+}
+EOF
+
+          if [ "$TRACE_MODE" = "strace" ]; then
+            exec strace -ff \
+              -o "$LOG_DIR/strace" \
+              -s 256 \
+              -e trace=%file,%process,%network,ptrace,mmap,mprotect \
+              chroot "$ROOTFS" "$@"
+          fi
+
+          exec chroot "$ROOTFS" "$@"
+        ' bash "$ROOTFS" "$LOG_DIR" "$TRACE_MODE" /bin/unpacked.elf
+
+  EXIT_CODE="$?"
 
   set -e
 
@@ -160,9 +226,14 @@ run_sample() {
     TIMED_OUT=true
   fi
 
+  ISOLATION_READY=false
+  if [ -f "$SECURITY_STATUS_PATH" ]; then
+    ISOLATION_READY=true
+  fi
+
   cat > "$STATUS_PATH" <<EOF
 {
-  "command": "sudo ip netns exec $NS chroot $ROOTFS /bin/unpacked.elf",
+  "command": "sudo ip netns exec $NS unshare --pid --mount --uts --ipc chroot $ROOTFS /bin/unpacked.elf",
   "namespace": "$NS",
   "rootfs": "$ROOTFS",
   "guest_command": "/bin/unpacked.elf",
@@ -175,21 +246,25 @@ run_sample() {
   "stdout_path": "$STDOUT_PATH",
   "stderr_path": "$STDERR_PATH",
   "strace_enabled": $STRACE_ENABLED,
-  "strace_prefix": "$STRACE_PREFIX"
+  "strace_prefix": "$STRACE_PREFIX",
+  "isolation_ready": $ISOLATION_READY,
+  "security_status_path": "$SECURITY_STATUS_PATH",
+  "resource_limits_path": "$RESOURCE_LIMITS_PATH"
 }
 EOF
 
   echo "[+] Finished"
   echo "[+] exit code: $EXIT_CODE"
   echo "[+] timed out: $TIMED_OUT"
+  echo "[+] isolation ready: $ISOLATION_READY"
   echo "[+] status: $STATUS_PATH"
+  echo "[+] security status: $SECURITY_STATUS_PATH"
   echo "[+] stdout: $STDOUT_PATH"
   echo "[+] stderr: $STDERR_PATH"
-  echo "[+] strace enabled: $STRACE_ENABLED"
-  echo "[+] strace prefix: $STRACE_PREFIX"
 
   return "$EXIT_CODE"
 }
+
 
 case "${1:-run}" in
   setup)

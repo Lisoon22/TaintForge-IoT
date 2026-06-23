@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "run_id": "local-smoke",
+  "session_id": "20260623T115209.820347Z-02cfddbf",
+  "capture_kind": "local_test",
+  "started_at_utc": "2026-06-23T11:52:09.820651+00:00",
+  "finished_at_utc": "2026-06-23T11:52:09.822747+00:00",
+  "duration_seconds": 0.002096,
+  "close_reason": "upstream_closed",
+  "error": null,
+  "peer": "('127.0.0.1', 39116)",
+  "original_remote_ip": "198.51.100.10",
+  "original_remote_port": 48101,
+  "upstream_ip": "127.0.0.1",
+  "upstream_port": 49001,
+  "client_to_server": {
+    "bytes": 5,
+    "chunks": 1,
+    "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    "path": "client_to_server.bin"
+  },
+  "server_to_client": {
+    "bytes": 5,
+    "chunks": 1,
+    "sha256": "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
+    "path": "server_to_client.bin"
+  },
+  "limits": {
+    "max_connections": 1,
+    "connect_timeout_seconds": 3.0,
+    "session_timeout_seconds": 15.0,
+    "idle_timeout_seconds": 3.0,
+    "max_client_bytes": 65536,
+    "max_server_bytes": 1048576
+  }
+}

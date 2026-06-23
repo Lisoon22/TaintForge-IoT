@@ -30,6 +30,7 @@ class RunReportGenerator:
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.network_events_path = self.logs_dir / "network_events.jsonl"
         self.runtime_status_path = self.logs_dir / "runtime_status.json"
+        self.security_status_path = self.logs_dir / "security_status.json"
         self.syscall_events_path = self.logs_dir / "syscall_events.jsonl"
         self.syscall_summary_path = self.logs_dir / "syscall_events.summary.json"
         self.rootfs_snapshot_before_path = self.logs_dir / "rootfs_snapshot_before.json"
@@ -153,6 +154,7 @@ class RunReportGenerator:
         library_resolution = self.load_json_optional(self.library_resolution_path)
         network_events = self.load_jsonl_optional(self.network_events_path)
         runtime_status = self.load_json_optional(self.runtime_status_path)
+        security_status = self.load_json_optional(self.security_status_path)
         raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path)
         syscall_summary = self.load_json_optional(self.syscall_summary_path)
         rootfs_diff = self.load_json_optional(self.rootfs_diff_path)
@@ -182,7 +184,7 @@ class RunReportGenerator:
             "filesystem": self.build_filesystem_section(rootfs_diff),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
-            "security": self.build_security_section(network_policy),
+            "security": self.build_security_section(network_policy=network_policy, security_status=security_status),
         }
 
         self.save_json_report(report)
@@ -200,6 +202,7 @@ class RunReportGenerator:
             "syscall_events": self.rel(self.syscall_events_path),
             "syscall_summary": self.rel(self.syscall_summary_path),
             "runtime_status": self.rel(self.runtime_status_path),
+            "security_status": self.rel(self.security_status_path),
             "runtime_stdout": self.rel(self.logs_dir / "runtime_stdout.log"),
             "runtime_stderr": self.rel(self.logs_dir / "runtime_stderr.log"),
             "report_json": self.rel(self.report_json_path),
@@ -412,21 +415,74 @@ class RunReportGenerator:
             ),
         }
 
-    def build_security_section(self, network_policy: dict[str, Any]) -> dict[str, Any]:
+    def build_security_section(
+        self,
+        network_policy: dict[str, Any],
+        security_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        catch_all = network_policy.get("catch_all", {})
+
         return {
+            "isolation_ready": security_status.get("isolation_ready", False),
             "chroot_enabled": True,
-            "network_namespace_enabled": True,
+            "network_namespace_enabled": security_status.get(
+                "network_namespace",
+                True,
+            ),
+            "pid_namespace_enabled": security_status.get(
+                "pid_namespace",
+                False,
+            ),
+            "mount_namespace_enabled": security_status.get(
+                "mount_namespace",
+                False,
+            ),
+            "uts_namespace_enabled": security_status.get(
+                "uts_namespace",
+                False,
+            ),
+            "ipc_namespace_enabled": security_status.get(
+                "ipc_namespace",
+                False,
+            ),
+            "user_namespace_enabled": security_status.get(
+                "user_namespace",
+                False,
+            ),
+            "mount_propagation": security_status.get(
+                "mount_propagation",
+            ),
+            "sandbox_hostname": security_status.get(
+                "sandbox_hostname",
+            ),
+            "proc_mode": security_status.get(
+                "proc_mode",
+                "static_rootfs_stubs",
+            ),
             "iptables_default_deny_expected": True,
             "host_ip_forwarding_expected": False,
-            "allow_internet": bool(network_policy.get("allow_internet", False)),
+            "allow_internet": bool(
+                network_policy.get("allow_internet", False)
+            ),
             "known_endpoint_dnat": True,
             "tcp_catch_all_redirect": bool(
-                network_policy.get("catch_all", {}).get("enabled", False)
+                catch_all.get("enabled", False)
             ),
             "udp_catch_all_redirect": bool(
-                network_policy.get("catch_all", {}).get("udp_enabled", False)
+                catch_all.get("udp_enabled", False)
             ),
-            "resource_limits": "disabled_in_v1_timeout_only",
+            "strace_enabled": security_status.get(
+                "strace_enabled",
+                False,
+            ),
+            "resource_limits": security_status.get(
+                "resource_limits",
+                {},
+            ),
+            "limitations": security_status.get(
+                "limitations",
+                [],
+            ),
         }
 
     def save_json_report(self, report: dict[str, Any]) -> None:
@@ -773,9 +829,16 @@ class RunReportGenerator:
         lines.append("## Security model")
         lines.append("")
         for key, value in security.items():
-            lines.append(f"- `{key}`: `{value}`")
-        lines.append("")
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            else:
+                rendered = str(value)
 
+            lines.append(f"- `{key}`: `{rendered}`")
         lines.append("## Runtime stdout preview")
         lines.append("")
         lines.append("```text")

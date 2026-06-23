@@ -5,6 +5,20 @@ import os
 import stat
 
 
+from taintforge_env.c2_record_policy import (
+    C2RecordPolicyError,
+    load_c2_record_policy,
+)
+from taintforge_env.egress_policy import (
+    EgressPolicyError,
+    load_egress_policy,
+)
+from taintforge_env.network_modes import (
+    NetworkMode,
+    normalize_network_mode,
+    requires_egress_policy,
+    requires_record_policy,
+)
 from taintforge_env.orchestrator import (
     OrchestratorConfig,
     OrchestratorError,
@@ -115,10 +129,33 @@ def main():
     parser.add_argument("--timeout", type=int, default=60)
 
     parser.add_argument(
-    "--network",
-    choices=["auto", "controlled", "none"],
-    default="auto",
-    help="Network mode: auto enables sandbox only when taint has network_dependencies.",
+        "--network",
+        choices=[
+            "auto",
+            "controlled",
+            "none",
+            "emulated",
+            "replay",
+            "brokered_fetch",
+            "brokered_relay",
+            "brokered_record",
+        ],
+        default="auto",
+        help=(
+            "Network mode. 'controlled' is an alias for 'emulated'. "
+            "fetch/relay modes require --egress-policy; "
+            "brokered_record requires --record-policy."
+        ),
+    )
+    parser.add_argument(
+        "--egress-policy",
+        default=None,
+        help="Path to a validated brokered-egress policy JSON.",
+    )
+    parser.add_argument(
+        "--record-policy",
+        default=None,
+        help="Path to a strict brokered-record policy JSON.",
     )
 
     parser.add_argument("--bind-ip", default="10.10.0.1")
@@ -140,14 +177,63 @@ def main():
 
     network_deps = taint_raw.get("network_dependencies", [])
 
-    if args.network == "auto":
-        network_enabled = bool(network_deps)
-    elif args.network == "controlled":
-        network_enabled = True
-    else:
-        network_enabled = False
+    try:
+        effective_network_mode = normalize_network_mode(
+            args.network,
+            has_network_dependencies=bool(network_deps),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    effective_network_mode = "controlled" if network_enabled else "none"
+    egress_policy_path: Path | None = None
+    record_policy_path: Path | None = None
+
+    if requires_record_policy(effective_network_mode):
+        if not args.record_policy:
+            parser.error(
+                "--network brokered_record requires --record-policy"
+            )
+        if args.egress_policy:
+            parser.error(
+                "--egress-policy cannot be combined with brokered_record"
+            )
+
+        record_policy_path = Path(args.record_policy).resolve()
+        try:
+            load_c2_record_policy(record_policy_path)
+        except C2RecordPolicyError as exc:
+            parser.error(f"Invalid record policy: {exc}")
+
+    elif args.record_policy:
+        parser.error(
+            "--record-policy is only valid with brokered_record"
+        )
+
+    if requires_egress_policy(effective_network_mode):
+        if not args.egress_policy:
+            parser.error(
+                f"--network {effective_network_mode.value} requires "
+                "--egress-policy"
+            )
+
+        egress_policy_path = Path(args.egress_policy).resolve()
+
+        try:
+            policy = load_egress_policy(egress_policy_path)
+        except EgressPolicyError as exc:
+            parser.error(f"Invalid egress policy: {exc}")
+
+        if policy.mode != effective_network_mode:
+            parser.error(
+                "Egress policy mode does not match --network: "
+                f"policy={policy.mode.value}, "
+                f"network={effective_network_mode.value}"
+            )
+    elif args.egress_policy:
+        parser.error(
+            "--egress-policy is only valid with "
+            "brokered_fetch or brokered_relay"
+        )
 
     out_dir = Path(args.out).resolve()
     taint_path = Path(args.taint).resolve()
@@ -165,6 +251,8 @@ def main():
         out_dir=Path(args.out),
         timeout_seconds=args.timeout,
         network_mode=effective_network_mode,
+        egress_policy_path=egress_policy_path,
+        record_policy_path=record_policy_path,
         bind_ip=args.bind_ip,
         namespace=args.namespace,
         catch_all_port=args.catch_all_port,
