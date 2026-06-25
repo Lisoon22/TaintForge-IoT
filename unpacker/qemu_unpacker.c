@@ -7,6 +7,7 @@
 #include <capstone/capstone.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include "trace.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -34,6 +35,7 @@ static uint64_t oep_addr = 0;
 static __thread uint64_t g_current_ip = 0;
 static csh cs_handle;
 static RegShadow reg_shadow;
+static TraceBuffer *g_trace = NULL;
 
 static bool read_socketcall_args(uint64_t block_addr, uint32_t out[6]) {
 	GByteArray *arr = g_byte_array_new();
@@ -383,6 +385,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	//capstone handle
 	cs_close(&cs_handle);
 	meta_free();
+
+	//tracer
+	trace_buffer_destroy(g_trace);
+	g_trace = NULL;
 }
 
 static int mask_first_reg(uint32_t mask) {
@@ -398,7 +404,15 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	
 	InsnMeta *meta = meta_lookup(vaddr);
 	if (!meta) goto fallback_oep;
-	
+
+	//tracer
+	if (g_trace) {
+		TraceEntry ent = {0};
+		ent.pc = vaddr;
+		ent.size = meta->size;
+		trace_append(g_trace, &ent);
+	}
+
 	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
 	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
 		int reg = mask_first_reg(meta->regs_written_mask);
@@ -1067,6 +1081,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
 	qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
 	
+	//tracer
+	g_trace = trace_buffer_create(256 * 1024);
+	if (!g_trace) {
+		fprintf(stderr, "[PLUGIN] Trace buffer init failed\n");
+	return -1;
+	}
+
 	//exit
 	qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
