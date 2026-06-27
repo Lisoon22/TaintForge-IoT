@@ -75,12 +75,16 @@ typedef struct {
 //init and basic operands DSE
 SymExpr *sym_expr_const(uint64_t val, uint32_t width);
 SymExpr *sym_expr_var(uint64_t src_addr, uint32_t idx, uint32_t width);
+SymExpr *sym_expr_clone(const SymExpr *e);
 SymExpr *sym_expr_sext(SymExpr *a, uint32_t to_width);
 SymExpr *sym_expr_add(SymExpr *a, SymExpr *b);
 SymExpr *sym_expr_sub(SymExpr *a, SymExpr *b);
 SymExpr *sym_expr_xor(SymExpr *a, SymExpr *b);
 SymExpr *sym_expr_and(SymExpr *a, SymExpr *b);
 SymExpr *sym_expr_shl(SymExpr *a, SymExpr *b);
+SymExpr *sym_expr_zext(SymExpr *a, uint32_t to_width);
+SymExpr *sym_expr_extract(SymExpr *a, uint32_t low_bit, uint32_t out_width);
+SymExpr *sym_expr_concat(SymExpr *high, SymExpr *low);
 void sym_expr_free(SymExpr *e);
 
 //states for DSE

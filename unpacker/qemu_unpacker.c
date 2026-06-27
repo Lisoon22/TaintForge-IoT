@@ -198,11 +198,12 @@ static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint
 
 static bool bin_dumped = false;
 static GString *saved_reg = NULL;
+static uint64_t saved_base = 0;
+static bool saved_base_set = false;
 
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
 	keys = g_list_sort(keys, compare_keys);
-	static uint64_t base_addr = 0;
 	
 	if (!bin_dumped) {
 		FILE *f_bin = fopen("unpacked.bin", "wb");
@@ -221,7 +222,7 @@ static void do_dump(uint64_t oep) {
 			bin_dumped = true;
 		}
 	}
-
+	
 	if (!saved_reg) {
 		saved_reg= g_string_new(NULL);
 		g_string_append(saved_reg, "  \"regions\": [\n");
@@ -259,6 +260,10 @@ static void do_dump(uint64_t oep) {
 				region_start = addr;
 				region_size = written;
 				region_prot = p->prot;
+				if (!saved_base_set) {
+					saved_base = region_start;
+					saved_base_set = true;
+				}
 				in_region = true;
 			}
 			offset += written;
@@ -273,13 +278,10 @@ static void do_dump(uint64_t oep) {
 	FILE *f_json = fopen("unpacked.json", "w");
 	if (!f_json) { g_list_free(keys); return; }
 
-	if (base_addr == 0) {
-		base_addr = oep & ~(page_size - 1);
-	}
 	fprintf(f_json, "{\n");
 	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", oep);
 	fprintf(f_json, "  \"arch\": \"x86\",\n");
-	fprintf(f_json, "  \"base\": \"0x%lx\",\n", base_addr);
+	fprintf(f_json, "  \"base\": \"0x%lx\",\n", saved_base);
 	fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
 
 	// files
