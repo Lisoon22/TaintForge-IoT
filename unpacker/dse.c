@@ -1,9 +1,16 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <glib.h>
+#include <capstone/capstone.h>
 #include <z3.h>
 #include "dta.h"
 #include "trace.h"
 #include "dse.h"
+
+#define MAX_SLICE 512
 
 //helpers
 static inline uint64_t mask_w(uint64_t v, uint8_t w) {
@@ -258,6 +265,137 @@ SymExpr *sym_expr_shl(SymExpr *a, SymExpr *b) {
 	return expr;
 }
 
+SymExpr *sym_expr_shr(SymExpr *a, SymExpr *count) {
+	if (!a || !count) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	if (count->type != SYM_CONST) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint64_t c = count->const_val; sym_expr_free(count);
+	if (c == 0) return a;
+	if (c >= w) {
+		sym_expr_free(a);
+		return sym_expr_const(0, w);
+	}
+	return sym_expr_zext(sym_expr_extract(a, (uint32_t)c, (uint32_t)(w - c)), w);
+}
+
+SymExpr *sym_expr_sar(SymExpr *a, SymExpr *count) {
+	if (!a || !count) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	if (count->type != SYM_CONST) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint64_t c = count->const_val; sym_expr_free(count);
+	if (c == 0) return a;
+	if (c >= w) c = w - 1;
+	return sym_expr_sext(sym_expr_extract(a, (uint32_t)c, (uint32_t)(w - c)), w);
+}
+
+SymExpr *sym_expr_rol(SymExpr *a, SymExpr *count) {
+	if (!a || !count) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	if (count->type != SYM_CONST) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint32_t c = (uint32_t)(count->const_val % (w ? w : 1)); sym_expr_free(count);
+	if (c == 0) return a;
+	SymExpr *hi = sym_expr_extract(sym_expr_clone(a), 0, w - c);
+	SymExpr *lo = sym_expr_extract(a, w - c, c);
+	return sym_expr_concat(hi, lo);
+}
+
+SymExpr *sym_expr_ror(SymExpr *a, SymExpr *count) {
+	if (!a || !count) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	if (count->type != SYM_CONST) {
+		sym_expr_free(a);
+		sym_expr_free(count);
+		return NULL;
+	}
+	uint32_t c = (uint32_t)(count->const_val % (w ? w : 1)); sym_expr_free(count);
+	if (c == 0) return a;
+	SymExpr *hi = sym_expr_extract(sym_expr_clone(a), 0, c);
+	SymExpr *lo = sym_expr_extract(a, c, w - c);
+	return sym_expr_concat(hi, lo);
+}
+
+SymExpr *sym_expr_mul(SymExpr *a, SymExpr *b) {
+	if (!a || !b || a->width != b->width) {
+		sym_expr_free(a);
+		sym_expr_free(b);
+		return NULL;
+	}
+	if (a->type == SYM_CONST && b->type != SYM_CONST) {
+		SymExpr *t = a;
+		a = b;
+		b = t;
+	}
+	if (b->type != SYM_CONST) {
+		sym_expr_free(a);
+		sym_expr_free(b);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	uint64_t c = mask_w(b->const_val, w); sym_expr_free(b);
+	if (c == 0) {
+		sym_expr_free(a);
+		return sym_expr_const(0, w);
+	}
+	if (c == 1) return a;
+	SymExpr *acc = NULL;
+	for (int i = 0; i < w; i++) {
+		if (!((c >> i) & 1ULL)) continue;
+		SymExpr *term;
+		if (i == 0) {
+			term = sym_expr_clone(a);
+		} else { 
+			term = sym_expr_shl(sym_expr_clone(a), sym_expr_const((uint64_t)i, w));
+		}
+		acc = acc ? sym_expr_add(acc, term) : term;
+	}
+	sym_expr_free(a);
+	return acc ? acc : sym_expr_const(0, w);
+}
+
+
+SymExpr *sym_expr_or(SymExpr *a, SymExpr *b) {
+	if (!a || !b || a->width != b->width) {
+		sym_expr_free(a);
+		sym_expr_free(b);
+		return NULL;
+	}
+	uint8_t w = a->width;
+	uint64_t ones = mask_w(~0ULL, w);
+	SymExpr *na = sym_expr_xor(a, sym_expr_const(ones, w));
+	SymExpr *nb = sym_expr_xor(b, sym_expr_const(ones, w));
+	SymExpr *an = sym_expr_and(na, nb);
+	return sym_expr_xor(an, sym_expr_const(ones, w));
+}
+
+
 SymExpr *sym_expr_sext(SymExpr *a, uint32_t to_width) {
 	if (!a || to_width > 64 || to_width < a->width) {
 		sym_expr_free(a);
@@ -325,6 +463,18 @@ SymExpr *sym_expr_concat(SymExpr *high, SymExpr *low) {
 		return sym_expr_const(v, (uint8_t)w);
 	}
 	return mk_binary(SYM_CONCAT, (uint8_t)w, high, low);
+}
+
+SymExpr *sym_expr_not(SymExpr *a) {
+	if (!a) return NULL;
+	uint8_t w = a->width;
+	return sym_expr_xor(a, sym_expr_const(mask_w(~0ULL, w), w));
+}
+
+SymExpr *sym_expr_neg(SymExpr *a) {
+	if (!a) return NULL;
+	uint8_t w = a->width;
+	return sym_expr_sub(sym_expr_const(0, w), a);
 }
 
 void sym_expr_free(SymExpr *e) {
@@ -466,6 +616,163 @@ void dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
 	}
 	sym_expr_free(cond);
 }
+//init all
+static const TraceBuffer *g_tb   = NULL;
+static const DseAuxRing *g_ring = NULL;
+static const DseArch *g_arch = NULL;
+static uint32_t g_total = 0, g_concretized = 0;
+
+//lifter
+bool dse_lift_insn(DSECtx *ctx, const TraceEntry *entry, const InsnMeta *meta, csh cs_handle) {
+	if (!ctx || !entry || !meta || !g_arch) return false;
+	g_total++;
+ 
+	const InsnAux *aux = dse_aux_for(g_ring, g_tb, entry);
+	cs_insn *insn = NULL;
+	size_t count;
+	if (cs_handle) { 
+		count = cs_disasm(cs_handle, entry->instr_bytes, entry->size, entry->pc, 1, &insn);
+	} else {
+		count = 0;
+	}
+ 
+	if (count == 0 || !insn || !insn->detail || !aux) {
+		if (insn) cs_free(insn, count);
+		for (int i = 0; i < REG_COUNT; i++) {
+			if (meta->regs_written_mask & (1U << i)) sym_state_set_reg(&ctx->state, i, NULL);
+		}
+		g_concretized++;
+		return false;
+	}
+ 
+	//fallback
+	bool ok = g_arch->lift_one(ctx, insn, aux, g_arch);
+	if (!ok) {
+		for (int i = 0; i < REG_COUNT; i++) {
+			if (meta->regs_written_mask & (1U << i)) sym_state_set_reg(&ctx->state, i, NULL);
+		}
+		g_concretized++;
+	}
+	cs_free(insn, count);
+	return ok;
+}
+
+void dse_lift_attach(const TraceBuffer *tb, const DseAuxRing *ring, const struct DseArch *arch) {
+	g_tb = tb;
+	g_ring = ring;
+	g_arch = arch;
+}
+void dse_lift_begin(DSECtx *ctx) {
+	if (ctx) sym_state_clear(&ctx->state);
+	g_total = 0;
+	g_concretized = 0;
+}
+uint32_t dse_lift_total_count(void) {
+	return g_total;
+}
+uint32_t dse_lift_concretized_count(void) {
+	return g_concretized;
+}
+
+bool dse_expr_has_var(const SymExpr *e) {
+	if (!e) return false;
+	switch (e->type) {
+		case SYM_VAR:   return true;
+		case SYM_CONST: return false;
+		case SYM_ADD: case SYM_SUB: case SYM_XOR: case SYM_AND: case SYM_SHL: case SYM_CONCAT:
+			return dse_expr_has_var(e->binary.a) || dse_expr_has_var(e->binary.b);
+		case SYM_EXTRACT: case SYM_ZEXT: case SYM_SEXT:
+			return dse_expr_has_var(e->unary.a);
+	}
+	return false;
+}
+//get reg in needed width
+SymExpr *dse_read_rid_fit(DSECtx *ctx, const InsnAux *aux, int rid, uint32_t want_w, uint32_t natw) {
+	SymExpr *base;
+	if (ctx->state.reg[rid]) base = sym_expr_clone(ctx->state.reg[rid]); //already symbolic
+	else if (aux->reg_taint[rid]) base = sym_state_new_var(&ctx->state, (0xF000000000000000ULL | (uint64_t)rid), natw); //tainted and not yet symbolic
+	else base = sym_expr_const(aux->reg_vals[rid], natw); //concrete
+	if (!base) return NULL;
+	//needed width
+	if (want_w < natw) base = sym_expr_extract(base, 0, want_w);
+	else if (want_w > natw) base = sym_expr_zext(base, want_w);
+	return base;
+}
+
+//from mem to symbolic
+SymExpr *dse_load_mem(DSECtx *ctx, const InsnAux *aux, uint32_t width_bits, bool big_endian) {
+	if (!aux->has_mem_read) return NULL;
+	uint64_t addr = aux->mem_read_addr;
+	//store in current slice
+	if (ctx->state.sym_mem) {
+		gint64 key = (gint64)addr;
+		SymExpr *stored = g_hash_table_lookup(ctx->state.sym_mem, &key);
+		if (stored) return sym_expr_clone(stored);
+	}
+	uint32_t nbytes = width_bits / 8;
+	if (nbytes == 0) nbytes = 1;
+	if (nbytes > 8)  nbytes = 8;
+	SymExpr *acc = NULL;
+	//check every byte on taint
+	for (uint32_t i = 0; i < nbytes; i++) {
+		uint8_t tainted = (aux->mem_read_taint >> i) & 1u;
+		uint8_t bval = (uint8_t)((aux->mem_read_val >> (8 * i)) & 0xFF);
+		uint64_t baddr;
+	       	if ( big_endian ) {
+			baddr = (addr + (nbytes - 1 - i)) 
+		} else {
+			baddr = (addr + i);
+		}
+		SymExpr *byte;
+		if (tainted) {
+			byte = sym_state_new_var(&ctx->state, baddr, 8);
+		} else {
+			byte = sym_expr_const(bval, 8);
+		}
+		if (!byte) {
+			sym_expr_free(acc);
+			return NULL;
+		}
+		if (acc) {
+			acc = sym_expr_concat(byte, acc);
+		} else {
+			acc = byte;
+		}
+	}
+	return acc;
+}
+//store from mem
+void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val) {
+	if (!aux->has_mem_write || !val) {
+		sym_expr_free(val);
+		return;
+	}
+	if (!ctx->state.sym_mem) ctx->state.sym_mem = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, (GDestroyNotify)sym_expr_free);
+	gint64 *k = g_new(gint64, 1); 
+	*k = (gint64)aux->mem_write_addr;
+	g_hash_table_insert(ctx->state.sym_mem, k, val);
+}
+
+void dse_set_reg(DSECtx *ctx, int rid, SymExpr *val, uint32_t natw) {
+	if (val) {
+		//width lower -> fill with zeroes, greater -> extract
+		if (val->width < natw) val = sym_expr_zext(val, natw);
+		else if (val->width > natw) val = sym_expr_extract(val, 0, natw);
+	}
+	sym_state_set_reg(&ctx->state, rid, val);
+}
+//part write
+void dse_commit_low(DSECtx *ctx, const InsnAux *aux, int rid, SymExpr *val, uint32_t w, uint32_t natw) {
+	SymExpr *old;
+	if (ctx->state.reg[rid]) {
+	       old = sym_expr_clone(ctx->state.reg[rid]);
+	} else {
+		old = sym_expr_const(aux->reg_vals[rid], natw);
+	}
+	SymExpr *hi = sym_expr_extract(old, w, natw - w);
+	sym_state_set_reg(&ctx->state, rid, sym_expr_concat(hi, val));
+}
+
 
 int dse_check_oep_reachable(DSECtx *ctx, SymExpr *target_expr, uint64_t oep_candidate) {
 	if (!ctx || !ctx->has_solver || !target_expr) return -1;
@@ -485,3 +792,40 @@ int dse_check_oep_reachable(DSECtx *ctx, SymExpr *target_expr, uint64_t oep_cand
 	if (r == Z3_L_FALSE) return 0;
 	return -1;
 }
+bool dse_verify_oep_candidate(TraceBuffer *tb, uint64_t trigger_pc, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
+	if (!tb || target_reg < 0 || target_reg >= REG_COUNT || !g_arch) return false;
+	g_tb = tb;
+
+	const TraceEntry *slice[MAX_SLICE];
+	int n = trace_get_slice(tb, trigger_pc, target_reg, slice, MAX_SLICE);
+	if (n <= 0) return false;
+
+	DSECtx ctx;
+	if (!dse_ctx_init(&ctx)) return false;
+	dse_lift_begin(&ctx);
+
+	for (int i = 0; i < n; i++) {
+		InsnMeta *meta = meta_lookup(slice[i]->pc);
+		if (!meta) {
+			g_concretized++;
+			continue;
+		}
+		dse_lift_insn(&ctx, slice[i], meta, cs_handle);
+	}
+
+	SymExpr *target;
+	if (ctx.state.reg[target_reg]) {
+	       target = sym_expr_clone(ctx.state.reg[target_reg])
+	} else {
+	       target = NULL;
+	}
+	bool confirmed = false;
+	if (target && dse_expr_has_var(target)) {
+		confirmed = (dse_check_oep_reachable(&ctx, target, oep_candidate) == 1);
+	}
+	sym_expr_free(target);
+	dse_lift_end();
+	dse_ctx_free(&ctx);
+	return confirmed;
+}
+

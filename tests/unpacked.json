@@ -21,7 +21,7 @@
     {"path": "/etc/ld.so.cache", "write": false},
     {"path": "/usr/lib32/libc.so.6", "write": false},
     {"path": "/tmp/testfile.txt", "write": true}],
-  "library_dependencies": [{"path": "/lib/ld-linux.so.2", "base": "0x4083b000", "size": 9400}, {"path": "/usr/lib32/libc.so.6", "base": "0x40a9f000", "size": 12288}],
+  "library_dependencies": [{"path": "/lib/ld-linux.so.2", "base": "0x40805000", "size": 230584}, {"path": "/usr/lib32/libc.so.6", "base": "0x4088e000", "size": 2179072}],
   "network_dependencies": [
     {"op":"socket","fd":3,"domain":"AF_INET","type":"tcp"},
     {"op":"connect","fd":3,"ip":"127.0.0.1","port":80,"type":"tcp"}
