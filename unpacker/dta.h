@@ -35,6 +35,8 @@ void shadow_untaint_byte(ShadowMemory *sm, uint64_t addr);
 bool shadow_is_tainted(ShadowMemory *sm, uint64_t addr);
 bool shadow_page_has_taint(ShadowMemory *sm, uint64_t addr);
 
+int x86_reg_to_rid(unsigned cs_reg);
+
 #define MAX_REG_BYTES 8
 
 typedef struct {

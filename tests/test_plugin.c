@@ -7,6 +7,7 @@
 #include <capstone/capstone.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include "trace.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -34,6 +35,7 @@ static uint64_t oep_addr = 0;
 static __thread uint64_t g_current_ip = 0;
 static csh cs_handle;
 static RegShadow reg_shadow;
+static TraceBuffer *g_trace = NULL;
 
 static bool read_socketcall_args(uint64_t block_addr, uint32_t out[6]) {
 	GByteArray *arr = g_byte_array_new();
@@ -65,6 +67,7 @@ typedef struct {
 	char *path;
 	uint64_t base;
 	uint64_t size;
+	uint64_t end;
 } lib_mapping_t;
 typedef struct {
 	int fd;
@@ -159,6 +162,22 @@ static bool is_valid_path(const char *s) {
     }
     return true;
 }
+//for exact lib dump
+static void lib_update_mapping(uint32_t fd, uint64_t addr, uint64_t size) {
+	if ((int)fd <= 0 || size == 0) return;
+	gpointer val = g_hash_table_lookup(file_fd, (gpointer)(uintptr_t)fd);
+	if (!val) return;
+	file_dep_t *f = (file_dep_t*)val;
+	for (GList *l = lib_deps; l; l = l->next) {
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		if (f->path && lm->path && strcmp(lm->path, f->path) == 0) {
+			uint64_t end = addr + size;
+			if (lm->base == 0 || addr < lm->base) lm->base = addr;
+			if (end > lm->end) lm->end = end;
+			return;
+		}
+	}
+}
 
 static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 	for (GList *l = file_deps; l; l = l->next) {
@@ -196,11 +215,12 @@ static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint
 
 static bool bin_dumped = false;
 static GString *saved_reg = NULL;
+static uint64_t saved_base = 0;
+static bool saved_base_set = false;
 
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
 	keys = g_list_sort(keys, compare_keys);
-	static uint64_t base_addr = 0;
 	
 	if (!bin_dumped) {
 		FILE *f_bin = fopen("unpacked.bin", "wb");
@@ -219,7 +239,7 @@ static void do_dump(uint64_t oep) {
 			bin_dumped = true;
 		}
 	}
-
+	
 	if (!saved_reg) {
 		saved_reg= g_string_new(NULL);
 		g_string_append(saved_reg, "  \"regions\": [\n");
@@ -257,6 +277,10 @@ static void do_dump(uint64_t oep) {
 				region_start = addr;
 				region_size = written;
 				region_prot = p->prot;
+				if (!saved_base_set) {
+					saved_base = region_start;
+					saved_base_set = true;
+				}
 				in_region = true;
 			}
 			offset += written;
@@ -271,13 +295,10 @@ static void do_dump(uint64_t oep) {
 	FILE *f_json = fopen("unpacked.json", "w");
 	if (!f_json) { g_list_free(keys); return; }
 
-	if (base_addr == 0) {
-		base_addr = oep & ~(page_size - 1);
-	}
 	fprintf(f_json, "{\n");
 	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", oep);
 	fprintf(f_json, "  \"arch\": \"x86\",\n");
-	fprintf(f_json, "  \"base\": \"0x%lx\",\n", base_addr);
+	fprintf(f_json, "  \"base\": \"0x%lx\",\n", saved_base);
 	fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
 
 	// files
@@ -301,8 +322,14 @@ static void do_dump(uint64_t oep) {
 	for (GList *l = lib_deps; l; l = l->next) {
 		lib_mapping_t *lm = (lib_mapping_t*)l->data;
 		if (!lm->path || !*lm->path || *lm->path != '/' || !is_valid_path(lm->path)) continue;
+		uint64_t span;
+		if (lm->end > lm->base) {
+			span = (lm->end - lm->base);
+		} else {
+			span = lm->size;
+		}
 		if (!first) fprintf(f_json, ", ");
-		fprintf(f_json, "{\"path\": \"%s\", \"base\": \"0x%lx\", \"size\": %lu}", lm->path, lm->base, lm->size);
+		fprintf(f_json, "{\"path\": \"%s\", \"base\": \"0x%lx\", \"size\": %lu}", lm->path, lm->base, span);
 		first = false;
 	}
 	fprintf(f_json, "],\n");
@@ -383,6 +410,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	//capstone handle
 	cs_close(&cs_handle);
 	meta_free();
+
+	//tracer
+	trace_buffer_destroy(g_trace);
+	g_trace = NULL;
 }
 
 static int mask_first_reg(uint32_t mask) {
@@ -398,7 +429,15 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	
 	InsnMeta *meta = meta_lookup(vaddr);
 	if (!meta) goto fallback_oep;
-	
+
+	//tracer
+	if (g_trace) {
+		TraceEntry ent = {0};
+		ent.pc = vaddr;
+		ent.size = meta->size;
+		trace_append(g_trace, &ent);
+	}
+
 	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
 	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
 		int reg = mask_first_reg(meta->regs_written_mask);
@@ -813,6 +852,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		fprintf(stderr, "[NET] shutdown fd=%d how=%ld\n", (int)a1, a2);
 	}else if (num == 192) { //mmap2
 		int prot = (int)a3;
+		lib_update_mapping((uint32_t)a5, a1, a2); //lib dump
 		if (prot & 0x2 || prot & 0x4) {
 			fprintf(stderr, "[SYSCALL] mmap2(0x%lx, 0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=0x%x)\n", a1, a2, (int)a3, (int)a4, (int)a5, (int)a6);
 			uint64_t page_start = a1 & ~(page_size - 1);
@@ -827,29 +867,6 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
 				}
 			}
-			if (a5 > 0) { //fd check
-				gpointer val = g_hash_table_lookup(file_fd, (gpointer)(uintptr_t)a5);
-				if (val) {
-					file_dep_t *f = (file_dep_t*)val;
-					for (GList *l = lib_deps; l; l = l->next) {
-						lib_mapping_t *lm = (lib_mapping_t*)l->data;
-						if (f->path && strcmp(lm->path, f->path) == 0) {
-							lm->base = a1;
-							lm->size = a2;
-							break;
-						}
-					}
-				} else { // fallback if fd was open before check
-					for (GList *l = lib_deps; l; l = l->next) {
-						lib_mapping_t *lm = (lib_mapping_t*)l->data;
-						if (lm->base == 0) {
-							lm->base = a1;
-							lm->size = a2;
-							break;
-						}
-					}
-				}
-			}
 		}
 	} else if (num == 90) { //mmap
 		GByteArray *buf = g_byte_array_new();
@@ -861,6 +878,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			uint32_t flags = args[3];
 			uint32_t fd = args[4];
 			uint32_t off = args[5];
+			lib_update_mapping(fd, addr, size); //lib dump
 			if (prot & 0x2 || prot & 0x4) {
 				fprintf(stderr, "[SYSCALL] mmap(0x%lx, 0x%lx, prot=0x%x, flags=0x%x, fd=%u, offset=0x%x)\n", addr, size, prot, flags, fd, off);
 				uint64_t page_start = addr & ~(page_size - 1);
@@ -873,29 +891,6 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 						page_t *np = g_new0(page_t, 1);
 						np->prot = prot;
 						g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
-					}
-				}
-				if (fd > 0){
-					gpointer val = g_hash_table_lookup(file_fd, (gpointer)(uintptr_t) fd);
-					if (val) {
-						file_dep_t *f = (file_dep_t*)val;
-						for (GList *l = lib_deps; l; l = l->next) {
-							lib_mapping_t *lm = (lib_mapping_t*)l->data;
-							if (f->path && strcmp(lm->path, f->path) == 0) {
-								lm->base = addr;
-								lm->size = size;
-								break;
-							}
-						}
-					}
-				} else {
-					for (GList *l = lib_deps; l; l = l->next) {
-						lib_mapping_t *lm = (lib_mapping_t*)l->data;
-						if (lm->base == 0) {
-							lm->base = addr;
-							lm->size = size;
-							break;
-						}
 					}
 				}
 			}
@@ -1067,6 +1062,13 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
 	qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
 	
+	//tracer
+	g_trace = trace_buffer_create(256 * 1024);
+	if (!g_trace) {
+		fprintf(stderr, "[PLUGIN] Trace buffer init failed\n");
+	return -1;
+	}
+
 	//exit
 	qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
