@@ -70,6 +70,10 @@ class Phase2Orchestrator:
         self.library_plan_path = self.config_dir / "library_plan.json"
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.runtime_path = self.config_dir / "runtime.json"
+        self.runtime_requirements_path = (
+            self.config_dir / "runtime_requirements.json"
+        )
+        self.repair_plan_path = self.config_dir / "repair_plan.json"
         self.network_runner_path = self.config.out_dir / "run_network_sandbox.sh"
         self.run_manifest_path = self.config_dir / "run_manifest.json"
         self.copied_egress_policy_path = self.config_dir / "egress_policy.json"
@@ -83,6 +87,41 @@ class Phase2Orchestrator:
             
         self.processes: list[subprocess.Popen] = []
 
+
+    def run_runtime_observer(self, phase: str) -> None:
+        if phase not in {"before", "finalize"}:
+            raise OrchestratorError(f"Unsupported observation phase: {phase}")
+
+        print(f"[+] Runtime observation phase: {phase}")
+        self.run_command(
+            [
+                "sudo",
+                "env",
+                f"PYTHONPATH={self.project_root}",
+                sys.executable,
+                "scripts/capture_runtime_observations.py",
+                phase,
+                "--run-dir",
+                str(self.config.out_dir),
+                "--rootfs",
+                str(self.rootfs_dir),
+            ]
+        )
+
+
+
+    def run_repair_planner(self) -> None:
+        print("[+] Building passive repair plan")
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/plan_repairs.py",
+                "--requirements",
+                str(self.runtime_requirements_path),
+                "--out",
+                str(self.repair_plan_path),
+            ]
+        )
 
 
     def clear_network_self_test_artifacts(self) -> None:
@@ -145,8 +184,12 @@ class Phase2Orchestrator:
 
             if self.config.network_mode == NetworkMode.NONE:
                 self.ensure_sudo()
+                self.run_runtime_observer("before")
                 self.run_sample_direct()
+                self.make_runtime_artifacts_readable()
                 self.parse_strace_logs()
+                self.run_runtime_observer("finalize")
+                self.run_repair_planner()
                 self.generate_report()
                 self.print_run_summary()
                 return
@@ -161,9 +204,12 @@ class Phase2Orchestrator:
                 self.wait_for_transparent_logger()
                 self.wait_for_c2_record_broker()
 
+                self.run_runtime_observer("before")
                 self.run_sample()
                 self.make_runtime_artifacts_readable()
                 self.parse_strace_logs()
+                self.run_runtime_observer("finalize")
+                self.run_repair_planner()
                 self.generate_report()
                 self.print_run_summary()
                 return
@@ -204,11 +250,14 @@ class Phase2Orchestrator:
                 self.run_network_self_test()
                 self.clear_network_self_test_artifacts()
 
+            self.run_runtime_observer("before")
             self.run_sample()
 
             self.make_runtime_artifacts_readable()
 
             self.parse_strace_logs()
+            self.run_runtime_observer("finalize")
+            self.run_repair_planner()
             self.generate_report()
 
             self.print_run_summary()
@@ -1379,6 +1428,10 @@ class Phase2Orchestrator:
         print(f"    report md: {self.config.out_dir / 'report.md'}")
         print(f"    runtime stdout: {self.logs_dir / 'runtime_stdout.log'}")
         print(f"    runtime stderr: {self.logs_dir / 'runtime_stderr.log'}")
+        print(f"    observation lifecycle: {self.config_dir / 'observation_lifecycle.json'}")
+        print(f"    rootfs diff: {self.config_dir / 'rootfs_diff.json'}")
+        print(f"    runtime requirements: {self.runtime_requirements_path}")
+        print(f"    repair plan: {self.repair_plan_path}")
         print(f"    transparent logger stdout: {self.logs_dir / 'transparent_logger_stdout.log'}")
         print(f"    transparent logger stderr: {self.logs_dir / 'transparent_logger_stderr.log'}")
         print(f"    network emulator stdout: {self.logs_dir / 'network_emulator_stdout.log'}")

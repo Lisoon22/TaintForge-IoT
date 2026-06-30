@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
-from .models import SUPPORTED_ARCHES, SUPPORTED_NETWORK_TYPES
+from .models import SUPPORTED_ARCHES, SUPPORTED_NETWORK_TYPES, SUPPORTED_RUNTIME_MODULE_KINDS
 
 
 class TaintLogValidationError(ValueError):
@@ -97,3 +97,40 @@ def validate_port(port: Any, context: str = "network_dependency.port") -> int:
         raise TaintLogValidationError(f"{context} out of range: {port}")
 
     return port
+
+def validate_hex_address(value: Any, context: str) -> str:
+    value = require_string(value, context).lower()
+
+    if not value.startswith("0x"):
+        raise TaintLogValidationError(
+            f"{context} must start with 0x"
+        )
+
+    try:
+        parsed = int(value, 16)
+    except ValueError as exc:
+        raise TaintLogValidationError(
+            f"{context} is not a valid hexadecimal address: {value}"
+        ) from exc
+
+    if parsed < 0:
+        raise TaintLogValidationError(
+            f"{context} must be >= 0"
+        )
+
+    return hex(parsed)
+
+
+def validate_runtime_module_kind(value: Any, context: str) -> str:
+    kind = require_string(value, context).lower()
+
+    if kind not in SUPPORTED_RUNTIME_MODULE_KINDS:
+        supported = ", ".join(
+            sorted(SUPPORTED_RUNTIME_MODULE_KINDS)
+        )
+        raise TaintLogValidationError(
+            f"Unsupported runtime module kind: {kind}. "
+            f"Supported: {supported}"
+        )
+
+    return kind
