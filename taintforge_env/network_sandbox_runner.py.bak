@@ -205,11 +205,6 @@ run_sample() {{
   rm -f "$SECURITY_STATUS_PATH"
   rm -f "$RESOURCE_LIMITS_PATH"
 
-  # Create output files even if sudo, unshare or chroot fails
-  # before the guest process starts.
-  : > "$STDOUT_PATH"
-  : > "$STDERR_PATH"
-
   set +e
 
   timeout --kill-after=5s {config.timeout_seconds}s \\
@@ -294,8 +289,7 @@ EOF
           fi
 
           exec chroot "$ROOTFS" "$@"
-        ' bash "$ROOTFS" "$LOG_DIR" "$TRACE_MODE" {exec_part} \
-    >"$STDOUT_PATH" 2>"$STDERR_PATH"
+        ' bash "$ROOTFS" "$LOG_DIR" "$TRACE_MODE" {exec_part}
 
   EXIT_CODE="$?"
 
