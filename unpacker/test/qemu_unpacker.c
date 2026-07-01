@@ -39,6 +39,7 @@ static RegShadow reg_shadow;
 static TraceBuffer *g_trace = NULL;
 static DseAuxRing *g_aux = NULL;
 static __thread InsnAux *g_cur_aux = NULL;
+static bool g_taint_seen = false;
 static struct qemu_plugin_register *g_reg_handle[REG_COUNT];
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
@@ -355,7 +356,7 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
 	shadow_taint_byte(g_shadow, vaddr, g_current_ip);
-
+	g_taint_seen = true;
 	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) (vaddr & ~(page_size - 1)));
 	if (p) {
 		p->written = true;
@@ -597,7 +598,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			memcpy(ent.instr_bytes, ib->data, ib->len > 15 ? 15 : ib->len);
 		}
 		g_byte_array_free(ib, TRUE);
-		if (g_aux) {
+		if (g_aux && g_taint_seen) {
 			if (!g_regs_ready) dse_init_reg_handles();
 			InsnAux aux;
 			memset(&aux, 0, sizeof(aux));
@@ -616,6 +617,8 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			uint32_t idx = g_trace->head_pointer & (g_aux->capacity - 1);
 			dse_aux_record(g_aux, g_trace, &aux);
 			g_cur_aux = &g_aux->entries[idx];
+		} else {
+			g_cur_aux = NULL;
 		}
 		trace_append(g_trace, &ent);
 	}
@@ -689,7 +692,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 						uint64_t tgt = 0;
 						dse_read_reg(meta->branch_target_reg, &tgt);
 						bool dse_ok = dse_verify_oep_candidate(g_trace, vaddr, meta->branch_target_reg, tgt, g_shadow, cs_handle);
-						fprintf(stderr, "[DSE] OEP verify: %s (concretized %u/%u)\n", dse_ok ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count());
+						fprintf(stderr, "[DSE] OEP verify: %s (concretized %u/%u; aux_miss %u, unsupported %u)\n", dse_ok ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
 					} else {
 						uint64_t taddr = 0, tval = 0;
 						if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {

@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -563,6 +564,10 @@ void sym_state_set_reg(SymState *st, RegId rid, SymExpr *e) {
 	st->reg[rid] = e;
 }
 
+static void dse_z3_error_handler(Z3_context c, Z3_error_code e) {
+	(void)c; (void)e;
+}
+
 bool dse_ctx_init(DSECtx *ctx) {
 	memset(ctx, 0, sizeof(*ctx));
 	sym_state_init(&ctx->state);
@@ -572,6 +577,7 @@ bool dse_ctx_init(DSECtx *ctx) {
 	ctx->z3_ctx = Z3_mk_context_rc(cfg);
 	Z3_del_config(cfg);
 	if (!ctx->z3_ctx) return false;
+	Z3_set_error_handler(ctx->z3_ctx, dse_z3_error_handler);
 	ctx->z3_solver = Z3_mk_solver(ctx->z3_ctx);
 	Z3_solver_inc_ref(ctx->z3_ctx, ctx->z3_solver);
 	Z3_params params = Z3_mk_params(ctx->z3_ctx);
@@ -613,41 +619,63 @@ static Z3_ast sym_expr_to_z3(DSECtx *ctx, const SymExpr *e) {
 	switch (e->type) {
 		case SYM_CONST: {
 			Z3_sort sort = Z3_mk_bv_sort(c, e->width);
-			return Z3_mk_unsigned_int64(c, e->const_val, sort);
+			Z3_ast r = Z3_mk_unsigned_int64(c, e->const_val, sort);
+			if (r) Z3_inc_ref(c, r);
+			return r;
 		}
 		case SYM_VAR: {
 			Z3_sort sort = Z3_mk_bv_sort(c, e->width);
-			Z3_symbol name = Z3_mk_int_symbol(c, (int)e->var.id);
-			return Z3_mk_const(c, name, sort);
+			char nbuf[32];
+			snprintf(nbuf, sizeof(nbuf), "dse_v%u", e->var.id);
+			Z3_symbol name = Z3_mk_string_symbol(c, nbuf);
+			Z3_ast r = Z3_mk_const(c, name, sort);
+			if (r) Z3_inc_ref(c, r);
+			return r;
 		}
 		case SYM_ADD: case SYM_SUB: case SYM_XOR: case SYM_AND: case SYM_SHL: case SYM_CONCAT: {
 			Z3_ast A = sym_expr_to_z3(ctx, e->binary.a);
 			Z3_ast B = sym_expr_to_z3(ctx, e->binary.b);
-			if (!A || !B) return NULL;
+			if (!A || !B) {
+				if (A) Z3_dec_ref(c, A);
+				if (B) Z3_dec_ref(c, B);
+				return NULL;
+			}
+			Z3_ast r = NULL;
 			switch (e->type) {
-				case SYM_ADD:    return Z3_mk_bvadd(c, A, B);
-				case SYM_SUB:    return Z3_mk_bvsub(c, A, B);
-				case SYM_XOR:    return Z3_mk_bvxor(c, A, B);
-				case SYM_AND:    return Z3_mk_bvand(c, A, B);
-				case SYM_SHL:    return Z3_mk_bvshl(c, A, B);
-				case SYM_CONCAT: return Z3_mk_concat(c, A, B);
+				case SYM_ADD:    return Z3_mk_bvadd(c, A, B); break;
+				case SYM_SUB:    return Z3_mk_bvsub(c, A, B); break;
+				case SYM_XOR:    return Z3_mk_bvxor(c, A, B); break;
+				case SYM_AND:    return Z3_mk_bvand(c, A, B); break;
+				case SYM_SHL:    return Z3_mk_bvshl(c, A, B); break;
+				case SYM_CONCAT: return Z3_mk_concat(c, A, B); break;
 				default:         return NULL;
 			}
+			if (r) Z3_inc_ref(c, r);
+			Z3_dec_ref(c, A);
+			Z3_dec_ref(c, B);
+			return r;
 		}
 		case SYM_ZEXT: case SYM_SEXT: {
 			Z3_ast A = sym_expr_to_z3(ctx, e->unary.a);
 			if (!A) return NULL;
 			unsigned add = (unsigned)(e->width - e->unary.a->width);
+			Z3_ast r;
 			if (e->type == SYM_ZEXT) {
-				return Z3_mk_zero_ext(c, add, A);
+				return r= Z3_mk_zero_ext(c, add, A);
 			} else {
-				return Z3_mk_sign_ext(c, add, A);
+				return r = Z3_mk_sign_ext(c, add, A);
 			}
+			if (r) Z3_inc_ref(c, r);
+			Z3_dec_ref(c, A);
+			return r;
 		}
 		case SYM_EXTRACT: {
 			Z3_ast A = sym_expr_to_z3(ctx, e->unary.a);
 			if (!A) return NULL;
-			return Z3_mk_extract(c, e->unary.extract_high, e->unary.extract_low, A);
+			Z3_ast r = Z3_mk_extract(c, e->unary.extract_high, e->unary.extract_low, A);
+			if (r) Z3_inc_ref(c, r);
+			Z3_dec_ref(c, A);
+			return r;
 		}
 		default: {
 			return NULL;
@@ -676,6 +704,7 @@ static const TraceBuffer *g_tb   = NULL;
 static const DseAuxRing *g_ring = NULL;
 static const DseArch *g_arch = NULL;
 static uint32_t g_total = 0, g_concretized = 0;
+static uint32_t g_aux_miss = 0, g_unsupported = 0;
 
 //lifter
 bool dse_lift_insn(DSECtx *ctx, const TraceEntry *entry, const InsnMeta *meta, csh cs_handle) {
@@ -696,6 +725,7 @@ bool dse_lift_insn(DSECtx *ctx, const TraceEntry *entry, const InsnMeta *meta, c
 		for (int i = 0; i < REG_COUNT; i++) {
 			if (meta->regs_written_mask & (1U << i)) sym_state_set_reg(&ctx->state, i, NULL);
 		}
+		if (!aux) g_aux_miss++;
 		g_concretized++;
 		return false;
 	}
@@ -706,6 +736,7 @@ bool dse_lift_insn(DSECtx *ctx, const TraceEntry *entry, const InsnMeta *meta, c
 		for (int i = 0; i < REG_COUNT; i++) {
 			if (meta->regs_written_mask & (1U << i)) sym_state_set_reg(&ctx->state, i, NULL);
 		}
+		g_unsupported++;
 		g_concretized++;
 	}
 	cs_free(insn, count);
@@ -721,12 +752,21 @@ void dse_lift_begin(DSECtx *ctx) {
 	if (ctx) sym_state_clear(&ctx->state);
 	g_total = 0;
 	g_concretized = 0;
+	g_aux_miss = 0;
+	g_unsupported = 0;
 }
 uint32_t dse_lift_total_count(void) {
 	return g_total;
 }
 uint32_t dse_lift_concretized_count(void) {
 	return g_concretized;
+}
+
+uint32_t dse_lift_aux_miss_count(void)    {
+	return g_aux_miss;
+}
+uint32_t dse_lift_unsupported_count(void) {
+	return g_unsupported;
 }
 
 bool dse_expr_has_var(const SymExpr *e) {
@@ -760,46 +800,39 @@ SymExpr *dse_load_mem(DSECtx *ctx, const InsnAux *aux, uint32_t width_bits, bool
 	if (!ctx || !aux || width_bits == 0) return NULL;
 	if (!aux->has_mem_read) return NULL;
 	uint64_t addr = aux->mem_read_addr;
-	//store in current slice
-	if (ctx->state.sym_mem) {
-		gint64 key = (gint64)addr;
-		SymExpr *stored = g_hash_table_lookup(ctx->state.sym_mem, &key);
-		if (stored) return sym_expr_clone(stored);
-	}
+
 	uint32_t nbytes = width_bits / 8;
 	if (nbytes == 0) nbytes = 1;
 	if (nbytes > 8)  nbytes = 8;
+
 	SymExpr *acc = NULL;
-	//check every byte on taint
 	for (uint32_t i = 0; i < nbytes; i++) {
 		uint8_t tainted = (aux->mem_read_taint >> i) & 1u;
-		uint8_t bval = (uint8_t)((aux->mem_read_val >> (8 * i)) & 0xFF);
-		uint64_t baddr;
-	       	if ( big_endian ) {
-			baddr = (addr + (nbytes-1 - i)); 
-		} else {
-			baddr = (addr + i);
+		uint8_t bval    = (uint8_t)((aux->mem_read_val >> (8 * i)) & 0xFF);
+		uint64_t baddr  = big_endian ? (addr + (nbytes - 1 - i)) : (addr + i);
+
+		SymExpr *byte = NULL;
+		/* побайтовый store-forward: сперва ищем ранее записанный символьный байт */
+		if (ctx->state.sym_mem) {
+			gint64 key = (gint64)baddr;
+			SymExpr *stored = g_hash_table_lookup(ctx->state.sym_mem, &key);
+			if (stored) byte = sym_expr_clone(stored);   /* всегда 8 бит */
 		}
-		SymExpr *byte;
-		if (tainted) {
-			byte = sym_state_new_var(&ctx->state, baddr, 8);
-		} else {
-			byte = sym_expr_const(bval,8);
+		if (!byte) {
+			byte = tainted ? sym_state_new_var(&ctx->state, baddr, 8)
+			               : sym_expr_const(bval, 8);
 		}
 		if (!byte) {
 			sym_expr_free(acc);
 			return NULL;
 		}
-		if (acc) {
-			acc = sym_expr_concat(byte, acc);
-		} else {
-			acc = byte;
-		}
+
+		acc = acc ? sym_expr_concat(byte, acc) : byte;   /* младшие адреса — снизу */
 	}
 	return acc;
 }
 //store from mem
-void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val) {
+void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val, bool big_endian) {
 	if (!ctx || !aux) {
 		sym_expr_free(val);
 		return;
@@ -809,9 +842,18 @@ void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val) {
 		return;
 	}
 	if (!ctx->state.sym_mem) ctx->state.sym_mem = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, (GDestroyNotify)sym_expr_free);
-	gint64 *k = g_new(gint64, 1); 
-	*k = (gint64)aux->mem_write_addr;
-	g_hash_table_insert(ctx->state.sym_mem, k, val);
+	uint32_t nbytes = val->width / 8;
+	if (nbytes == 0) nbytes = 1;
+	if (nbytes > 8) nbytes = 8;
+	uint64_t base = aux->mem_write_addr;
+	for (uint32_t i = 0; i < nbytes; i++) {
+		SymExpr *byte = sym_expr_extract(sym_expr_clone(val), 8 * i, 8);
+		if (!byte) continue;
+		gint64 *k = g_new(gint64, 1); 
+		*k = (gint64)(base + i);
+		g_hash_table_insert(ctx->state.sym_mem, k, byte);
+	}
+	sym_expr_free(val);
 }
 
 void dse_set_reg(DSECtx *ctx, int rid, SymExpr *val, uint32_t natw) {
@@ -872,6 +914,7 @@ bool dse_verify_oep_candidate(TraceBuffer *tb, uint64_t trigger_pc, RegId target
 	for (int i = 0; i < n; i++) {
 		InsnMeta *meta = meta_lookup(slice[i]->pc);
 		if (!meta) {
+			g_total++;
 			g_concretized++;
 			continue;
 		}

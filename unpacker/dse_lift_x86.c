@@ -62,7 +62,7 @@ static bool lift_mov(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
 	}
 	if (dst->type == X86_OP_REG) return commit_reg(ctx, aux, arch, dst->reg, src_e, w);
 	if (dst->type == X86_OP_MEM) {
-		dse_store_mem(ctx, aux, src_e);
+		dse_store_mem(ctx, aux, src_e, arch->big_endian);
 		return true;
 	}
 	sym_expr_free(src_e);
@@ -188,7 +188,7 @@ static bool lift_push(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const
 		if (sw < natw)      val = sym_expr_zext(val, natw);
 		else if (sw > natw) val = sym_expr_extract(val, 0, natw);
 	}
-	dse_store_mem(ctx, aux, val);
+	dse_store_mem(ctx, aux, val, arch->big_endian);
 
 	SymExpr *esp = dse_read_rid_fit(ctx, aux, REG_RSP, natw, natw);
 	if (esp) {
@@ -215,7 +215,7 @@ static bool lift_pop(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
 
 	if (dst->type == X86_OP_REG) return commit_reg(ctx, aux, arch, dst->reg, val, natw);
 	if (dst->type == X86_OP_MEM) {
-		dse_store_mem(ctx, aux, val);
+		dse_store_mem(ctx, aux, val, arch->big_endian);
 		return true;
 	}
 	sym_expr_free(val);

@@ -89,7 +89,7 @@ extern const DseArch dse_arch_x86;
 
 SymExpr *dse_read_rid_fit(DSECtx *ctx, const InsnAux *aux, int rid, uint32_t want_w, uint32_t natural_w);
 SymExpr *dse_load_mem (DSECtx *ctx, const InsnAux *aux, uint32_t width_bits, bool big_endian);
-void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val);
+void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val, bool big_endian);
 void dse_set_reg (DSECtx *ctx, int rid, SymExpr *val, uint32_t natural_w);
 void dse_commit_low(DSECtx *ctx, const InsnAux *aux, int rid, SymExpr *val, uint32_t w, uint32_t natural_w);
 
