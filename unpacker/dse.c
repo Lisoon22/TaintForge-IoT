@@ -689,13 +689,22 @@ void dse_path_assert(DSECtx *ctx, SymExpr *cond, bool expected) {
 		sym_expr_free(cond);
 		return;
 	}
+	Z3_context z = ctx->z3_ctx;
 	Z3_ast c = sym_expr_to_z3(ctx, cond);
 	if (c) {
-		Z3_sort s = Z3_mk_bv_sort(ctx->z3_ctx, cond->width);
-		Z3_ast want = Z3_mk_unsigned_int64(ctx->z3_ctx, expected ? 1u : 0u, s);
-		Z3_ast eq = Z3_mk_eq(ctx->z3_ctx, c, want);
+		Z3_sort s = Z3_mk_bv_sort(z, cond->width);
+		Z3_ast want = Z3_mk_unsigned_int64(z, expected ? 1u : 0u, s);
+		Z3_inc_ref(z, want);
+		Z3_ast eq = Z3_mk_eq(z, c, want);
+		Z3_inc_ref(z, eq);
 		Z3_ast conj[2] = { ctx->path_predicate, eq };
-		ctx->path_predicate = Z3_mk_and(ctx->z3_ctx, 2, conj);
+		Z3_ast np = Z3_mk_and(z, 2, conj);
+		Z3_inc_ref(z, np);
+		Z3_dec_ref(z, ctx->path_predicate);
+		ctx->path_predicate = np;
+		Z3_dec_ref(z, eq);
+		Z3_dec_ref(z, want);
+		Z3_dec_ref(z, c);
 	}
 	sym_expr_free(cond);
 }
@@ -880,25 +889,32 @@ void dse_commit_low(DSECtx *ctx, const InsnAux *aux, int rid, SymExpr *val, uint
 	sym_state_set_reg(&ctx->state, rid, sym_expr_concat(hi, val));
 }
 
-
 int dse_check_oep_reachable(DSECtx *ctx, SymExpr *target_expr, uint64_t oep_candidate) {
 	if (!ctx || !ctx->has_solver || !target_expr) return -1;
+	Z3_context z = ctx->z3_ctx;
 	Z3_ast t = sym_expr_to_z3(ctx, target_expr);
 	if (!t) return -1;
-	Z3_sort s = Z3_mk_bv_sort(ctx->z3_ctx, target_expr->width);
-	Z3_ast oep = Z3_mk_unsigned_int64(ctx->z3_ctx, mask_w(oep_candidate, target_expr->width), s);
-	Z3_ast eq = Z3_mk_eq(ctx->z3_ctx, t, oep);
+	Z3_sort s = Z3_mk_bv_sort(z, target_expr->width);
+	Z3_ast oep = Z3_mk_unsigned_int64(z, mask_w(oep_candidate, target_expr->width), s);
+	Z3_inc_ref(z, oep);
+	Z3_ast eq = Z3_mk_eq(z, t, oep);
+	Z3_inc_ref(z, eq);
 
-	Z3_solver_push(ctx->z3_ctx, ctx->z3_solver);
-	Z3_solver_assert(ctx->z3_ctx, ctx->z3_solver, ctx->path_predicate);
-	Z3_solver_assert(ctx->z3_ctx, ctx->z3_solver, eq);
-	Z3_lbool r = Z3_solver_check(ctx->z3_ctx, ctx->z3_solver);
-	Z3_solver_pop(ctx->z3_ctx, ctx->z3_solver, 1);
+	Z3_solver_push(z, ctx->z3_solver);
+	Z3_solver_assert(z, ctx->z3_solver, ctx->path_predicate);
+	Z3_solver_assert(z, ctx->z3_solver, eq);
+	Z3_lbool r = Z3_solver_check(z, ctx->z3_solver);
+	Z3_solver_pop(z, ctx->z3_solver, 1);
+
+	Z3_dec_ref(z, eq);
+	Z3_dec_ref(z, oep);
+	Z3_dec_ref(z, t);
 
 	if (r == Z3_L_TRUE)  return 1;
 	if (r == Z3_L_FALSE) return 0;
 	return -1;
 }
+
 bool dse_verify_oep_candidate(TraceBuffer *tb, uint64_t trigger_pc, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
 	if (!tb || target_reg < 0 || target_reg >= REG_COUNT || !g_arch) return false;
 	g_tb = tb;

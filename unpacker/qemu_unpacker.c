@@ -27,6 +27,8 @@ typedef struct {
     bool exec_after_write;
     uint64_t write_count;
     uint64_t last_write;
+    uint8_t *wbitmap;
+    uint32_t gen_written;
 } page_t;
 
 static GHashTable *pages = NULL;
@@ -44,6 +46,12 @@ static struct qemu_plugin_register *g_reg_handle[REG_COUNT];
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
+//additional OEP checks
+static uint64_t g_icount = 0;
+static uint32_t g_unpack_gen = 0;
+static bool g_prev_unpacked = false;
+static uint64_t g_last_cand_icount = 0;
+
 typedef struct {
 	bool active;
 	int64_t syscall_num;
@@ -352,6 +360,34 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 		lib_deps = g_list_append(lib_deps, lm);
 	}
 	return f;
+}
+//mark write
+static void mark_written(uint64_t vaddr, uint32_t size) {
+	while (size > 0) {
+		uint64_t page_addr = vaddr & ~(page_size - 1);
+		uint32_t offset = vaddr & (page_size - 1);
+		uint32_t chunk = MIN(size, page_size - offset);
+		page_t *page = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
+
+		if (!page) {
+			page = g_new0(page_t, 1);
+			page->prot = 0x3;
+			g_hash_table_insert(pages, (gpointer)(uintptr_t)page_addr, page);
+		}
+
+		if (!page->wbitmap) page->wbitmap = g_malloc0(page_size / 8);
+
+		for (uint32_t i = 0; i < chunk; i++) {
+			uint32_t bit = offset + i;
+			page->wbitmap[bit >> 3] |= 1u << (bit & 7);
+		}
+		page->written = true;
+		page->write_count++;
+		page->last_write = g_icount;
+		page->gen_written = g_unpack_gen;
+		vaddr += chunk;
+		size -= chunk;
+	}
 }
 
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
