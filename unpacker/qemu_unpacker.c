@@ -25,11 +25,22 @@ typedef struct {
     int prot;
     bool written;
     bool exec_after_write;
+    bool dyn_exec;
     uint64_t write_count;
     uint64_t last_write;
     uint8_t *wbitmap;
     uint32_t gen_written;
 } page_t;
+
+//multiple OEP vatiants
+typedef struct {
+    uint64_t addr;
+    uint64_t jump_site;
+    uint32_t generation;
+    uint64_t icount;
+    bool     dse_confirmed;
+} oep_cand_t;
+
 
 static GHashTable *pages = NULL;
 static ShadowMemory *g_shadow = NULL;
@@ -51,6 +62,15 @@ static uint64_t g_icount = 0;
 static uint32_t g_unpack_gen = 0;
 static bool g_prev_unpacked = false;
 static uint64_t g_last_cand_icount = 0;
+static GList *oep_cands = NULL;
+static GHashTable *unmapped_pages = NULL; //for munmaped pages
+
+//addtional info for last indirect jump
+static __thread uint64_t prev_jump_site = 0;
+static __thread int prev_target_reg = REG_INVALID;
+static __thread uint64_t prev_mem_taddr = 0;
+static __thread bool prev_jump_pending = false;
+static uint32_t g_prev_gen = 0xFFFFFFFFu; 
 
 typedef struct {
 	bool active;
@@ -393,18 +413,16 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
 	shadow_taint_byte(g_shadow, vaddr, g_current_ip);
 	g_taint_seen = true;
-	page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) (vaddr & ~(page_size - 1)));
-	if (p) {
-		p->written = true;
-		p->write_count++;
-		p->last_write = g_current_ip;
-	}
+	uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
+	mark_written(vaddr, size);
 }
 
 static bool bin_dumped = false;
 static GString *saved_reg = NULL;
 static uint64_t saved_base = 0;
 static bool saved_base_set = false;
+static uint64_t saved_oep = 0;
+static bool image_captured = false;
 
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
@@ -479,12 +497,19 @@ static void do_dump(uint64_t oep) {
 		}
 		g_string_append(saved_reg, "  ],\n");
 	}
+	g_list_free(keys);
+	image_captured = true;
+	fprintf(stderr, "[DUMP] unpacked.bin captured (oep=0x%lx)\n", (unsigned long)oep);
+}
+
+static void write_report(void) {
+	if (!image_captured) do_dump(saved_oep);
 
 	FILE *f_json = fopen("unpacked.json", "w");
-	if (!f_json) { g_list_free(keys); return; }
+	if (!f_json) return;
 
 	fprintf(f_json, "{\n");
-	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", oep);
+	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", saved_oep);
 	fprintf(f_json, "  \"arch\": \"x86\",\n");
 	fprintf(f_json, "  \"base\": \"0x%lx\",\n", saved_base);
 	fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
@@ -548,14 +573,29 @@ static void do_dump(uint64_t oep) {
 	fprintf(f_json, "\n  ]\n}\n");
 
 	fclose(f_json);
-	g_list_free(keys);
-	fprintf(stderr, "[DUMP] unpacked.bin + unpacked.json complete\n");
+	fprintf(stderr, "[DUMP] unpacked.json complete\n");
 }
 
 
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
-	//dump check
-	do_dump(oep_addr);
+	//oep choose
+	if (!oep_found && oep_cands) {
+		for (GList *l = g_list_last(oep_cands); l; l = l->prev) {
+			oep_cand_t *c = (oep_cand_t*)l->data;
+			if (c->dse_confirmed) {
+				oep_addr = c->addr;
+				oep_found = true;
+				break;
+			}
+		}
+		if (!oep_found)   /* W^X if no one DSE confirmed */
+			oep_addr = ((oep_cand_t*)g_list_last(oep_cands)->data)->addr;
+	}
+
+	
+	//write json-report
+	saved_oep = oep_addr;
+	write_report();
 	//memory free
 	for (GList *l = file_deps; l; l = l->next) {
 		file_dep_t *f = (file_dep_t*)l->data;
@@ -577,6 +617,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	g_list_free(net_deps);
 	g_hash_table_destroy(file_fd);
 	
+	if (unmapped_pages) {
+		g_hash_table_destroy(unmapped_pages);
+		unmapped_pages = NULL;
+	}
+
 	if (g_sockets) {
 		GHashTableIter iter;
 		gpointer key, value;
@@ -588,9 +633,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 		}
 	}
 	g_hash_table_destroy(g_sockets);
-	if (saved_reg) {
-		g_string_free(saved_reg, TRUE);
-	}
 	
 	//fd
 	g_free(pending_open_path);
@@ -602,6 +644,13 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	//tracer
 	trace_buffer_destroy(g_trace);
 	g_trace = NULL;
+	
+	if (saved_reg) {
+		g_string_free(saved_reg, TRUE);
+		saved_reg = NULL;
+	}
+	g_list_free_full(oep_cands, g_free);
+	oep_cands = NULL;
 }
 
 static int mask_first_reg(uint32_t mask) {
@@ -611,12 +660,31 @@ static int mask_first_reg(uint32_t mask) {
 	return -1;
 }
 
+static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
+	for (size_t i = 0; i < size; i++) {
+		uint64_t addr = vaddr + i;
+		uint64_t page_addr = addr & ~(page_size - 1);
+		page_t *page = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
+
+		if (!page || !(page->prot & 0x4)) continue;
+
+		if (page->dyn_exec) return true;
+
+		if (page->wbitmap) {
+			unsigned offset = addr & (page_size - 1);
+			if (page->wbitmap[offset >> 3] & (1u << (offset & 7))) return true;
+		}
+	}
+	return false;
+}
+
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t vaddr = (uint64_t)(uintptr_t) udata;
 	g_current_ip = vaddr;
-	
+	g_icount++;
+
 	InsnMeta *meta = meta_lookup(vaddr);
-	if (!meta) goto fallback_oep;
+	if (!meta) return;
 
 	//tracer
 	if (g_trace) {
@@ -658,18 +726,80 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		}
 		trace_append(g_trace, &ent);
 	}
+	//detect mov to upacked code
+	bool now_unpacked = insn_is_unpacked(vaddr, meta->size);
+	uint32_t cur_gen = UINT32_MAX;
+	if (now_unpacked) {
+		uint64_t page_addr = vaddr & ~(page_size - 1);
+		page_t *pg = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
+		if (pg) cur_gen = pg->gen_written;
+	}
+
+	bool new_layer = now_unpacked && !oep_found &&(!g_prev_unpacked || cur_gen != g_prev_gen);
+
+	if (new_layer) {
+		oep_cand_t *c = g_new0(oep_cand_t, 1);
+		c->addr = vaddr;
+		if (prev_jump_pending) {
+			c->jump_site = prev_jump_site;
+		} else {
+			c->jump_site = 0;
+		}
+		c->generation = g_unpack_gen;
+		c->icount = g_icount;
+		//dse confirming
+		if (prev_jump_pending) {
+			if (prev_target_reg >= 0) {
+				c->dse_confirmed = dse_verify_oep_candidate(g_trace, prev_jump_site, prev_target_reg, vaddr,g_shadow, cs_handle);
+			} else if (prev_mem_taddr) {
+				c->dse_confirmed = dse_verify_oep_candidate_mem(g_trace, g_aux, prev_jump_site, prev_mem_taddr, vaddr, g_shadow, cs_handle);
+			}
+		}
+		fprintf(stderr,"[OEP-CAND gen=%u] 0x%lx (jmp@0x%lx) dse=%s ""(concretized %u/%u; aux_miss %u, unsup %u)\n", c->generation, (unsigned long)c->addr, (unsigned long)c->jump_site, c->dse_confirmed ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
+		//proceed to next layer
+		oep_cands = g_list_append(oep_cands, c);
+		g_unpack_gen++;
+		g_last_cand_icount = g_icount;
+		prev_jump_pending = false;
+		prev_jump_site = 0;
+		prev_target_reg = REG_INVALID;
+		prev_mem_taddr = 0;
+	}
+	//if we are too long in unpacked code without proceeding further - we end cycle
+	if (now_unpacked && !oep_found && g_last_cand_icount && (g_icount - g_last_cand_icount) > 200000) {
+		oep_cand_t *chosen = NULL;
+		for (GList *l = g_list_last(oep_cands); l; l = l->prev) {
+			oep_cand_t *cc = (oep_cand_t*)l->data;
+			if (cc->dse_confirmed) {
+				chosen = cc;
+				break; 
+			}
+		}
+		if (!chosen && oep_cands)   //fallback
+			chosen = (oep_cand_t*)g_list_last(oep_cands)->data;
+		if (chosen) {
+			oep_addr  = chosen->addr;
+			oep_found = true;
+			fprintf(stderr, "[OEP-FINAL gen=%u] 0x%lx\n", chosen->generation, (unsigned long)chosen->addr);
+			do_dump(oep_addr);
+		}
+	}
+	g_prev_unpacked = now_unpacked;
+	if (now_unpacked) g_prev_gen = cur_gen;
+
+	//taint propagation
 
 	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
 	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
 		int reg = mask_first_reg(meta->regs_written_mask);
 		if (reg >= 0) reg_propagate_clear(&reg_shadow, reg);
-		goto check_oep;
+		goto record_branch;
 	}
 	//if const have been changed we will see at mem_taint
 	if (meta->regs_read_mask == 0 && meta->regs_written_mask != 0 && !meta->has_mem_read && !meta->has_mem_write) {
 		int dst = mask_first_reg(meta->regs_written_mask);
 		if (dst >= 0) reg_propagate_clear(&reg_shadow, dst);
-		goto check_oep;
+		goto record_branch;
 	}
 	// lea with two registers
 	if (meta->insn_id == X86_INS_LEA) {
@@ -678,7 +808,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		if (dst >= 0 && src >= 0) {
 			propagate_reg2reg(&reg_shadow, dst, 0x0F, src, 0x0F);
 		}
-		goto check_oep;
+		goto record_branch;
 	}
 	//mem2reg
 	if (meta->has_mem_read && meta->regs_written_mask) {
@@ -712,7 +842,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
 		}
 	}
-	check_oep:
+	record_branch:
 		if (meta->is_indirect_branch && !oep_found) { //indirect check
 			bool target_tainted = false;
 			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) { //on reg
@@ -721,42 +851,18 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 				target_tainted = shadow_page_has_taint(g_shadow, vaddr);
 			}
 			if (target_tainted) {
-				uint64_t page = vaddr & ~(page_size - 1);
-				page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
-				if (p && (p->prot & 0x4)) {
-					if (meta->branch_target_reg >= 0) {
-						uint64_t tgt = 0;
-						dse_read_reg(meta->branch_target_reg, &tgt);
-						bool dse_ok = dse_verify_oep_candidate(g_trace, vaddr, meta->branch_target_reg, tgt, g_shadow, cs_handle);
-						fprintf(stderr, "[DSE] OEP verify: %s (concretized %u/%u; aux_miss %u, unsupported %u)\n", dse_ok ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
-					} else {
-						uint64_t taddr = 0, tval = 0;
-						if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {
-							uint64_t esp = 0;
-							dse_read_reg(REG_RSP, &esp);
-							fprintf(stderr, "[DSE-DBG] insn_id=%u esp=0x%lx taddr=0x%lx tval=0x%lx\n", meta->insn_id, (unsigned long)esp, (unsigned long)taddr, (unsigned long)tval);
-							bool ok = dse_verify_oep_candidate_mem(g_trace, g_aux, vaddr, taddr, tval, g_shadow, cs_handle);
-							fprintf(stderr, "[DSE] OEP(mem) verify: %s  (target [0x%lx]=0x%lx, concretized %u/%u)\n", ok ? "CONFIRMED" : "unconfirmed", (unsigned long)taddr, (unsigned long)tval, dse_lift_concretized_count(), dse_lift_total_count());
-						} else {
-							fprintf(stderr, "[DSE] OEP memory-indirect: could not resolve target\n");
-						}
+				prev_jump_site = vaddr;
+				prev_jump_pending = true;
+				prev_target_reg = meta->branch_target_reg;
+				prev_mem_taddr =0;
+				//for mem or ret, we need to do it inplace, when registers still suitable
+				if (meta->branch_target_reg == REG_INVALID) {
+					uint64_t taddr = 0, tval = 0;
+					if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {
+					       	prev_mem_taddr = taddr;
 					}
-					oep_found = true;
-					oep_addr = vaddr;
-					fprintf(stderr, "[OEP-REG] 0x%lx\n", vaddr);
-					do_dump(oep_addr);
-					return;
 				}
 			}
-		}
-	fallback_oep: //enough for direct jumps, TODO mb add direct jump sink
-		if (oep_addr != 0) return;
-		uint64_t page = vaddr & ~(page_size - 1);
-		page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page);
-		if (p && ((p->written && (p->prot & 0x4)) || p->exec_after_write)) {
-			oep_addr = vaddr;
-			fprintf(stderr, "[OEP-LEGACY] 0x%lx\n", oep_addr);
-			do_dump(oep_addr);
 		}
 }
 
@@ -1100,9 +1206,13 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 				if (p) {
 					p->prot = prot;
 				} else {
-					page_t *np = g_new0(page_t, 1);
-					np->prot = prot;
-					g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
+					p = g_new0(page_t, 1);
+					p->prot = prot;
+					g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
+				}
+				if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
+					p->dyn_exec = true;
+					p->gen_written = g_unpack_gen;
 				}
 			}
 		}
@@ -1126,9 +1236,13 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					if (p) {
 						p->prot = prot;
 					} else {
-						page_t *np = g_new0(page_t, 1);
-						np->prot = prot;
-						g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
+						p = g_new0(page_t, 1);
+						p->prot = prot;
+						g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
+					}
+					if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
+						p->dyn_exec = true;
+						p->gen_written = g_unpack_gen;
 					}
 				}
 			}
@@ -1144,24 +1258,27 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			if (p) {
 				p->prot = prot;
 			} else {
-				page_t *np = g_new0(page_t, 1);
-				np->prot = prot;
-				g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, np);
+				p = g_new0(page_t, 1);
+				p->prot = prot;
+				g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
 			}
 			if (p && p->written && (prot & 0x4)) {
 				p->exec_after_write = true;  // written + потом exec = OEP candidate
+			}
+			if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
+				p->dyn_exec = true;
+				p->gen_written = g_unpack_gen;
 			}
 		}
 	} else if (num == 91) { //munmap
 		uint64_t page_start = a1 & ~(page_size - 1);
 		uint64_t page_end = (a1 + a2 + page_size - 1) & ~(page_size- 1);
 		for (uint64_t addr = page_start; addr < page_end; addr += page_size) {
+			g_hash_table_add(unmapped_pages, (gpointer)(uintptr_t)addr);
 			page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) addr);
 			if (p) {
-				if (p->written && (p->prot & 0x4) && oep_addr == 0) {
-					do_dump(oep_addr);
-				}
 				g_hash_table_remove(pages, (gpointer)(uintptr_t) addr);
+				g_free(p->wbitmap);
 				g_free(p);
 			}
 		}
@@ -1298,6 +1415,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);
 	file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
 	g_sockets = g_hash_table_new(g_direct_hash, g_direct_equal);
+	//munmaped pages
+	unmapped_pages = g_hash_table_new(g_direct_hash, g_direct_equal);
 	
 	//callback funcs
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);

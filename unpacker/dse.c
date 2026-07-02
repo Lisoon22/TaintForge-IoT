@@ -642,12 +642,12 @@ static Z3_ast sym_expr_to_z3(DSECtx *ctx, const SymExpr *e) {
 			}
 			Z3_ast r = NULL;
 			switch (e->type) {
-				case SYM_ADD:    return Z3_mk_bvadd(c, A, B); break;
-				case SYM_SUB:    return Z3_mk_bvsub(c, A, B); break;
-				case SYM_XOR:    return Z3_mk_bvxor(c, A, B); break;
-				case SYM_AND:    return Z3_mk_bvand(c, A, B); break;
-				case SYM_SHL:    return Z3_mk_bvshl(c, A, B); break;
-				case SYM_CONCAT: return Z3_mk_concat(c, A, B); break;
+				case SYM_ADD:    r = Z3_mk_bvadd(c, A, B); break;
+				case SYM_SUB:    r =Z3_mk_bvsub(c, A, B); break;
+				case SYM_XOR:    r= Z3_mk_bvxor(c, A, B); break;
+				case SYM_AND:    r = Z3_mk_bvand(c, A, B); break;
+				case SYM_SHL:    r=Z3_mk_bvshl(c, A, B); break;
+				case SYM_CONCAT: r = Z3_mk_concat(c, A, B); break;
 				default:         return NULL;
 			}
 			if (r) Z3_inc_ref(c, r);
@@ -661,9 +661,9 @@ static Z3_ast sym_expr_to_z3(DSECtx *ctx, const SymExpr *e) {
 			unsigned add = (unsigned)(e->width - e->unary.a->width);
 			Z3_ast r;
 			if (e->type == SYM_ZEXT) {
-				return r= Z3_mk_zero_ext(c, add, A);
+				r= Z3_mk_zero_ext(c, add, A);
 			} else {
-				return r = Z3_mk_sign_ext(c, add, A);
+				r = Z3_mk_sign_ext(c, add, A);
 			}
 			if (r) Z3_inc_ref(c, r);
 			Z3_dec_ref(c, A);
