@@ -22,25 +22,33 @@ typedef enum {
 } arch_t;
 
 typedef struct {
-    int prot;
-    bool written;
-    bool exec_after_write;
-    bool dyn_exec;
-    uint64_t write_count;
-    uint64_t last_write;
-    uint8_t *wbitmap;
-    uint32_t gen_written;
+	int prot;
+	bool written;
+	bool exec_after_write;
+	bool dyn_exec;
+	uint64_t write_count;
+	uint64_t last_write;
+	uint8_t *wbitmap;
+	uint32_t gen_written;
+	bool exec_seen;
 } page_t;
 
 //multiple OEP vatiants
 typedef struct {
-    uint64_t addr;
-    uint64_t jump_site;
-    uint32_t generation;
-    uint64_t icount;
-    bool     dse_confirmed;
+	uint64_t addr;
+	uint64_t jump_site;
+	uint32_t generation;
+	uint64_t icount;
+	bool     dse_confirmed;
 } oep_cand_t;
 
+//got table reconstruct helper
+typedef struct {
+	uint64_t got_slot;
+	uint64_t resolved_addr;
+	const char *module;
+	uint64_t lib_base;
+} resolved_import_t;
 
 static GHashTable *pages = NULL;
 static ShadowMemory *g_shadow = NULL;
@@ -60,7 +68,6 @@ static bool g_reg_read_error_reported[REG_COUNT];
 //additional OEP checks
 static uint64_t g_icount = 0;
 static uint32_t g_unpack_gen = 0;
-static bool g_prev_unpacked = false;
 static uint64_t g_last_cand_icount = 0;
 static GList *oep_cands = NULL;
 static GHashTable *unmapped_pages = NULL; //for munmaped pages
@@ -70,7 +77,6 @@ static __thread uint64_t prev_jump_site = 0;
 static __thread int prev_target_reg = REG_INVALID;
 static __thread uint64_t prev_mem_taddr = 0;
 static __thread bool prev_jump_pending = false;
-static uint32_t g_prev_gen = 0xFFFFFFFFu; 
 
 typedef struct {
 	bool active;
@@ -134,6 +140,56 @@ static GHashTable *file_fd = NULL;
 static char *pending_open_path = NULL;
 static bool pending_open_is_lib = false;
 static bool pending_open_write = false;
+
+static GList *resolved_imports = NULL;
+static GHashTable *resolved_imports_by_slot = NULL; //got slot thing
+
+//stub for dynamic reconstruction
+static const char *addr_lib_path(uint64_t addr) {
+	if (addr == 0) return NULL;
+	for (GList *l = lib_deps; l; l = l->next) {
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		if (!lm->base) continue;
+		uint64_t end = (lm->end > lm->base) ? lm->end : (lm->base + lm->size);
+		if (end <= lm->base) continue;
+		if (addr >= lm->base && addr < end) return lm->path;
+	}
+	return NULL;
+}
+
+static uint64_t addr_lib_base(uint64_t addr) {
+	if (addr == 0) return 0;
+	for (GList *l = lib_deps; l; l = l->next) {
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		if (!lm->base) continue;
+		uint64_t end = (lm->end > lm->base) ? lm->end : (lm->base + lm->size);
+		if (end <= lm->base) continue;
+		if (addr >= lm->base && addr < end) return lm->base;
+	}
+	return 0;
+}
+
+static const char *base_name(const char *path) {
+	if (!path) return NULL;
+	const char *s = strrchr(path, '/');
+	return s ? s + 1 : path;
+}
+
+static void record_resolved_import(uint64_t got_slot, uint64_t resolved_addr) {
+	if (!resolved_addr) return;
+	uint64_t lib_base = addr_lib_base(resolved_addr);
+	if (!lib_base) return;
+	if (addr_lib_base(got_slot)) return;
+	if (resolved_imports_by_slot && g_hash_table_contains(resolved_imports_by_slot, (gpointer)(uintptr_t)got_slot)) return;
+	resolved_import_t *ri = g_new0(resolved_import_t, 1);
+	ri->got_slot = got_slot;
+	ri->resolved_addr = resolved_addr;
+	ri->module = addr_lib_path(resolved_addr);
+	ri->lib_base = lib_base;
+	resolved_imports = g_list_append(resolved_imports, ri);
+	if (resolved_imports_by_slot) g_hash_table_add(resolved_imports_by_slot, (gpointer)(uintptr_t)got_slot);
+}
+
 
 static bool parse_guest_sockaddr(uint64_t gaddr, int addrlen, char *ip_out, size_t ip_size, uint16_t *port_out) {
 	if (addrlen <= 0 || gaddr == 0 || !ip_out || !port_out) return false;
@@ -405,6 +461,7 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
 		page->write_count++;
 		page->last_write = g_icount;
 		page->gen_written = g_unpack_gen;
+		page->exec_seen = false;
 		vaddr += chunk;
 		size -= chunk;
 	}
@@ -424,6 +481,45 @@ static bool saved_base_set = false;
 static uint64_t saved_oep = 0;
 static bool image_captured = false;
 
+//enhanced logic of choosing oep
+static bool addr_in_lib(uint64_t addr) {
+	if (addr == 0) return false;
+	for (GList *l = lib_deps; l; l = l->next) {
+		lib_mapping_t *lm = (lib_mapping_t*)l->data;
+		if (!lm->base) continue;
+		uint64_t end;
+		if (lm->end > lm->base) {
+			end = lm->end;
+		} else {
+			end = (lm->base + lm->size);
+		}
+		if (end <= lm->base) continue;
+		if (addr >= lm->base && addr < end) return true;
+	}
+	return false;
+}
+
+static bool cand_in_main_image(const oep_cand_t *c) {
+	if (!c) return false;
+	if (addr_in_lib(c->addr)) return false;          // target in libc/ld 
+	return true;
+}
+
+//union of oep choosing
+static oep_cand_t *choose_oep_cand(void) {
+	oep_cand_t *first_conf_main = NULL, *last_main = NULL, *last_any = NULL;
+	for (GList *l = oep_cands; l; l = l->next) {
+		oep_cand_t *c = (oep_cand_t*)l->data;
+		last_any = c;
+		if (!cand_in_main_image(c)) continue;
+		last_main = c;
+		if (c->dse_confirmed && !first_conf_main) first_conf_main = c;
+	}
+	if (first_conf_main) return first_conf_main; //main logic
+	if (last_main)       return last_main; //fallback1
+	return last_any; //fallback2
+}
+
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
 	keys = g_list_sort(keys, compare_keys);
@@ -433,6 +529,7 @@ static void do_dump(uint64_t oep) {
 		if (f_bin) {
 			for (GList *k = keys; k; k = k->next) {
 				uint64_t addr = (uint64_t)(uintptr_t)k->data;
+				if (addr_in_lib(addr))continue; //get rid of lib reg/pages
 				page_t *p = g_hash_table_lookup(pages, k->data);
 				if (!p) continue;
 				GByteArray *data = g_byte_array_new();
@@ -451,10 +548,14 @@ static void do_dump(uint64_t oep) {
 		g_string_append(saved_reg, "  \"regions\": [\n");
 		bool in_region = false;
 		bool first_region = true;
-		uint64_t offset = 0;
+		uint64_t main_off = 0;
 		uint64_t region_start = 0;
 		uint64_t region_size = 0;
 		int region_prot = 0;
+		const char *region_mod = NULL;
+		bool region_is_lib = false;
+		uint64_t region_off = 0;
+		char modbuf[512];
 
 		for (GList *k = keys; k; k = k->next) {
 			uint64_t addr = (uint64_t)(uintptr_t)k->data;
@@ -472,28 +573,45 @@ static void do_dump(uint64_t oep) {
 			g_byte_array_free(data, TRUE);
 			if (written == 0) continue;
 
-			if (in_region && addr == region_start + region_size && p->prot == region_prot) {
+			const char *mod = addr_lib_path(addr);
+			bool is_lib = (mod != NULL);
+			if (in_region && addr == region_start + region_size && p->prot == region_prot && mod == region_mod) {
 				region_size += written;
 			} else {
 				if (in_region) {
 					if (!first_region) g_string_append(saved_reg, ",\n");
 					first_region = false;
-					g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}", region_start, region_size, region_prot, offset - region_size);
+					if (region_mod) {
+						snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
+					} else {
+						snprintf(modbuf, sizeof modbuf, "null");
+					}
+					g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}", region_start, region_size, region_prot, region_off, region_is_lib ? "true" : "false", modbuf);
 				}
 				region_start = addr;
 				region_size = written;
 				region_prot = p->prot;
-				if (!saved_base_set) {
+				region_mod = mod;
+				region_is_lib = is_lib;
+				region_off = main_off;
+				if (!is_lib && !saved_base_set) {
 					saved_base = region_start;
 					saved_base_set = true;
 				}
 				in_region = true;
 			}
-			offset += written;
+			if (!is_lib) {
+				main_off += written;
+			}
 		}
 		if (in_region) {
 			if (!first_region) g_string_append(saved_reg, ",\n");
-			g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu}\n", region_start, region_size, region_prot, offset - region_size);
+			if (region_mod){
+				snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
+			} else {
+				snprintf(modbuf, sizeof modbuf, "null");
+			}
+			g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}\n", region_start, region_size, region_prot, region_off, region_is_lib ? "true" : "false", modbuf);
 		}
 		g_string_append(saved_reg, "  ],\n");
 	}
@@ -547,6 +665,18 @@ static void write_report(void) {
 	}
 	fprintf(f_json, "],\n");
 
+	//got reconstruct
+	fprintf(f_json, "  \"resolved_imports\": [");
+	first = true;
+	for (GList *l = resolved_imports; l; l = l->next) {
+		resolved_import_t *ri = (resolved_import_t*)l->data;
+		if (!ri || !ri->module) continue;
+		if (!first) fprintf(f_json, ", ");
+		fprintf(f_json, "{\"got_slot\": \"0x%lx\", \"resolved_addr\": \"0x%lx\", \"module\": \"%s\", \"offset\": \"0x%lx\"}",(unsigned long)ri->got_slot, (unsigned long)ri->resolved_addr,ri->module, (unsigned long)( ri->resolved_addr - ri->lib_base));
+		first = false;
+	}
+	fprintf(f_json, "],\n");
+
 	// network
 	fprintf(f_json, "  \"network_dependencies\": [\n");
 	bool net_first = true;
@@ -580,16 +710,11 @@ static void write_report(void) {
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	//oep choose
 	if (!oep_found && oep_cands) {
-		for (GList *l = g_list_last(oep_cands); l; l = l->prev) {
-			oep_cand_t *c = (oep_cand_t*)l->data;
-			if (c->dse_confirmed) {
-				oep_addr = c->addr;
-				oep_found = true;
-				break;
-			}
+		oep_cand_t *chosen = choose_oep_cand();
+		if (chosen) {
+			oep_addr = chosen->addr;
+			oep_found = true;
 		}
-		if (!oep_found)   /* W^X if no one DSE confirmed */
-			oep_addr = ((oep_cand_t*)g_list_last(oep_cands)->data)->addr;
 	}
 
 	
@@ -645,12 +770,20 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	trace_buffer_destroy(g_trace);
 	g_trace = NULL;
 	
+	//oeps
 	if (saved_reg) {
 		g_string_free(saved_reg, TRUE);
 		saved_reg = NULL;
 	}
 	g_list_free_full(oep_cands, g_free);
 	oep_cands = NULL;
+	//got
+	g_list_free_full(resolved_imports, g_free);
+	resolved_imports = NULL;
+	if (resolved_imports_by_slot) {
+		g_hash_table_destroy(resolved_imports_by_slot);
+		resolved_imports_by_slot = NULL;
+	}
 }
 
 static int mask_first_reg(uint32_t mask) {
@@ -728,14 +861,14 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	}
 	//detect mov to upacked code
 	bool now_unpacked = insn_is_unpacked(vaddr, meta->size);
-	uint32_t cur_gen = UINT32_MAX;
+	page_t *cur_pg = NULL;
 	if (now_unpacked) {
 		uint64_t page_addr = vaddr & ~(page_size - 1);
-		page_t *pg = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
-		if (pg) cur_gen = pg->gen_written;
+		cur_pg = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
 	}
 
-	bool new_layer = now_unpacked && !oep_found &&(!g_prev_unpacked || cur_gen != g_prev_gen);
+	bool new_layer = now_unpacked && !oep_found && cur_pg && !cur_pg->exec_seen;
+	if (cur_pg) cur_pg->exec_seen = true;
 
 	if (new_layer) {
 		oep_cand_t *c = g_new0(oep_cand_t, 1);
@@ -767,16 +900,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	}
 	//if we are too long in unpacked code without proceeding further - we end cycle
 	if (now_unpacked && !oep_found && g_last_cand_icount && (g_icount - g_last_cand_icount) > 200000) {
-		oep_cand_t *chosen = NULL;
-		for (GList *l = g_list_last(oep_cands); l; l = l->prev) {
-			oep_cand_t *cc = (oep_cand_t*)l->data;
-			if (cc->dse_confirmed) {
-				chosen = cc;
-				break; 
-			}
-		}
-		if (!chosen && oep_cands)   //fallback
-			chosen = (oep_cand_t*)g_list_last(oep_cands)->data;
+		oep_cand_t *chosen = choose_oep_cand();
 		if (chosen) {
 			oep_addr  = chosen->addr;
 			oep_found = true;
@@ -784,9 +908,6 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			do_dump(oep_addr);
 		}
 	}
-	g_prev_unpacked = now_unpacked;
-	if (now_unpacked) g_prev_gen = cur_gen;
-
 	//taint propagation
 
 	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
@@ -863,6 +984,11 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 					}
 				}
 			}
+		}
+		//got
+		if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&meta->insn_id != X86_INS_RET && lib_deps) {
+			uint64_t slot = 0, val = 0;
+			if (dse_resolve_mem_target(vaddr, meta, &slot, &val)) record_resolved_import(slot, val);
 		}
 }
 
@@ -1417,7 +1543,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	g_sockets = g_hash_table_new(g_direct_hash, g_direct_equal);
 	//munmaped pages
 	unmapped_pages = g_hash_table_new(g_direct_hash, g_direct_equal);
-	
+
+	//got
+	resolved_imports_by_slot = g_hash_table_new(g_direct_hash, g_direct_equal);
+
 	//callback funcs
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
 	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
