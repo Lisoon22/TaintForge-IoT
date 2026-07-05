@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "goal_id": "test_stat_payload_logic",
+  "description": "The test payload reached its user-visible body and emitted the expected marker.",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "stdout_marker",
+      "type": "text_contains",
+      "source": "stdout",
+      "needle": "привет",
+      "min_count": 1
+    },
+    {
+      "id": "guest_write",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "write",
+        "success": true
+      },
+      "min_count": 1
+    }
+  ]
+}

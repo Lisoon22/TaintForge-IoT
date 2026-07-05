@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "goal_id": "network_receive_loop",
+  "description": "The payload repeatedly alternated between readiness waiting and receiving data. This is an analyst-defined behavioral proxy, not a universal main-loop detector.",
+  "mode": "at_least",
+  "min_satisfied": 1,
+  "rules": [
+    {
+      "id": "poll_recv_loop",
+      "type": "repeated_sequence",
+      "source": "syscall",
+      "sequence": [
+        {"syscall": "poll"},
+        {"syscall": "recvfrom"}
+      ],
+      "min_repeats": 3,
+      "max_gap": 4
+    },
+    {
+      "id": "epoll_recv_loop",
+      "type": "repeated_sequence",
+      "source": "syscall",
+      "sequence": [
+        {"syscall": "epoll_wait"},
+        {"syscall": "recvfrom"}
+      ],
+      "min_repeats": 3,
+      "max_gap": 4
+    }
+  ]
+}

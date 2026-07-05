@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "goal_id": "c2_registration_observed",
+  "description": "The payload connected to the configured C2 endpoint and the network logger recorded a response event.",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "c2_connect",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "connect",
+        "remote_ip": "185.62.190.0",
+        "remote_port": 48101
+      },
+      "min_count": 1
+    },
+    {
+      "id": "c2_response",
+      "type": "event_count",
+      "source": "network",
+      "where": {
+        "event": "tcp_response_sent",
+        "original_remote_ip": "185.62.190.0",
+        "original_remote_port": 48101
+      },
+      "min_count": 1
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "oep": "0x401000",
+  "arch": "x86_64",
+  "base": "0x400000",
+  "regions": [
+    {
+      "addr": "0x400000",
+      "size": 4096,
+      "prot": 5,
+      "offset": 0
+    }
+  ],
+  "file_dependencies": [],
+  "network_dependencies": [
+    {
+      "ip": "198.51.100.10",
+      "port": 48101,
+      "type": "c2_binary",
+      "sample_bytes": "68656c6c6f"
+    }
+  ],
+  "library_dependencies": [],
+  "anti_analysis": {
+    "cpuinfo_check": false,
+    "uname_check": false,
+    "ptrace_traceme": false
+  }
+}

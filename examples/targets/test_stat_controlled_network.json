@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "goal_id": "test_stat_controlled_loopback",
+  "description": "The test payload reached its user-visible body and opened the declared loopback service through the controlled iterative network backend.",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "stdout_marker",
+      "type": "text_contains",
+      "source": "stdout",
+      "needle": "привет",
+      "min_count": 1
+    },
+    {
+      "id": "loopback_connection_observed",
+      "type": "event_count",
+      "source": "network",
+      "where": {
+        "event": "tcp_connection_open",
+        "original_remote_ip": "127.0.0.1",
+        "original_remote_port": 80,
+        "backend_source": "loopback"
+      },
+      "min_count": 1
+    }
+  ]
+}
