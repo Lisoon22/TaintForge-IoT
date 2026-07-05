@@ -4,3 +4,6 @@ __pycache__/
 /workdir/
 *.so
 .pytest_cache/
+.taintforge-backups/
+*.bak
+samples/c2_record_client_x86_64
