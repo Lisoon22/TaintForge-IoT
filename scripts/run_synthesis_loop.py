@@ -18,7 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Drive the TaintForge-IoT environment synthesis state machine: "
             "prepare an immutable iteration, execute its prebuilt rootfs, "
             "complete the observation, and repeat until a controller stop "
-            "condition or invocation step limit is reached."
+            "condition or invocation step limit is reached. Native and "
+            "static QEMU user-mode execution are selected automatically from "
+            "the bound ELF target."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

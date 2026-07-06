@@ -18,6 +18,7 @@ from taintforge_env.prebuilt_runner import (
     PrebuiltRunnerConfig,
     PrebuiltRunnerError,
 )
+from tests.elf_fixture import write_elf
 
 
 class FakeExecutor:
@@ -76,7 +77,11 @@ class FakeExecutor:
                 )
             return CommandResult(0)
 
-        if any(value.endswith("parse_strace.py") for value in cmd):
+        if any(
+            value.endswith("parse_strace.py")
+            or value.endswith("parse_qemu_strace.py")
+            for value in cmd
+        ):
             out = Path(cmd[cmd.index("--out") + 1])
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(
@@ -127,7 +132,17 @@ class FakeExecutor:
                 f"{self.guest_exit_code}\n",
                 encoding="utf-8",
             )
-            (logs / "strace.1").write_text("write(1, \\\"x\\\", 1) = 1\n")
+            script_text = script.read_text(encoding="utf-8")
+            if "QEMU_GUEST=" in script_text:
+                (logs / "qemu_strace.log").write_text(
+                    '100 write(1,0x40001000,1) = 1\n',
+                    encoding="utf-8",
+                )
+            else:
+                (logs / "strace.1").write_text(
+                    'write(1, "x", 1) = 1\n',
+                    encoding="utf-8",
+                )
             return CommandResult(self.guest_exit_code)
 
         return CommandResult(0)
@@ -222,6 +237,7 @@ class PrebuiltRunnerTests(unittest.TestCase):
         for relative in (
             "scripts/capture_runtime_observations.py",
             "scripts/parse_strace.py",
+            "scripts/parse_qemu_strace.py",
             "scripts/plan_repairs.py",
             "scripts/generate_report.py",
         ):
@@ -229,13 +245,15 @@ class PrebuiltRunnerTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# placeholder\n", encoding="utf-8")
 
-        self.binary = self.base / "sample"
-        self.binary.write_bytes(b"ELF-test")
+        self.binary = write_elf(
+            self.base / "sample",
+            arch="x86_64",
+        )
         self.seed = self.base / "seed-rootfs"
         (self.seed / "bin").mkdir(parents=True)
         (self.seed / "proc").mkdir()
         guest = self.seed / "bin" / "unpacked.elf"
-        guest.write_bytes(b"guest")
+        guest.write_bytes(self.binary.read_bytes())
         guest.chmod(0o755)
 
         self.template = self.base / "template-run"
@@ -243,6 +261,7 @@ class PrebuiltRunnerTests(unittest.TestCase):
         _write_json(
             self.template / "config" / "runtime.json",
             {
+                "arch": "x86_64",
                 "rootfs": str(self.seed),
                 "host_binary": str(self.binary),
                 "guest_binary": "/bin/unpacked.elf",
@@ -319,13 +338,80 @@ class PrebuiltRunnerTests(unittest.TestCase):
             (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
         )
 
-    def test_qemu_runtime_fails_closed(self) -> None:
+    def test_qemu_runtime_builds_bind_mounted_execution_plan(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.session)
+        self.binary = write_elf(
+            self.base / "sample-arm",
+            arch="arm",
+        )
+        guest = self.seed / "bin" / "unpacked.elf"
+        guest.write_bytes(self.binary.read_bytes())
+        guest.chmod(0o755)
+        qemu = write_elf(
+            self.base / "qemu-arm-static",
+            arch="x86_64",
+        )
         runtime_path = self.template / "config" / "runtime.json"
         runtime = json.loads(runtime_path.read_text())
-        runtime["qemu_required"] = True
+        runtime.update(
+            {
+                "arch": "arm",
+                "host_binary": str(self.binary),
+                "guest_binary": "/bin/unpacked.elf",
+                "qemu_required": True,
+                "qemu_binary_name": "qemu-arm-static",
+                "qemu_host_path": str(qemu),
+            }
+        )
         _write_json(runtime_path, runtime)
-        with self.assertRaisesRegex(PrebuiltRunnerError, "qemu_required"):
-            self.make_runner().validate()
+        IterationController.initialize(
+            session_dir=self.session,
+            snapshot_store=self.base / "snapshots-arm",
+            seed_rootfs=self.seed,
+            max_iterations=3,
+        )
+        IterationController(self.session).prepare_next()
+
+        executor = FakeExecutor()
+        runner = self.make_runner(executor)
+        with patch.object(runner, "_check_host_dependencies", return_value=None):
+            result = runner.run_and_complete()
+
+        self.assertEqual(result.execution_backend, "qemu_user")
+        self.assertEqual(result.target_arch, "arm")
+        script = (
+            self.session
+            / "iterations"
+            / "0000"
+            / "run"
+            / "run_prebuilt_sandbox.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('mount --bind "$QEMU_HOST" "$QEMU_MOUNT"', script)
+        self.assertIn('"$QEMU_GUEST" -strace "$GUEST_BINARY"', script)
+        self.assertNotIn("strace -ff", script)
+        import subprocess
+        syntax = subprocess.run(
+            ["bash", "-n", str(
+                self.session
+                / "iterations"
+                / "0000"
+                / "run"
+                / "run_prebuilt_sandbox.sh"
+            )],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        backend = json.loads(
+            result.execution_backend_manifest_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(backend["backend"], "qemu_user")
+        self.assertEqual(backend["target"]["arch"], "arm")
+        self.assertTrue((result.run_dir / "logs" / "qemu_strace.log").is_file())
 
     def test_missing_guest_binary_is_rejected(self) -> None:
         runtime_path = self.template / "config" / "runtime.json"

@@ -29,6 +29,7 @@ from taintforge_env.synthesis_loop import (
     SynthesisLoopConfig,
     SynthesisLoopError,
 )
+from tests.elf_fixture import write_elf
 
 
 class FakeRunnerFactory:
@@ -106,20 +107,24 @@ class SynthesisLoopTests(unittest.TestCase):
         for relative in (
             "scripts/capture_runtime_observations.py",
             "scripts/parse_strace.py",
+            "scripts/parse_qemu_strace.py",
             "scripts/plan_repairs.py",
             "scripts/generate_report.py",
         ):
             path = self.project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("# test placeholder\n", encoding="utf-8")
-        self.binary = self.root / "sample"
-        self.binary.write_bytes(b"ELF-sample")
-        self.seed = make_seed(self.root)
+        self.binary = write_elf(
+            self.root / "sample",
+            arch="x86_64",
+        )
+        self.seed = make_seed(self.root, self.binary)
         self.template = self.root / "template"
         (self.template / "config").mkdir(parents=True)
         write_json(
             self.template / "config" / "runtime.json",
             {
+                "arch": "x86_64",
                 "host_binary": str(self.binary),
                 "guest_binary": "/bin/unpacked.elf",
                 "qemu_required": False,
@@ -357,6 +362,52 @@ class SynthesisLoopTests(unittest.TestCase):
         with self.assertRaisesRegex(SynthesisLoopError, "host binary was modified"):
             EnvironmentSynthesisLoop.verify_session(self.session)
 
+    def test_qemu_identity_is_bound_and_verified(self) -> None:
+        self.binary = write_elf(
+            self.root / "sample-arm",
+            arch="arm",
+        )
+        guest = self.seed / "bin" / "unpacked.elf"
+        guest.write_bytes(self.binary.read_bytes())
+        guest.chmod(0o755)
+        qemu = write_elf(
+            self.root / "qemu-arm-static",
+            arch="x86_64",
+        )
+        runtime_path = self.template / "config" / "runtime.json"
+        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime.update(
+            {
+                "arch": "arm",
+                "host_binary": str(self.binary),
+                "qemu_required": True,
+                "qemu_binary_name": "qemu-arm-static",
+                "qemu_host_path": str(qemu),
+            }
+        )
+        write_json(runtime_path, runtime)
+
+        EnvironmentSynthesisLoop(
+            self.config(initialize_only=True),
+            runner_factory=FakeRunnerFactory(),
+        ).run()
+        binding = json.loads(
+            (self.session / "synthesis_loop.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(binding["execution_backend"], "qemu_user")
+        self.assertEqual(binding["target_arch"], "arm")
+        self.assertEqual(binding["qemu_host_path"], str(qemu.resolve()))
+        self.assertTrue(binding["qemu_host_sha256"])
+
+        qemu.write_bytes(qemu.read_bytes() + b"changed")
+        with self.assertRaisesRegex(
+            SynthesisLoopError,
+            "QEMU executable was modified",
+        ):
+            EnvironmentSynthesisLoop.verify_session(self.session)
+
     def test_verify_detects_analysis_stack_tampering(self) -> None:
         EnvironmentSynthesisLoop(
             self.config(initialize_only=True),
@@ -449,7 +500,7 @@ class SynthesisLoopTests(unittest.TestCase):
         self.assertIn("invocation_finished", names)
 
 
-def make_seed(root: Path) -> Path:
+def make_seed(root: Path, binary: Path) -> Path:
     seed = root / "seed"
     (seed / "etc").mkdir(parents=True)
     (seed / "tmp").mkdir()
@@ -457,7 +508,7 @@ def make_seed(root: Path) -> Path:
     (seed / "bin").mkdir()
     (seed / "etc" / "seed.conf").write_text("seed\n", encoding="utf-8")
     guest = seed / "bin" / "unpacked.elf"
-    guest.write_bytes(b"guest")
+    guest.write_bytes(binary.read_bytes())
     guest.chmod(0o755)
     return seed
 

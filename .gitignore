@@ -7,3 +7,4 @@ __pycache__/
 .taintforge-backups/
 *.bak
 samples/c2_record_client_x86_64
+samples/qemu_smoke/arm_write_exit

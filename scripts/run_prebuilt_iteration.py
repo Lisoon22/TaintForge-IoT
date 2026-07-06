@@ -64,8 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Validate or execute one IterationController-prepared rootfs "
-            "without rebuilding the environment. Supports isolated network-none "
-            "and controlled local-responder modes."
+            "without rebuilding the environment. Selects native or static "
+            "QEMU user-mode execution from verified ELF metadata and supports "
+            "isolated network-none and controlled local-responder modes."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -131,6 +132,21 @@ def main() -> int:
             )
             print(f"[+] Execution rootfs: {context.execution_rootfs}")
             print(f"[+] Guest binary: {context.guest_binary}")
+            print(
+                "[+] Execution backend: "
+                f"{context.execution_plan.backend.value}"
+            )
+            print(f"[+] Target architecture: {context.execution_plan.target.arch}")
+            print(
+                "[+] Trace backend: "
+                f"{context.execution_plan.trace_backend.value}"
+            )
+            if context.execution_plan.qemu_host_path is not None:
+                print(f"[+] QEMU host path: {context.execution_plan.qemu_host_path}")
+                print(
+                    "[+] QEMU SHA-256: "
+                    f"{context.execution_plan.qemu_host_sha256}"
+                )
             return 0
 
         result = runner.run_and_complete()
@@ -143,6 +159,12 @@ def main() -> int:
         print(f"[+] Target evaluation: {result.target_evaluation_path}")
         print(f"[+] Network mode: {result.network_mode}")
         print(f"[+] Network manifest: {result.network_manifest_path}")
+        print(f"[+] Execution backend: {result.execution_backend}")
+        print(f"[+] Target architecture: {result.target_arch}")
+        print(
+            "[+] Execution backend manifest: "
+            f"{result.execution_backend_manifest_path}"
+        )
         print(
             "[+] Progress: "
             + json.dumps(result.progress, ensure_ascii=False)

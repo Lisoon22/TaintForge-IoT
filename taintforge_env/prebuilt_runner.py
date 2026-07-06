@@ -28,6 +28,15 @@ from .environment_snapshot import (
     scan_environment,
     tree_digest,
 )
+from .execution_backend import (
+    ExecutionBackendError,
+    ExecutionBackendKind,
+    ExecutionBackendResolver,
+    ExecutionPlan,
+    TraceBackend,
+    resolve_runtime_guest_binary,
+    resolve_runtime_host_binary,
+)
 from .iteration_controller import (
     IterationController,
     IterationControllerError,
@@ -163,6 +172,7 @@ class PreparedRunContext:
     guest_binary: str
     run_dir: Path
     claim_path: Path
+    execution_plan: ExecutionPlan
     target_spec: TargetStateSpec | None = None
 
 
@@ -179,6 +189,9 @@ class PrebuiltRunnerResult:
     target_evaluation_path: Path | None = None
     network_mode: str = "none"
     network_manifest_path: Path | None = None
+    execution_backend: str = "native"
+    target_arch: str = "unknown"
+    execution_backend_manifest_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -231,13 +244,14 @@ class PrebuiltRootfsRunner:
     observation/requirements/repair artifacts, and finally completes the
     IterationController record.
 
-    The runner deliberately fails closed for QEMU-required runtimes.  The
-    controlled network backend preserves original remote endpoints, provides
-    local responders, captures unknown TCP/UDP attempts, and never enables
-    arbitrary Internet forwarding.
+    Execution is delegated to a verified backend selected from the actual
+    ELF header. Native targets retain host strace; foreign ARM/MIPS/AArch64
+    targets use a statically linked QEMU user-mode binary bind-mounted only
+    into the disposable execution clone. The controlled network backend
+    preserves original endpoints and never enables arbitrary Internet access.
     """
 
-    ADAPTER_VERSION = 3
+    ADAPTER_VERSION = 4
     TEMPLATE_CONFIG_ALLOWLIST = (
         "library_plan.json",
         "library_resolution.json",
@@ -263,6 +277,7 @@ class PrebuiltRootfsRunner:
             )
         )
         self.controller = IterationController(self.config.session_dir)
+        self.execution_resolver = ExecutionBackendResolver()
 
     def validate(self) -> PreparedRunContext:
         session = self.controller.load()
@@ -320,30 +335,21 @@ class PrebuiltRootfsRunner:
         elif not template_network_policy_path.is_file():
             template_network_policy_path = None
 
-        if bool(runtime.get("qemu_required", False)):
-            raise PrebuiltRunnerError(
-                "prebuilt runner v1 does not support qemu_required=true"
+        try:
+            guest_binary = resolve_runtime_guest_binary(runtime)
+            host_binary = resolve_runtime_host_binary(
+                runtime,
+                self.config.binary_path,
+                self.config.project_root,
             )
-        guest_binary = _validate_guest_path(
-            runtime.get("guest_binary", "/bin/unpacked.elf"),
-            "guest binary",
-        )
-        if not _guest_path_lexists(execution_rootfs, guest_binary):
-            raise PrebuiltRunnerError(
-                f"guest binary is absent from prepared rootfs: {guest_binary}"
+            execution_plan = self.execution_resolver.resolve(
+                runtime=runtime,
+                host_binary=host_binary,
+                rootfs=execution_rootfs,
+                guest_binary=guest_binary,
             )
-
-        host_binary_raw = (
-            str(self.config.binary_path)
-            if self.config.binary_path is not None
-            else runtime.get("host_binary")
-        )
-        if not isinstance(host_binary_raw, str) or not host_binary_raw:
-            raise PrebuiltRunnerError(
-                "host binary is missing; pass --binary or provide it in runtime.json"
-            )
-        host_binary = Path(host_binary_raw).resolve(strict=False)
-        _validate_regular_file(host_binary, "host binary")
+        except ExecutionBackendError as exc:
+            raise PrebuiltRunnerError(str(exc)) from exc
 
         proc_dir = execution_rootfs / "proc"
         _validate_directory(proc_dir, "guest /proc mountpoint")
@@ -390,6 +396,7 @@ class PrebuiltRootfsRunner:
             guest_binary=guest_binary,
             run_dir=run_dir,
             claim_path=claim_path,
+            execution_plan=execution_plan,
             target_spec=target_spec,
         )
 
@@ -404,7 +411,7 @@ class PrebuiltRootfsRunner:
             self._prepare_run_directory(context)
             self._update_claim(context, claim, RunnerStage.PREPARED)
 
-            self._check_host_dependencies()
+            self._check_host_dependencies(context)
             if self.config.network_mode == "controlled":
                 network_backend = self._create_network_backend(context)
                 network_result = network_backend.setup()
@@ -492,6 +499,13 @@ class PrebuiltRootfsRunner:
                 ),
                 network_mode=self.config.network_mode,
                 network_manifest_path=network_manifest_path,
+                execution_backend=context.execution_plan.backend.value,
+                target_arch=context.execution_plan.target.arch,
+                execution_backend_manifest_path=(
+                    context.run_dir
+                    / "config"
+                    / "execution_backend_manifest.json"
+                ),
             )
         except Exception as exc:
             if network_backend is not None:
@@ -620,8 +634,26 @@ class PrebuiltRootfsRunner:
             )
             runtime["rootfs"] = str(context.execution_rootfs)
             runtime["host_binary"] = str(context.host_binary)
+            runtime["host_binary_path"] = str(context.host_binary)
             runtime["guest_binary"] = context.guest_binary
-            runtime["qemu_required"] = False
+            runtime["guest_binary_path"] = context.guest_binary
+            runtime["qemu_required"] = context.execution_plan.qemu_required
+            runtime["execution_backend"] = (
+                context.execution_plan.backend.value
+            )
+            runtime["trace_backend"] = (
+                context.execution_plan.trace_backend.value
+            )
+            runtime["target_arch"] = context.execution_plan.target.arch
+            runtime["qemu_binary_name"] = (
+                context.execution_plan.qemu_binary_name
+            )
+            runtime["qemu_host_path"] = (
+                context.execution_plan.qemu_host_path
+            )
+            runtime["qemu_guest_path"] = (
+                context.execution_plan.qemu_guest_path
+            )
             runtime["network_mode"] = self.config.network_mode
             runtime["allow_internet"] = False
             runtime["prebuilt_environment"] = {
@@ -638,6 +670,16 @@ class PrebuiltRootfsRunner:
                 "template_run_dir": str(context.template_run_dir),
             }
             _atomic_write_json(config_dir / "runtime.json", runtime)
+            backend_manifest = {
+                "schema_version": 1,
+                "backend_version": 1,
+                "generated_at_utc": _utc_now(),
+                **context.execution_plan.to_dict(),
+            }
+            _atomic_write_json(
+                config_dir / "execution_backend_manifest.json",
+                backend_manifest,
+            )
 
             if context.target_spec is not None:
                 context.target_spec.save(config_dir / "target_state_spec.json")
@@ -660,6 +702,13 @@ class PrebuiltRootfsRunner:
                 "host_binary": str(context.host_binary),
                 "host_binary_sha256": _sha256_file(context.host_binary),
                 "guest_binary": context.guest_binary,
+                "execution_backend": context.execution_plan.backend.value,
+                "target_arch": context.execution_plan.target.arch,
+                "target_elf_sha256": context.execution_plan.target.sha256,
+                "trace_backend": context.execution_plan.trace_backend.value,
+                "qemu_host_path": context.execution_plan.qemu_host_path,
+                "qemu_host_sha256": context.execution_plan.qemu_host_sha256,
+                "qemu_guest_path": context.execution_plan.qemu_guest_path,
                 "network_mode": self.config.network_mode,
                 "network_self_test": self.config.network_self_test,
                 "allow_internet": False,
@@ -710,19 +759,59 @@ class PrebuiltRootfsRunner:
         context: PreparedRunContext,
         temporary_run_dir: Path,
     ) -> str:
-        # The final run directory has the same child layout as the temporary
-        # directory.  Use final absolute paths because the script executes only
-        # after atomic promotion.
+        del temporary_run_dir
         run_dir = context.run_dir
         rootfs = shlex.quote(str(context.execution_rootfs))
         proc_dir = shlex.quote(str(context.execution_rootfs / "proc"))
         guest = shlex.quote(context.guest_binary)
         logs = run_dir / "logs"
         strace_base = shlex.quote(str(logs / "strace"))
+        qemu_trace = shlex.quote(str(logs / "qemu_strace.log"))
         started = shlex.quote(str(logs / "malware_started"))
         exit_file = shlex.quote(str(logs / "guest_exit_code"))
         timeout_value = shlex.quote(str(self.config.timeout_seconds))
         hostname = shlex.quote(f"tf-iot-{context.iteration.index:04d}")
+
+        qemu_setup = ""
+        qemu_cleanup = ""
+        if context.execution_plan.backend == ExecutionBackendKind.QEMU_USER:
+            qemu_host = shlex.quote(str(context.execution_plan.qemu_host_path))
+            qemu_guest = shlex.quote(str(context.execution_plan.qemu_guest_path))
+            qemu_internal = shlex.quote(
+                str(context.execution_rootfs / "__taintforge")
+            )
+            qemu_mount = shlex.quote(
+                str(
+                    context.execution_rootfs
+                    / "__taintforge"
+                    / "qemu-user-static"
+                )
+            )
+            qemu_setup = f"""
+QEMU_HOST={qemu_host}
+QEMU_GUEST={qemu_guest}
+QEMU_INTERNAL_DIR={qemu_internal}
+QEMU_MOUNT={qemu_mount}
+QEMU_TRACE={qemu_trace}
+mkdir -m 0700 "$QEMU_INTERNAL_DIR"
+touch "$QEMU_MOUNT"
+mount --bind "$QEMU_HOST" "$QEMU_MOUNT"
+mount -o remount,bind,ro "$QEMU_MOUNT"
+""".rstrip()
+            qemu_cleanup = """
+umount -l "$QEMU_MOUNT" >/dev/null 2>&1 || true
+rm -f "$QEMU_MOUNT" >/dev/null 2>&1 || true
+rmdir "$QEMU_INTERNAL_DIR" >/dev/null 2>&1 || true
+""".rstrip()
+            execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
+    env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
+    chroot "$ROOTFS" "$QEMU_GUEST" -strace "$GUEST_BINARY" \
+    2> >(tee "$QEMU_TRACE" >&2)"""
+        else:
+            execution = """timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \
+    strace -ff -yy -s 4096 -o "$STRACE_BASE" \
+    env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \
+    chroot "$ROOTFS" "$GUEST_BINARY"""
 
         return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -735,24 +824,21 @@ STARTED_MARKER={started}
 EXIT_FILE={exit_file}
 TIMEOUT_SECONDS={timeout_value}
 SANDBOX_HOSTNAME={hostname}
+{qemu_setup}
 
 mount --make-rprivate /
-# In controlled mode the named namespace is configured by the network
-# backend. In none mode this brings up loopback in the private namespace.
 ip link set lo up
 hostname "$SANDBOX_HOSTNAME"
 mount -t proc proc "$PROC_DIR"
 cleanup() {{
     umount -l "$PROC_DIR" >/dev/null 2>&1 || true
+    {qemu_cleanup}
 }}
 trap cleanup EXIT INT TERM
 
 printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STARTED_MARKER"
 set +e
-timeout --signal=TERM --kill-after=2s "$TIMEOUT_SECONDS" \\
-    strace -ff -yy -s 4096 -o "$STRACE_BASE" \\
-    env -i PATH=/usr/bin:/bin HOME=/ LANG=C LC_ALL=C \\
-    chroot "$ROOTFS" "$GUEST_BINARY"
+{execution}
 status=$?
 set -e
 printf '%s\n' "$status" > "$EXIT_FILE"
@@ -838,15 +924,28 @@ exit "$status"
         context: PreparedRunContext,
         guest_exit_code: int,
     ) -> None:
-        self.executor.run(
-            [
+        if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE:
+            parse_command = [
+                sys.executable,
+                "scripts/parse_qemu_strace.py",
+                "--input",
+                str(context.run_dir / "logs" / "qemu_strace.log"),
+                "--out",
+                str(context.run_dir / "logs" / "syscall_events.jsonl"),
+                "--target-arch",
+                context.execution_plan.target.arch,
+            ]
+        else:
+            parse_command = [
                 sys.executable,
                 "scripts/parse_strace.py",
                 "--log-dir",
                 str(context.run_dir / "logs"),
                 "--out",
                 str(context.run_dir / "logs" / "syscall_events.jsonl"),
-            ],
+            ]
+        self.executor.run(
+            parse_command,
             cwd=self.config.project_root,
             check=True,
         )
@@ -871,7 +970,15 @@ exit "$status"
             "timed_out": guest_exit_code == 124,
             "stdout": "logs/runtime_stdout.log",
             "stderr": "logs/runtime_stderr.log",
-            "strace": "logs/strace.*",
+            "strace": (
+                "logs/qemu_strace.log"
+                if context.execution_plan.trace_backend
+                == TraceBackend.QEMU_STRACE
+                else "logs/strace.*"
+            ),
+            "execution_backend": context.execution_plan.backend.value,
+            "trace_backend": context.execution_plan.trace_backend.value,
+            "target_arch": context.execution_plan.target.arch,
         }
         _atomic_write_json(
             context.run_dir / "config" / "prebuilt_execution.json",
@@ -927,6 +1034,7 @@ exit "$status"
     def _validate_final_artifacts(self, context: PreparedRunContext) -> None:
         required = (
             context.run_dir / "config" / "runtime.json",
+            context.run_dir / "config" / "execution_backend_manifest.json",
             context.run_dir / "config" / "rootfs_before.json",
             context.run_dir / "config" / "rootfs_after.json",
             context.run_dir / "config" / "rootfs_diff.json",
@@ -936,6 +1044,11 @@ exit "$status"
             context.run_dir / "report.json",
             context.run_dir / "report.md",
         )
+        if context.execution_plan.trace_backend == TraceBackend.QEMU_STRACE:
+            required = (
+                *required,
+                context.run_dir / "logs" / "qemu_strace.log",
+            )
         if self.config.network_mode == "controlled":
             required = (
                 *required,
@@ -972,7 +1085,7 @@ exit "$status"
         )
         return self.network_backend_factory(backend_config, self.executor)
 
-    def _check_host_dependencies(self) -> None:
+    def _check_host_dependencies(self, context: PreparedRunContext) -> None:
         required = (
             "sudo",
             "unshare",
@@ -982,9 +1095,11 @@ exit "$status"
             "ip",
             "hostname",
             "timeout",
-            "strace",
             "chroot",
+            "tee",
         )
+        if context.execution_plan.backend == ExecutionBackendKind.NATIVE:
+            required = (*required, "strace")
         if self.config.network_mode == "controlled":
             required = (*required, "iptables")
         missing = [name for name in required if shutil.which(name) is None]
@@ -995,6 +1110,7 @@ exit "$status"
         scripts = [
             "scripts/capture_runtime_observations.py",
             "scripts/parse_strace.py",
+            "scripts/parse_qemu_strace.py",
             "scripts/plan_repairs.py",
             "scripts/generate_report.py",
         ]
@@ -1057,6 +1173,10 @@ exit "$status"
             "malware_started": False,
             "retry_safe": False,
             "guest_exit_code": None,
+            "execution_backend": context.execution_plan.backend.value,
+            "target_arch": context.execution_plan.target.arch,
+            "trace_backend": context.execution_plan.trace_backend.value,
+            "qemu_host_sha256": context.execution_plan.qemu_host_sha256,
             "network_mode": self.config.network_mode,
             "network_self_test": self.config.network_self_test,
             "error": None,

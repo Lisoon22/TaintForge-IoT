@@ -18,6 +18,12 @@ from .iteration_controller import (
     SessionManifest,
     SessionState,
 )
+from .execution_backend import (
+    ExecutionBackendError,
+    ExecutionBackendResolver,
+    resolve_runtime_guest_binary,
+    resolve_runtime_host_binary,
+)
 from .prebuilt_runner import (
     PrebuiltRootfsRunner,
     PrebuiltRunnerConfig,
@@ -131,7 +137,7 @@ class EnvironmentSynthesisLoop:
     """
 
     SCHEMA_VERSION = 1
-    LOOP_VERSION = 3
+    LOOP_VERSION = 4
     BINDING_FILENAME = "synthesis_loop.json"
     EVENT_FILENAME = "synthesis_events.jsonl"
     REPORT_JSON_FILENAME = "synthesis_report.json"
@@ -139,6 +145,7 @@ class EnvironmentSynthesisLoop:
     REQUIRED_PROJECT_SCRIPTS = (
         "scripts/capture_runtime_observations.py",
         "scripts/parse_strace.py",
+        "scripts/parse_qemu_strace.py",
         "scripts/plan_repairs.py",
         "scripts/generate_report.py",
     )
@@ -161,6 +168,7 @@ class EnvironmentSynthesisLoop:
             self.config.session_dir.parent
             / f".{self.config.session_dir.name}.synthesis-loop.lock"
         )
+        self.execution_resolver = ExecutionBackendResolver()
 
     def run(self) -> SynthesisLoopResult:
         with self._loop_locked():
@@ -386,6 +394,19 @@ class EnvironmentSynthesisLoop:
         if _sha256_file(host_binary) != binding.get("host_binary_sha256"):
             raise SynthesisLoopError("bound host binary was modified")
 
+        qemu_host_raw = binding.get("qemu_host_path")
+        qemu_digest = binding.get("qemu_host_sha256")
+        if qemu_host_raw is not None:
+            if not isinstance(qemu_host_raw, str) or not isinstance(
+                qemu_digest,
+                str,
+            ):
+                raise SynthesisLoopError("bound QEMU identity is invalid")
+            qemu_host = Path(qemu_host_raw)
+            _validate_regular_file(qemu_host, "bound QEMU executable")
+            if _sha256_file(qemu_host) != qemu_digest:
+                raise SynthesisLoopError("bound QEMU executable was modified")
+
         _verify_bound_file_bundle(
             binding.get("template_config_files"),
             binding.get("template_config_bundle_sha256"),
@@ -483,11 +504,26 @@ class EnvironmentSynthesisLoop:
                 self.config.template_run_dir / "config" / "network_policy.json",
                 "template network policy",
             )
-        host_binary = _resolve_host_binary(
-            runtime,
-            self.config.binary_path,
-            self.config.project_root,
-        )
+        try:
+            host_binary = resolve_runtime_host_binary(
+                runtime,
+                self.config.binary_path,
+                self.config.project_root,
+            )
+            guest_binary = resolve_runtime_guest_binary(runtime)
+            template_rootfs = _resolve_template_rootfs(
+                runtime,
+                self.config.template_run_dir,
+                self.config.project_root,
+            )
+            execution_plan = self.execution_resolver.resolve(
+                runtime=runtime,
+                host_binary=host_binary,
+                rootfs=template_rootfs,
+                guest_binary=guest_binary,
+            )
+        except ExecutionBackendError as exc:
+            raise SynthesisLoopError(str(exc)) from exc
         template_config_files, template_config_digest = (
             self._template_config_identity()
         )
@@ -508,6 +544,14 @@ class EnvironmentSynthesisLoop:
             "project_root": str(self.config.project_root),
             "host_binary": str(host_binary),
             "host_binary_sha256": _sha256_file(host_binary),
+            "execution_backend": execution_plan.backend.value,
+            "trace_backend": execution_plan.trace_backend.value,
+            "target_arch": execution_plan.target.arch,
+            "target_elf_sha256": execution_plan.target.sha256,
+            "target_interpreter": execution_plan.target.interpreter,
+            "qemu_host_path": execution_plan.qemu_host_path,
+            "qemu_host_sha256": execution_plan.qemu_host_sha256,
+            "qemu_guest_path": execution_plan.qemu_guest_path,
             "analysis_stack_files": analysis_files,
             "analysis_stack_sha256": analysis_digest,
             "target_spec_path": (
@@ -523,7 +567,7 @@ class EnvironmentSynthesisLoop:
             "network_mode": self.config.network_mode,
             "network_self_test": self.config.network_self_test,
             "allow_internet": False,
-            "qemu_required_supported": False,
+            "qemu_required_supported": True,
         }
 
     def _effective_target_spec_path(self) -> Path | None:
@@ -625,6 +669,14 @@ class EnvironmentSynthesisLoop:
             "project_root",
             "host_binary",
             "host_binary_sha256",
+            "execution_backend",
+            "trace_backend",
+            "target_arch",
+            "target_elf_sha256",
+            "target_interpreter",
+            "qemu_host_path",
+            "qemu_host_sha256",
+            "qemu_guest_path",
             "analysis_stack_files",
             "analysis_stack_sha256",
             "target_spec_path",
@@ -759,6 +811,12 @@ class EnvironmentSynthesisLoop:
                 ),
                 "host_binary": binding.get("host_binary"),
                 "host_binary_sha256": binding.get("host_binary_sha256"),
+                "execution_backend": binding.get("execution_backend"),
+                "trace_backend": binding.get("trace_backend"),
+                "target_arch": binding.get("target_arch"),
+                "target_elf_sha256": binding.get("target_elf_sha256"),
+                "qemu_host_path": binding.get("qemu_host_path"),
+                "qemu_host_sha256": binding.get("qemu_host_sha256"),
                 "template_config_bundle_sha256": binding.get(
                     "template_config_bundle_sha256"
                 ),
@@ -839,21 +897,20 @@ class EnvironmentSynthesisLoop:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _resolve_host_binary(
+def _resolve_template_rootfs(
     runtime: dict[str, Any],
-    explicit: Path | None,
+    template_run_dir: Path,
     project_root: Path,
 ) -> Path:
-    raw: Any = str(explicit) if explicit is not None else runtime.get("host_binary")
-    if not isinstance(raw, str) or not raw:
-        raise SynthesisLoopError(
-            "host binary is missing; pass --binary or set host_binary in runtime.json"
-        )
-    path = Path(raw)
-    if not path.is_absolute():
-        path = project_root / path
+    raw = runtime.get("rootfs")
+    if isinstance(raw, str) and raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = project_root / path
+    else:
+        path = template_run_dir / "rootfs"
     path = path.resolve(strict=False)
-    _validate_regular_file(path, "host binary")
+    _validate_directory(path, "template rootfs")
     return path
 
 

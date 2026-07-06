@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "sample": {
+    "name": "arm_write_exit",
+    "arch": "arm",
+    "binary_path": "samples/qemu_smoke/arm_write_exit"
+  },
+  "oep": "0x10000",
+  "arch": "arm",
+  "base": "0x10000",
+  "regions": [],
+  "file_dependencies": [],
+  "network_dependencies": [],
+  "library_dependencies": []
+}
