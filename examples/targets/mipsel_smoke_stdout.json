@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "goal_id": "mipsel_qemu_smoke_stdout",
+  "description": "MIPSel static smoke payload executed through QEMU and printed mipsel-ok",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "stdout_mipsel_ok",
+      "type": "text_contains",
+      "source": "stdout",
+      "needle": "mipsel-ok",
+      "min_count": 1
+    },
+    {
+      "id": "guest_write_syscall",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "write",
+        "execution_context": "guest",
+        "trace_backend": "qemu_strace",
+        "target_arch": "mipsel"
+      },
+      "min_count": 1
+    }
+  ]
+}

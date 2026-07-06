@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "sample": {
+    "name": "mipsel_write_exit",
+    "arch": "mipsel",
+    "binary_path": "samples/qemu_smoke/mipsel_write_exit"
+  },
+  "oep": "0x10000",
+  "arch": "mipsel",
+  "base": "0x10000",
+  "regions": [],
+  "file_dependencies": [],
+  "network_dependencies": [],
+  "library_dependencies": []
+}
