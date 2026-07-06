@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "goal_id": "arm_qemu_controlled_loopback_network",
+  "description": "ARM payload executed through QEMU, attempted loopback TCP connection, and emitted normalized guest network syscalls",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "stdout_arm_net_ok",
+      "type": "text_contains",
+      "source": "stdout",
+      "needle": "arm-net-ok",
+      "min_count": 1
+    },
+    {
+      "id": "guest_socket_syscall",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "socket",
+        "execution_context": "guest",
+        "trace_backend": "qemu_strace",
+        "target_arch": "arm"
+      },
+      "min_count": 1
+    },
+    {
+      "id": "guest_connect_syscall",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "connect",
+        "execution_context": "guest",
+        "trace_backend": "qemu_strace",
+        "target_arch": "arm"
+      },
+      "min_count": 1
+    },
+    {
+      "id": "guest_write_syscall",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "write",
+        "execution_context": "guest",
+        "trace_backend": "qemu_strace",
+        "target_arch": "arm"
+      },
+      "min_count": 1
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "sample": {
+    "name": "arm_connect_loopback",
+    "arch": "arm",
+    "binary_path": "samples/qemu_smoke/arm_connect_loopback"
+  },
+  "oep": "0x10000",
+  "arch": "arm",
+  "base": "0x10000",
+  "regions": [],
+  "file_dependencies": [],
+  "network_dependencies": [
+    {
+      "type": "tcp",
+      "ip": "127.0.0.1",
+      "port": 80,
+      "role": "loopback_test"
+    }
+  ],
+  "library_dependencies": []
+}
