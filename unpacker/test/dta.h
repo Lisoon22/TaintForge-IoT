@@ -25,6 +25,9 @@ typedef struct {
 	bool is_indirect_branch;
 	uint16_t insn_id;
 	RegId branch_target_reg;
+	uint32_t mem_addr_reg_mask;
+	RegId wr_reg; uint8_t wr_mask; uint8_t wr_off;
+	RegId rd_reg; uint8_t rd_mask; uint8_t rd_off;
 } InsnMeta;
 
 ShadowMemory *shadow_create(uint8_t guest_bits);
@@ -48,9 +51,9 @@ void reg_taint_set(RegShadow *rs, RegId rid, uint8_t byte_mask, uint64_t ip);
 void reg_taint_clear(RegShadow *rs, RegId rid, uint8_t byte_mask);
 bool reg_is_tainted(RegShadow *rs, RegId rid, uint8_t byte_mask);
 
-void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, RegId src, uint8_t src_mask);
+void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_off, uint8_t dst_mask, RegId src, uint8_t src_off, uint8_t src_mask,uint16_t insn_id);
 void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2, uint16_t insn_id);
-void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, bool mem_tainted);
+void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, uint8_t mem_taint_mask, bool overwrite);
 void reg_propagate_clear(RegShadow *rs, RegId dst);
 
 void meta_init(void);

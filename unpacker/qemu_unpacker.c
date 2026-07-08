@@ -12,7 +12,7 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-static const size_t page_size = 4096;
+static size_t page_size = 4096;
 
 typedef enum {
 	ARCH_X86_32,
@@ -39,7 +39,9 @@ typedef struct {
 	uint64_t jump_site;
 	uint32_t generation;
 	uint64_t icount;
-	bool     dse_confirmed;
+	bool dse_confirmed;
+	uint32_t dse_concretized;
+	uint32_t dse_total;
 } oep_cand_t;
 
 //got table reconstruct helper
@@ -65,10 +67,34 @@ static struct qemu_plugin_register *g_reg_handle[REG_COUNT];
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
+//auxv read for threshold and determine precise page size
+#ifndef AT_NULL
+#define AT_NULL 0 //vector end
+#define AT_PHDR 3 //phdr
+#define AT_PHENT 4 //size of phdr
+#define AT_PHNUM 5 //number of phdr
+#define AT_PAGESZ 6 //page size
+#define AT_BASE 7 // base of ld
+#define AT_ENTRY 9 //entry point addr
+#endif
+//boundaries for main code
+static uint64_t g_main_lo = 0;
+static uint64_t g_main_hi = 0;
+static bool g_main_known = false;
+//ld base
+static uint64_t g_ld_base = 0;
+//AT_ENTRY in packed file typically points to packer's stub
+static uint64_t g_stub_entry = 0;
+static bool g_auxv_done = false;
+//TODO stub for multiarch
+static const DseArch *g_plugin_arch = &dse_arch_x86;
 //additional OEP checks
 static uint64_t g_icount = 0;
 static uint32_t g_unpack_gen = 0;
 static uint64_t g_last_cand_icount = 0;
+static uint32_t g_layer = 0;
+static bool g_layer_dirty = false;
+static bool g_layer_has_cand = false;
 static GList *oep_cands = NULL;
 static GHashTable *unmapped_pages = NULL; //for munmaped pages
 
@@ -89,15 +115,41 @@ typedef struct {
 	uint64_t offset;
 } pending_mmap_t;
 static __thread pending_mmap_t g_pending_mmap;
+//read <=8 raw bytes from guest memory
+static bool guest_read_bytes(uint64_t gaddr, uint8_t *out, uint32_t n) {
+	GByteArray *b = g_byte_array_new();
+	bool ok = qemu_plugin_read_memory_vaddr(gaddr, b, n) && b->len >= n;
+	if (ok) memcpy(out, b->data, n);
+	g_byte_array_free(b, TRUE);
+	return ok;
+}
+
+//read uint of sz bytes, saves the active endianness.
+static bool guest_read_uint(uint64_t gaddr, uint32_t sz, uint64_t *out) {
+	uint8_t raw[8];
+	if (sz > 8 || !guest_read_bytes(gaddr, raw, sz)) return false;
+	uint64_t v = 0;
+	if (g_plugin_arch && g_plugin_arch->big_endian)
+		for (uint32_t i = 0; i < sz; i++) v = (v << 8) | raw[i];
+	else
+		for (uint32_t i = 0; i < sz; i++) v |= (uint64_t)raw[i] << (8 * i);
+	*out = v;
+	return true;
+}
+
+//32 -> 4, 64 -> 8
+static uint32_t guest_ptr_bytes(void) {
+	uint32_t w;
+	if (g_plugin_arch) {
+		w = g_plugin_arch->natural_width;
+	} else { 
+		w = 32;
+	}
+	return (w >= 64) ? 8 : 4;
+}
 
 static bool read_socketcall_args(uint64_t block_addr, uint32_t out[6]) {
-	GByteArray *arr = g_byte_array_new();
-	if (!qemu_plugin_read_memory_vaddr(block_addr, arr, 24)) {
-		g_byte_array_free(arr, TRUE);
-		return false;
-	}
-	memcpy(out, arr->data, 24);
-	g_byte_array_free(arr, TRUE);
+	if (!guest_read_bytes(block_addr, (uint8_t *)out, 24)) return false;
 	return true;
 }
 
@@ -180,6 +232,7 @@ static void record_resolved_import(uint64_t got_slot, uint64_t resolved_addr) {
 	uint64_t lib_base = addr_lib_base(resolved_addr);
 	if (!lib_base) return;
 	if (addr_lib_base(got_slot)) return;
+	if (g_main_known && (got_slot < g_main_lo || got_slot >= g_main_hi)) return;
 	if (resolved_imports_by_slot && g_hash_table_contains(resolved_imports_by_slot, (gpointer)(uintptr_t)got_slot)) return;
 	resolved_import_t *ri = g_new0(resolved_import_t, 1);
 	ri->got_slot = got_slot;
@@ -226,18 +279,16 @@ static char *read_guest_string(uint64_t gaddr) {
 	if (gaddr == 0) return NULL;
 
 	GString *s = g_string_new(NULL);
-	GByteArray *arr = g_byte_array_new();
-
-	for (size_t i = 0; i < 1024; i++) {
-		g_byte_array_set_size(arr, 0);
-		if (!qemu_plugin_read_memory_vaddr(gaddr + i, arr, 1)) break;
-		if (arr->len == 0) break;
-		guint8 ch = arr->data[0];
-		if (ch == '\0') break;
-		g_string_append_c(s, ch);
+	uint8_t chunk[64];
+	for (size_t off = 0; off < 4096; off += sizeof chunk) {
+		if (!guest_read_bytes(gaddr + off, chunk, sizeof chunk)) break;
+		size_t i = 0;
+		for (; i < sizeof chunk; i++) {
+			if (chunk[i] == '\0') break;
+			g_string_append_c(s, chunk[i]);
+		}
+		if (i < sizeof chunk) break;
 	}
-
-	g_byte_array_free(arr, TRUE);
 
 	if (s->len == 0) {
 		g_string_free(s, TRUE);
@@ -355,28 +406,51 @@ static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_
 	*out_val  = v;
 	return true;
 }
+//separate rewrite and change
+static inline bool insn_overwrites_dst(uint16_t id) {
+	switch (id) {
+		case X86_INS_MOV: case X86_INS_MOVZX: case X86_INS_MOVSX: case X86_INS_POP: case X86_INS_LEA:
+			return true;
+		default:
+			return false;
+	}
+}
 
 static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
 	(void)vcpu; (void)ud;
-	if (!g_cur_aux) return;
 	uint32_t sz = 1u << qemu_plugin_mem_size_shift(info);
 	if (qemu_plugin_mem_is_store(info)) {
-		g_cur_aux->has_mem_write  = true;
-		g_cur_aux->mem_write_addr = vaddr;
+		if (g_cur_aux) {
+			g_cur_aux->has_mem_write  = true;
+			g_cur_aux->mem_write_addr = vaddr;
+		}
 		return;
 	}
-	g_cur_aux->has_mem_read  = true;
-	g_cur_aux->mem_read_addr = vaddr;
-	GByteArray *arr = g_byte_array_new();
-	uint64_t val = 0; uint8_t tmask = 0;
-	if (qemu_plugin_read_memory_vaddr(vaddr, arr, sz))
-		for (uint32_t i = 0; i < sz && i < arr->len && i < 8; i++)
-			val |= (uint64_t)arr->data[i] << (8 * i);
-	g_byte_array_free(arr, TRUE);
-	for (uint32_t i = 0; i < sz && i < 8; i++)
+	//taint byte by byte
+	uint8_t tmask = 0;
+	for (uint32_t i = 0; i < sz && i < 8; i++) {
 		if (shadow_is_tainted(g_shadow, vaddr + i)) tmask |= (1u << i);
-	g_cur_aux->mem_read_val   = val;
-	g_cur_aux->mem_read_taint = tmask;
+	}
+	//mem2reg propagate
+	InsnMeta *meta = meta_lookup(g_current_ip);
+	if (meta && meta->wr_reg >= 0) {
+		bool overwrite = insn_overwrites_dst(meta->insn_id);
+		propagate_mem2reg(&reg_shadow, meta->wr_reg, meta->wr_mask, tmask, overwrite);
+	}
+	if (g_cur_aux) {
+		g_cur_aux->has_mem_read  = true;
+		g_cur_aux->mem_read_addr = vaddr;
+		GByteArray *arr = g_byte_array_new();
+		uint64_t val = 0;
+		if (qemu_plugin_read_memory_vaddr(vaddr, arr, sz)) {
+			for (uint32_t i = 0; i < sz && i < arr->len && i < 8; i++) {
+				val |= (uint64_t)arr->data[i] << (8 * i);
+			}
+		}
+		g_byte_array_free(arr, TRUE);
+		g_cur_aux->mem_read_val   = val;
+		g_cur_aux->mem_read_taint = tmask;
+	}
 }
 
 static bool is_valid_path(const char *s) {
@@ -462,15 +536,18 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
 		page->last_write = g_icount;
 		page->gen_written = g_unpack_gen;
 		page->exec_seen = false;
+		if (g_layer_has_cand) g_layer_dirty = true;
 		vaddr += chunk;
 		size -= chunk;
 	}
 }
 
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
-	shadow_taint_byte(g_shadow, vaddr, g_current_ip);
 	g_taint_seen = true;
 	uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
+	for (uint32_t i = 0; i < size; i++) {
+		shadow_taint_byte(g_shadow, vaddr + i, g_current_ip);
+	}
 	mark_written(vaddr, size);
 }
 
@@ -480,6 +557,7 @@ static uint64_t saved_base = 0;
 static bool saved_base_set = false;
 static uint64_t saved_oep = 0;
 static bool image_captured = false;
+static bool g_static_binary = false;
 
 //enhanced logic of choosing oep
 static bool addr_in_lib(uint64_t addr) {
@@ -505,33 +583,237 @@ static bool cand_in_main_image(const oep_cand_t *c) {
 	return true;
 }
 
+//part of the concrete to total to determine the most accurate OEP
+static double cand_dse_ratio(const oep_cand_t *c) {
+	if (!c || c->dse_total == 0) return 0.0;
+	return (double)c->dse_concretized / (double)c->dse_total;
+}
+//DSE strongest: 1. conc amount; 2. conc ratio; 3. unpack generation
+static bool cand_stronger(const oep_cand_t *a, const oep_cand_t *b) {
+	if (a->dse_concretized != b->dse_concretized)
+		return a->dse_concretized > b->dse_concretized;
+	double ra = cand_dse_ratio(a), rb = cand_dse_ratio(b);
+	if (ra != rb) return ra > rb;
+	if (a->generation != b->generation) return a->generation > b->generation;
+	return a->icount < b->icount;
+}
+
 //union of oep choosing
 static oep_cand_t *choose_oep_cand(void) {
-	oep_cand_t *first_conf_main = NULL, *last_main = NULL, *last_any = NULL;
+	oep_cand_t *best = NULL;
+	for (GList *l = oep_cands; l; l = l->next) {
+		oep_cand_t *c = (oep_cand_t*)l->data;
+		if (!cand_in_main_image(c) || !c->dse_confirmed) continue;
+		if (!best || cand_stronger(c, best)) {
+			best = c;
+			continue;
+		}
+	}
+	//fallback
+	if (best) return best;
+	oep_cand_t *fb = NULL, *last_any = NULL;
 	for (GList *l = oep_cands; l; l = l->next) {
 		oep_cand_t *c = (oep_cand_t*)l->data;
 		last_any = c;
 		if (!cand_in_main_image(c)) continue;
-		last_main = c;
-		if (c->dse_confirmed && !first_conf_main) first_conf_main = c;
+		if (!fb || cand_stronger(c, fb)) {
+			fb = c;
+			continue;
+		}
 	}
-	if (first_conf_main) return first_conf_main; //main logic
-	if (last_main)       return last_main; //fallback1
-	return last_any; //fallback2
+	if (fb) return fb;     //fallback1
+	return last_any;       //fallback2
 }
+
+//auxv PT_LOAD union, main logic
+static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num,uint64_t base_adjust) {
+	if (!phdr_va || !num || ent < 8) return false;
+	bool w64 = (guest_ptr_bytes() == 8);
+	uint64_t off_vaddr = w64 ? 16 : 8;
+	uint64_t off_memsz = w64 ? 40 : 20;
+	uint32_t fld = w64 ? 8 : 4;
+	uint64_t lo = UINT64_MAX, hi = 0;
+	for (uint64_t i = 0; i < num && i < 512; i++) {
+		uint64_t ph = phdr_va + i * ent;
+		uint64_t p_type = 0, p_vaddr = 0, p_memsz = 0;
+		if (!guest_read_uint(ph, 4, &p_type)) break;
+		if (p_type != 1) continue;
+		if (!guest_read_uint(ph + off_vaddr, fld, &p_vaddr)) break;
+		if (!guest_read_uint(ph + off_memsz, fld, &p_memsz)) break;
+		uint64_t start = p_vaddr + base_adjust;
+		if (start < lo) lo = start;
+		if (start + p_memsz > hi) hi = start + p_memsz;
+	}
+	if (hi > lo) {
+		g_main_lo = lo;
+		g_main_hi = hi;
+		g_main_known = true;
+		return true;
+	}
+	return false;
+}
+//read auxv
+static void read_auxv_from_stack(void) {
+	uint32_t pb = guest_ptr_bytes();
+	uint64_t sp = 0;
+	if (!dse_read_reg(REG_RSP, &sp)) { fprintf(stderr, "[AUXV] fail: cannot read REG_RSP\n"); return; }
+	if (pb == 4) sp &= 0xFFFFFFFFULL;
+
+	uint64_t argc = 0;
+	if (!guest_read_uint(sp, pb, &argc)) { fprintf(stderr, "[AUXV] fail: cannot read argc at sp=0x%lx\n", (unsigned long)sp); return; }
+	uint64_t p = sp + pb;
+	p += argc * pb;
+	p += pb;
+	for (int guard = 0; guard < 8192; guard++) {
+		uint64_t e = 0;
+		if (!guest_read_uint(p, pb, &e)) return;
+		p += pb;
+		if (e == 0) break;
+	}
+
+	uint64_t at_phdr = 0, at_phent = 0, at_phnum = 0, ptphdr_vaddr = 0;
+	bool have_ptphdr = false;
+	uint64_t scan = p;
+	for (int guard = 0; guard < 128; guard++) {
+		uint64_t type = 0, val = 0;
+		if (!guest_read_uint(scan, pb, &type)) { fprintf(stderr, "[AUXV] fail: auxv type read at 0x%lx\n", (unsigned long)scan); return; }
+		if (!guest_read_uint(scan + pb, pb, &val)) { fprintf(stderr, "[AUXV] fail: auxv val read at 0x%lx\n", (unsigned long)(scan+pb)); return; }
+		scan += 2 * pb;
+		if (type == AT_NULL) break;
+		switch (type) {
+			case AT_PHDR:  at_phdr  = val; break;
+			case AT_PHENT: at_phent = val; break;
+			case AT_PHNUM: at_phnum = val; break;
+			case AT_BASE:  g_ld_base = val; break;
+			case AT_ENTRY: g_stub_entry = val; break;
+			case AT_PAGESZ:
+				if (val && (size_t)val != page_size)
+					fprintf(stderr, "[AUXV] AT_PAGESZ=0x%lx differs from page_size=0x%lx\n", (unsigned long)val, (unsigned long)page_size);
+				if (val) page_size = (size_t)val;
+				break;
+		}
+	}
+
+	if (!at_phdr || !at_phnum || at_phent <8) { fprintf(stderr, "[AUXV] fail: no AT_PHDR (phdr=0x%lx phnum=%lu phent=%lu)\n", (unsigned long)at_phdr, (unsigned long)at_phnum, (unsigned long)at_phent); return; }
+
+	bool w64 = (guest_ptr_bytes() == 8);
+	uint64_t off_vaddr = w64 ? 16 : 8;
+	uint32_t fld = w64 ? 8 : 4;
+	uint64_t min_load_vaddr = UINT64_MAX;
+	for (uint64_t i = 0; i < at_phnum && i < 512; i++) {
+		uint64_t ph = at_phdr + i * at_phent;
+		uint64_t p_type = 0, p_vaddr = 0;
+		if (!guest_read_uint(ph, 4, &p_type)) break;
+		if (p_type == 6) { //PT_PHDR
+			if (guest_read_uint(ph + off_vaddr, fld, &p_vaddr) && p_vaddr <= at_phdr) {
+				ptphdr_vaddr = p_vaddr;
+				have_ptphdr = true;
+			}
+		} else if (p_type == 1) { //PT_LOAD
+			if (guest_read_uint(ph + off_vaddr, fld, &p_vaddr) && p_vaddr < min_load_vaddr) {
+				min_load_vaddr = p_vaddr;
+			}
+		}
+	}
+	uint64_t bias;
+	if (have_ptphdr) {
+		//bias = runtime phdr address - PT_PHDR.p_vaddr
+		bias = at_phdr - ptphdr_vaddr;
+	} else if (min_load_vaddr != UINT64_MAX) {
+		//fallback for stubs without PT_PHDR
+		uint64_t pmask = ~((uint64_t)page_size - 1);
+		bias = (at_phdr & pmask) - (min_load_vaddr & pmask);
+	} else {
+		bias = 0;
+	}
+	if (window_from_phdrs(at_phdr, at_phent, at_phnum, bias)) {
+		fprintf(stderr, "[WINDOW] auxv: main [0x%lx,0x%lx) ld_base=0x%lx entry=0x%lx bias=0x%lx\n", (unsigned long)g_main_lo, (unsigned long)g_main_hi, (unsigned long)g_ld_base, (unsigned long)g_stub_entry,(unsigned long)bias);
+	}
+}
+//bases form ELF phdrs, fallback if no auxv read
+static bool window_from_elf_header(uint64_t base) {
+	if (!base) return false;
+	uint8_t ident[16];
+	if (!guest_read_bytes(base, ident, 16)) return false;
+	if (!(ident[0] == 0x7f && ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F')) return false;
+	bool w64 = (ident[4] == 2);
+	uint64_t e_type = 0, e_phoff = 0, e_phnum = 0, e_phentsize = 0;
+	uint64_t off_type = 16;
+	uint64_t off_phoff = w64 ? 32 : 28;
+	uint64_t off_phent = w64 ? 54 : 42;
+	uint64_t off_phnum = w64 ? 56 : 44;
+	if (!guest_read_uint(base + off_type,  2, &e_type)) return false;
+	if (!guest_read_uint(base + off_phoff, w64 ? 8 : 4, &e_phoff)) return false;
+	if (!guest_read_uint(base + off_phent, 2, &e_phentsize)) return false;
+	if (!guest_read_uint(base + off_phnum, 2, &e_phnum)) return false;
+	uint64_t bias = (e_type==3) ? base : 0;
+	bool ok = window_from_phdrs(base + e_phoff, e_phentsize, e_phnum, bias);
+	if (ok)
+		fprintf(stderr, "[WINDOW] elf-header@0x%lx: main [0x%lx,0x%lx)\n", (unsigned long)base, (unsigned long)g_main_lo, (unsigned long)g_main_hi);
+	return ok;
+}
+//get boundaries from contiguity, fallback if not both previous
+static void window_from_pagetable(GList *keys) {
+	const uint64_t GAP_MAX = 64 * page_size;
+	uint64_t lo = 0, hi = 0;
+	bool have = false;
+	for (GList *k = keys; k; k = k->next) {
+		uint64_t addr = (uint64_t)(uintptr_t)k->data;
+		if (addr_in_lib(addr) || addr == 0) continue;
+		if (!have) {
+			lo = addr;
+			hi = addr + page_size;
+			have = true;
+			continue;
+		}
+		if (addr <= hi + GAP_MAX) hi = addr + page_size;
+		else break;
+	}
+	if (have) {
+		g_main_lo = lo; g_main_hi = hi; g_main_known = true;
+		fprintf(stderr, "[WINDOW] page-table heuristic: main [0x%lx,0x%lx)\n", (unsigned long)g_main_lo, (unsigned long)g_main_hi);
+	}
+}
+//helper for determine which prefer
+static void establish_main_window_fallback(GList *keys) {
+	if (g_main_known) return;
+	uint64_t base = 0;
+	for (GList *k = keys; k; k = k->next) {
+		uint64_t addr = (uint64_t)(uintptr_t)k->data;
+		if (!addr_in_lib(addr)) {
+			base = addr;
+			break;
+		}
+	}
+	if (window_from_elf_header(base)) return;
+	window_from_pagetable(keys);
+}
+//is page in boundaries
+static bool page_is_program(uint64_t addr, const page_t *p) {
+	if (addr_in_lib(addr)) return false;
+	if (!g_main_known) return true;
+	if (addr >= g_main_lo && addr < g_main_hi) return true;
+	if (p && (p->exec_seen || p->exec_after_write || p->dyn_exec)) return true;
+	return false;
+}
+
 
 static void do_dump(uint64_t oep) {
 	GList *keys = g_hash_table_get_keys(pages);
 	keys = g_list_sort(keys, compare_keys);
-	
+
+	establish_main_window_fallback(keys);
+
+	g_static_binary = (lib_deps == NULL);
+
 	if (!bin_dumped) {
 		FILE *f_bin = fopen("unpacked.bin", "wb");
 		if (f_bin) {
 			for (GList *k = keys; k; k = k->next) {
 				uint64_t addr = (uint64_t)(uintptr_t)k->data;
-				if (addr_in_lib(addr))continue; //get rid of lib reg/pages
 				page_t *p = g_hash_table_lookup(pages, k->data);
 				if (!p) continue;
+				if (!page_is_program(addr, p))continue;
 				GByteArray *data = g_byte_array_new();
 				if (qemu_plugin_read_memory_vaddr(addr, data, page_size) && data->len > 0) {
 					fwrite(data->data, 1, data->len, f_bin);
@@ -561,6 +843,7 @@ static void do_dump(uint64_t oep) {
 			uint64_t addr = (uint64_t)(uintptr_t)k->data;
 			page_t *p = g_hash_table_lookup(pages, k->data);
 			if (!p) continue;
+			if (!addr_in_lib(addr) && !page_is_program(addr,p)) continue;
 
 			GByteArray *data = g_byte_array_new();
 			size_t written = 0;
@@ -583,7 +866,11 @@ static void do_dump(uint64_t oep) {
 					first_region = false;
 					if (region_mod) {
 						snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
-					} else {
+					} else if (g_static_binary) {
+					       snprintf(modbuf, sizeof modbuf, "\"static\"");
+					}else if (g_main_known && region_start >= g_main_lo && region_start < g_main_hi){
+						snprintf(modbuf, sizeof modbuf, "\"main\"");
+    					} else {
 						snprintf(modbuf, sizeof modbuf, "null");
 					}
 					g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}", region_start, region_size, region_prot, region_off, region_is_lib ? "true" : "false", modbuf);
@@ -608,7 +895,11 @@ static void do_dump(uint64_t oep) {
 			if (!first_region) g_string_append(saved_reg, ",\n");
 			if (region_mod){
 				snprintf(modbuf, sizeof modbuf, "\"%s\"", base_name(region_mod));
-			} else {
+			}else if (g_static_binary) {
+				snprintf(modbuf, sizeof modbuf, "\"static\"");
+			} else if (g_main_known && region_start >= g_main_lo && region_start < g_main_hi) {
+				snprintf(modbuf, sizeof modbuf, "\"main\"");
+			}else {
 				snprintf(modbuf, sizeof modbuf, "null");
 			}
 			g_string_append_printf(saved_reg, "    {\"addr\": \"0x%lx\", \"size\": %lu, \"prot\": %d, \"offset\": %lu, \"lib\": %s, \"module\": %s}\n", region_start, region_size, region_prot, region_off, region_is_lib ? "true" : "false", modbuf);
@@ -671,6 +962,7 @@ static void write_report(void) {
 	for (GList *l = resolved_imports; l; l = l->next) {
 		resolved_import_t *ri = (resolved_import_t*)l->data;
 		if (!ri || !ri->module) continue;
+		if (g_main_known && (ri->got_slot < g_main_lo || ri->got_slot>=g_main_hi)) continue;
 		if (!first) fprintf(f_json, ", ");
 		fprintf(f_json, "{\"got_slot\": \"0x%lx\", \"resolved_addr\": \"0x%lx\", \"module\": \"%s\", \"offset\": \"0x%lx\"}",(unsigned long)ri->got_slot, (unsigned long)ri->resolved_addr,ri->module, (unsigned long)( ri->resolved_addr - ri->lib_base));
 		first = false;
@@ -816,6 +1108,12 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	g_current_ip = vaddr;
 	g_icount++;
 
+	if (!g_auxv_done) { 
+		if (!g_regs_ready) dse_init_reg_handles();
+		g_auxv_done = true;
+		read_auxv_from_stack();
+	}
+
 	InsnMeta *meta = meta_lookup(vaddr);
 	if (!meta) return;
 
@@ -878,7 +1176,12 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		} else {
 			c->jump_site = 0;
 		}
-		c->generation = g_unpack_gen;
+		if (g_layer_dirty) {
+			g_layer++;
+			g_layer_dirty = false;
+			g_layer_has_cand = false;
+		}
+		c->generation = g_layer;
 		c->icount = g_icount;
 		//dse confirming
 		if (prev_jump_pending) {
@@ -888,10 +1191,12 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 				c->dse_confirmed = dse_verify_oep_candidate_mem(g_trace, g_aux, prev_jump_site, prev_mem_taddr, vaddr, g_shadow, cs_handle);
 			}
 		}
+		c->dse_concretized = dse_lift_concretized_count();
+		c->dse_total =dse_lift_total_count();
 		fprintf(stderr,"[OEP-CAND gen=%u] 0x%lx (jmp@0x%lx) dse=%s ""(concretized %u/%u; aux_miss %u, unsup %u)\n", c->generation, (unsigned long)c->addr, (unsigned long)c->jump_site, c->dse_confirmed ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
 		//proceed to next layer
 		oep_cands = g_list_append(oep_cands, c);
-		g_unpack_gen++;
+		g_layer_has_cand = true;
 		g_last_cand_icount = g_icount;
 		prev_jump_pending = false;
 		prev_jump_site = 0;
@@ -924,43 +1229,45 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	}
 	// lea with two registers
 	if (meta->insn_id == X86_INS_LEA) {
-		int dst = mask_first_reg(meta->regs_written_mask);
-		int src = mask_first_reg(meta->regs_read_mask);
-		if (dst >= 0 && src >= 0) {
-			propagate_reg2reg(&reg_shadow, dst, 0x0F, src, 0x0F);
-		}
-		goto record_branch;
-	}
-	//mem2reg
-	if (meta->has_mem_read && meta->regs_written_mask) {
-		int dst = mask_first_reg(meta->regs_written_mask);
-		if (dst >= 0) {
-			propagate_mem2reg(&reg_shadow, dst, 0x0F, true);
-		}
-	}
-	int num_src_regs = __builtin_popcount(meta->regs_read_mask);
-	//reg2reg, count 1 in bytes representation, TODO add al, ah resolve
-	if (num_src_regs == 1 && meta->regs_written_mask) {
-		int src = mask_first_reg(meta->regs_read_mask);
-		int dst = mask_first_reg(meta->regs_written_mask);
-		if (src >= 0 && dst >= 0) {
-			propagate_reg2reg(&reg_shadow, dst, 0x0F, src, 0x0F);
-		}
-	} else if (num_src_regs >= 2 && meta->regs_written_mask) { //reg2reg with arith
-		int dst = mask_first_reg(meta->regs_written_mask);
+		int dst = meta->wr_reg;
 		int src1 = -1, src2 = -1;
 		for (int i = 0; i < REG_COUNT; i++) {
-			if (meta->regs_read_mask & (1U << i)) {
-				if (src1 < 0) {
-				       	src1 = i;
-				} else { 
-					src2 = i; 
+			if (meta->mem_addr_reg_mask & (1U << i)) {
+				if (src1 < 0){ 
+					src1 = i;
+				}else { 
+					src2 = i;
 					break;
 				}
 			}
 		}
-		if (src1 >= 0 && dst >= 0) {
+		if (dst >= 0 && src1 >= 0) {
 			propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
+		} else if (dst >= 0) {
+			reg_propagate_clear(&reg_shadow, dst);   // lea eax,[const]
+		}
+		goto record_branch;
+	}
+	int num_src_regs = __builtin_popcount(meta->regs_read_mask);
+	if (!meta->has_mem_read) {
+		if (num_src_regs == 1 && meta->wr_reg >= 0 && meta->rd_reg >= 0) {
+			propagate_reg2reg(&reg_shadow, meta->wr_reg, meta->wr_off, meta->wr_mask, meta->rd_reg, meta->rd_off,meta->rd_mask, meta->insn_id);
+		} else if (num_src_regs >= 2 && meta->regs_written_mask) { //reg2reg with arith
+			int dst = mask_first_reg(meta->regs_written_mask);
+			int src1 = -1, src2 = -1;
+			for (int i = 0; i < REG_COUNT; i++) {
+				if (meta->regs_read_mask & (1U << i)) {
+					if (src1 < 0) {
+				       		src1 = i;
+					} else { 
+						src2 = i; 
+						break;
+					}
+				}
+			}
+			if (src1 >= 0 && dst >= 0) {
+				propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
+			}
 		}
 	}
 	record_branch:
@@ -1339,6 +1646,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 				if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
 					p->dyn_exec = true;
 					p->gen_written = g_unpack_gen;
+					if (g_layer_has_cand) g_layer_dirty = true;
 				}
 			}
 		}
@@ -1369,6 +1677,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
 						p->dyn_exec = true;
 						p->gen_written = g_unpack_gen;
+						if (g_layer_has_cand) g_layer_dirty = true;
 					}
 				}
 			}
@@ -1394,6 +1703,7 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
 				p->dyn_exec = true;
 				p->gen_written = g_unpack_gen;
+				if (g_layer_has_cand) g_layer_dirty = true;
 			}
 		}
 	} else if (num == 91) { //munmap

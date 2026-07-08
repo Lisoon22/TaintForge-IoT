@@ -3,13 +3,10 @@
   "arch": "x86",
   "base": "0x8048000",
   "regions": [
-    {"addr": "0x8048000", "size": 4096, "prot": 1, "offset": 0, "lib": false, "module": null},
-    {"addr": "0x8049000", "size": 462848, "prot": 5, "offset": 4096, "lib": false, "module": null},
-    {"addr": "0x80ba000", "size": 208896, "prot": 1, "offset": 466944, "lib": false, "module": null},
-    {"addr": "0x80ed000", "size": 16384, "prot": 3, "offset": 675840, "lib": false, "module": null},
-    {"addr": "0x813c000", "size": 4096, "prot": 3, "offset": 692224, "lib": false, "module": null},
-    {"addr": "0x407ff000", "size": 8192, "prot": 3, "offset": 696320, "lib": false, "module": null},
-    {"addr": "0x40803000", "size": 4096, "prot": 3, "offset": 704512, "lib": false, "module": null}
+    {"addr": "0x8048000", "size": 4096, "prot": 1, "offset": 0, "lib": false, "module": "static"},
+    {"addr": "0x8049000", "size": 462848, "prot": 5, "offset": 4096, "lib": false, "module": "static"},
+    {"addr": "0x80ba000", "size": 208896, "prot": 1, "offset": 466944, "lib": false, "module": "static"},
+    {"addr": "0x80ed000", "size": 16384, "prot": 3, "offset": 675840, "lib": false, "module": "static"}
   ],
   "file_dependencies": [    {"path": "/proc/self/exe", "write": false},
     {"path": "/tmp/testfile.txt", "write": true}],

@@ -48,15 +48,17 @@ void shadow_destroy(ShadowMemory *sm) {
 
 void shadow_taint_byte(ShadowMemory *sm, uint64_t addr, uint64_t ip) {
 	(void)ip;
-	if (sm->arch == 32) { //IMPLEMENT NOT IN DTA CODE!!!!!!!!!!1
+	if (sm->arch == 32) {
 		addr &= 0xFFFFFFFFULL;
 	} else {
 		//TODO
 	}
 	uint64_t page_base = addr & ~((uint64_t)page_size - 1);
-	mprotect((char*)sm->base + (addr & ~(page_size - 1)), page_size, 3);
+	if (!g_hash_table_contains(sm->dirty_pages, GSIZE_TO_POINTER((size_t)page_base))) {
+		mprotect((char*)sm->base + page_base, page_size, PROT_READ | PROT_WRITE);
+		g_hash_table_add(sm->dirty_pages, GSIZE_TO_POINTER((size_t)page_base));
+	}
 	*((uint8_t *)sm->base + addr) = 1;
-	g_hash_table_add(sm->dirty_pages, GSIZE_TO_POINTER((size_t)page_base));
 }
 
 void shadow_untaint_byte(ShadowMemory *sm, uint64_t addr) {
@@ -135,16 +137,36 @@ bool reg_is_tainted(RegShadow *rs, RegId rid, uint8_t byte_mask) {
 	return false;
 }
 
-void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, RegId src, uint8_t src_mask) { //TODO limitations for partial regs al<-bh, movzx, xor 
-	for (int i = 0; i < MAX_REG_BYTES; i++) {
-		if (dst_mask & (1U << i)) {
-			if (src_mask & (1U << i)) {
-				rs->bytes[dst][i] = rs->bytes[src][i];
-			} else {
-				rs->bytes[dst][i] = false;
-			}
+void propagate_reg2reg(RegShadow *rs, RegId dst, uint8_t dst_off, uint8_t dst_mask, RegId src, uint8_t src_off, uint8_t src_mask, uint16_t insn_id) {
+	if (dst < 0 || dst >= REG_COUNT || src < 0 || src >= REG_COUNT) return;
+	int n = __builtin_popcount(src_mask);
+	bool zx = false, sx = false;
+	if (insn_id == X86_INS_MOVZX) {
+		zx = true;
+	}
+	if (insn_id == X86_INS_MOVSX) {
+		sx = true;
+	}
+	//byte accurate transfer from source to dst
+	for (int k = 0; k < n; k++) {
+		uint8_t di = dst_off + k, si = src_off + k;
+		if (di >= MAX_REG_BYTES) break;
+		if (si< MAX_REG_BYTES && (src_mask &(1U<<si))) {
+			rs->bytes[dst][di] = rs->bytes[src][si];
+		} else {
+			rs->bytes[dst][di] = false;
 		}
 	}
+	//deal with higher bytes
+	for (int di = dst_off + n; di < MAX_REG_BYTES; di++) {
+		if (!(dst_mask & (1U << di))) continue;
+		if (zx) {
+			rs->bytes[dst][di] = false;
+		} else if (sx) {
+			rs->bytes[dst][di] = rs->bytes[src][src_off + n - 1];
+		}
+	}
+	rs->src_ip[dst] = 0;
 }
 
 void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2, uint16_t insn_id) {
@@ -166,12 +188,18 @@ void propagate_reg2reg_arith(RegShadow *rs, RegId dst, RegId src1, RegId src2, u
 
 //mem2mem
 
-void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, bool mem_tainted) {
+void propagate_mem2reg(RegShadow *rs, RegId dst, uint8_t dst_mask, uint8_t mem_taint_mask, bool overwrite) {
 	for (int i = 0; i < MAX_REG_BYTES; i++) {
 		if (dst_mask & (1U << i)) {
-			rs->bytes[dst][i] = mem_tainted;
+			bool t = (mem_taint_mask >> i) & 1u;
+			if (overwrite) {
+				rs->bytes[dst][i] = t;
+			} else{ 
+				rs->bytes[dst][i] |= t;
+			}
 		}
 	}
+	rs->src_ip[dst] = 0;
 }
 
 void reg_propagate_clear(RegShadow *rs, RegId rid) {
@@ -198,6 +226,16 @@ void meta_store(uint64_t pc, InsnMeta *meta) {
 InsnMeta *meta_lookup(uint64_t pc) {
 	return g_hash_table_lookup(g_meta_table, GUINT_TO_POINTER(pc));
 }
+//helper for AH/BH/CH/DH
+static void reg_op_span(x86_reg r, uint8_t size_bytes, uint8_t *off, uint8_t *mask) {
+	uint8_t o = (r==X86_REG_AH||r==X86_REG_BH||r==X86_REG_CH||r==X86_REG_DH) ? 1 : 0;
+	uint8_t m = 0;
+	for (uint8_t i = 0; i < size_bytes && (o + i) < MAX_REG_BYTES; i++) {
+		m |= 1u << (o + i);
+	}
+	*off = o;
+	*mask = m;
+}
 
 InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle) {
 	//disasm 1 instr and write it into hashtable
@@ -209,14 +247,39 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 	m->pc = pc;
 	m->size = insn->size;
 	m->insn_id = insn->id;
+	m->wr_reg = REG_INVALID;
+	m->rd_reg = REG_INVALID;
 	if (insn->detail) {
 		//lookup on W/R flag
 		cs_x86 *x86 = &insn->detail->x86;
 		for (int i = 0; i < x86->op_count; i++) {
 			cs_x86_op *op = &x86->operands[i];
 			if (op->type == X86_OP_MEM) {
-				if (op->access & CS_AC_READ) m->has_mem_read = true;
-				if (op->access & CS_AC_WRITE) m->has_mem_write = true;
+				int b = x86_reg_to_rid(op->mem.base);
+				int x = x86_reg_to_rid(op->mem.index);
+				if (b >= 0) m->mem_addr_reg_mask |= (1U << b);
+				if (x >= 0) m->mem_addr_reg_mask |= (1U << x);
+			} else if (op->type == X86_OP_REG) {
+				int rid = x86_reg_to_rid(op->reg);
+				if (rid < 0) continue;
+				uint8_t off, mask;
+				reg_op_span(op->reg, op->size, &off, &mask);
+				if (op->access & CS_AC_WRITE) {
+					m->regs_written_mask |= (1U << rid);
+					if (m->wr_reg < 0) {
+						m->wr_reg = rid;
+						m->wr_mask = mask;
+						m->wr_off = off;
+					}
+				}
+				if (op->access & CS_AC_READ) {
+					m->regs_read_mask |= (1U << rid);
+					if (m->rd_reg < 0) {
+						m->rd_reg = rid;
+						m->rd_mask = mask;
+						m->rd_off = off;
+					}
+				}
 			}
 		}
 		// Implicit regs
