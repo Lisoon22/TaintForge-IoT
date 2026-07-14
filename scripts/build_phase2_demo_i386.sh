@@ -19,8 +19,14 @@ as --32 -o "$OBJECT" "$SOURCE"
 ld -m elf_i386 -nostdlib -o "$OUTPUT" "$OBJECT"
 chmod 0755 "$OUTPUT"
 
-if ! file "$OUTPUT" | grep -q "ELF 32-bit LSB executable, Intel 80386"; then
-    echo "[-] Demo target is not an ELF32 i386 executable" >&2
+ELF_HEADER="$(LC_ALL=C readelf -hW "$OUTPUT")"
+if ! grep -Eq 'Class:[[:space:]]+ELF32' <<<"$ELF_HEADER" \
+    || ! grep -Eq 'Data:[[:space:]]+2.s complement, little endian' <<<"$ELF_HEADER" \
+    || ! grep -Eq 'Type:[[:space:]]+EXEC' <<<"$ELF_HEADER" \
+    || ! grep -Eq 'Machine:[[:space:]]+Intel 80386' <<<"$ELF_HEADER"; then
+    echo "[-] Demo target is not an ELF32 little-endian i386 executable" >&2
+    LC_ALL=C file "$OUTPUT" >&2 || true
+    printf '%s\n' "$ELF_HEADER" >&2
     exit 1
 fi
 

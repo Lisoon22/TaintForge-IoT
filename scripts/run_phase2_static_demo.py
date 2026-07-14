@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 
-SEED_PATH = Path("/tmp/taintforge-phase2-demo.ready")
+REQUIRED_FILE_PATH = "/tmp/taintforge-phase2-demo.ready"
+REQUIRED_REMOTE_IP = "198.51.100.10"
+REQUIRED_REMOTE_PORT = 48101
+SEED_PATH = Path(REQUIRED_FILE_PATH)
 
 
 class DemoError(RuntimeError):
@@ -40,6 +43,92 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise DemoError(f"JSON artifact is not an object: {path}")
     return raw
+
+
+def validate_bridge_contract(
+    *,
+    phase2_input_path: Path,
+    bridge_audit_path: Path,
+) -> dict[str, Any]:
+    phase2_input = load_json(phase2_input_path)
+    bridge_audit = load_json(bridge_audit_path)
+
+    file_dependencies = phase2_input.get("file_dependencies")
+    if not isinstance(file_dependencies, list):
+        raise DemoError("Phase 2 input has no file_dependencies array")
+    file_observed = any(
+        isinstance(item, dict)
+        and item.get("path") == REQUIRED_FILE_PATH
+        for item in file_dependencies
+    )
+
+    network_dependencies = phase2_input.get("network_dependencies")
+    if not isinstance(network_dependencies, list):
+        raise DemoError("Phase 2 input has no network_dependencies array")
+    network_observed = False
+    for item in network_dependencies:
+        if not isinstance(item, dict):
+            continue
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            item.get("ip") == REQUIRED_REMOTE_IP
+            and port == REQUIRED_REMOTE_PORT
+            and item.get("type") == "tcp"
+        ):
+            network_observed = True
+            break
+
+    raw_counts = bridge_audit.get("raw_counts")
+    normalized_counts = bridge_audit.get("normalized_counts")
+    if not isinstance(raw_counts, dict) or not isinstance(
+        normalized_counts,
+        dict,
+    ):
+        raise DemoError("bridge audit does not contain dependency counts")
+
+    raw_file_count = raw_counts.get("file_dependencies")
+    raw_network_count = raw_counts.get("network_events")
+    normalized_file_count = normalized_counts.get("file_dependencies")
+    normalized_network_count = normalized_counts.get("network_dependencies")
+
+    if not file_observed:
+        raise DemoError(
+            "Phase 1 -> Phase 2 bridge lost the required file dependency: "
+            f"{REQUIRED_FILE_PATH}"
+        )
+    if not network_observed:
+        raise DemoError(
+            "Phase 1 -> Phase 2 bridge lost the required TCP dependency: "
+            f"{REQUIRED_REMOTE_IP}:{REQUIRED_REMOTE_PORT}"
+        )
+    if not isinstance(raw_file_count, int) or raw_file_count < 1:
+        raise DemoError("Phase 1 reported zero file dependencies")
+    if not isinstance(raw_network_count, int) or raw_network_count < 1:
+        raise DemoError("Phase 1 reported zero network events")
+    if (
+        not isinstance(normalized_file_count, int)
+        or normalized_file_count != len(file_dependencies)
+    ):
+        raise DemoError("bridge file dependency count is inconsistent")
+    if (
+        not isinstance(normalized_network_count, int)
+        or normalized_network_count != len(network_dependencies)
+    ):
+        raise DemoError("bridge network dependency count is inconsistent")
+
+    return {
+        "required_file_observed": True,
+        "required_network_observed": True,
+        "raw_file_dependencies": raw_file_count,
+        "raw_network_events": raw_network_count,
+        "normalized_file_dependencies": normalized_file_count,
+        "normalized_network_dependencies": normalized_network_count,
+        "phase2_input": str(phase2_input_path),
+        "bridge_audit": str(bridge_audit_path),
+    }
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -135,6 +224,8 @@ def build_markdown(summary: dict[str, Any]) -> str:
         f"- Pipeline status: `{full['status']}`",
         f"- Phase 1 file dependencies: `{full['phase1_file_dependencies']}`",
         f"- Phase 1 network events: `{full['phase1_network_events']}`",
+        f"- Required file crossed bridge: `{full['bridge_contract']['required_file_observed']}`",
+        f"- Required network crossed bridge: `{full['bridge_contract']['required_network_observed']}`",
         f"- Milestone reached: `{full['milestone_reached']}`",
         f"- Evidence: `{full['evaluation']}`",
         "",
@@ -252,8 +343,6 @@ def main() -> int:
             "--network",
             "controlled",
             "--self-test-network",
-            "--target-spec",
-            str(target_spec),
             "--phase1-timeout",
             str(args.phase1_timeout),
             "--phase2-timeout",
@@ -269,13 +358,17 @@ def main() -> int:
         run_command(command, cwd=project_root)
 
         pipeline_report = load_json(full_dir / "pipeline_report.json")
-        full_evaluation_path = (
-            full_dir
-            / "phase2"
-            / "config"
-            / "target_state_evaluation.json"
+        bridge_contract = validate_bridge_contract(
+            phase2_input_path=full_dir / "phase2_input.json",
+            bridge_audit_path=full_dir / "bridge_audit.json",
         )
-        full_evaluation = load_json(full_evaluation_path)
+        phase2_dir = full_dir / "phase2"
+        full_evaluation = evaluate_target(
+            project_root=project_root,
+            run_dir=phase2_dir,
+            spec=target_spec,
+            expected_reached=True,
+        )
         if not full_evaluation.get("reached"):
             raise DemoError("full Phase 2 run did not reach the milestone")
 
@@ -362,6 +455,7 @@ def main() -> int:
                 "phase1_network_events": pipeline_report.get("phase1", {}).get(
                     "network_events"
                 ),
+                "bridge_contract": bridge_contract,
                 "milestone_reached": full_evaluation.get("reached"),
                 "evaluation": (
                     "full_pipeline/phase2/config/target_state_evaluation.json"

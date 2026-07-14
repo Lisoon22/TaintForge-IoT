@@ -43,23 +43,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from taintforge_env.report_generator import generate_report
-from taintforge_env.target_state_oracle import (
-    TargetStateError,
-    TargetStateOracle,
-    TargetStateSpec,
-)
 
-
-SCRIPT_VERSION = "0.5.0"
+SCRIPT_VERSION = "0.4.0"
 SUPPORTED_MACHINE = "Intel 80386"
-PHASE1_PLUGIN_SOURCE_NAMES = (
-    "qemu_unpacker.c",
-    "dta.c",
-    "trace.c",
-    "dse.c",
-    "dse_lift_x86.c",
-)
 
 
 class PipelineError(RuntimeError):
@@ -372,8 +358,9 @@ def build_phase1_plugin(
     gcc = require_program("gcc")
 
     source_paths = [
-        project_root / "unpacker" / name
-        for name in PHASE1_PLUGIN_SOURCE_NAMES
+        project_root / "unpacker" / "qemu_unpacker.c",
+        project_root / "unpacker" / "dta.c",
+        project_root / "unpacker" / "trace.c",
     ]
 
     missing_sources = [path for path in source_paths if not path.is_file()]
@@ -1290,9 +1277,6 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         f"- Markdown report: `{phase2.get('report_md')}`",
         f"- Runtime requirements: `{phase2.get('runtime_requirements')}`",
         f"- Repair plan: `{phase2.get('repair_plan')}`",
-        f"- Target-state evaluation: `{phase2.get('target_state_evaluation')}`",
-        f"- Milestone reached: `{phase2.get('milestone_reached')}`",
-        f"- Milestone reason: `{phase2.get('milestone_reason')}`",
         "",
         "## Current Limitations",
         "",
@@ -1367,14 +1351,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sysroot", default=None)
     parser.add_argument(
-        "--target-spec",
-        default=None,
-        help=(
-            "Versioned target-state JSON. When supplied, the unified pipeline "
-            "is successful only if the Phase 2 evidence satisfies this spec."
-        ),
-    )
-    parser.add_argument(
         "--phase1-isolation",
         choices=["netns", "none"],
         default="netns",
@@ -1439,16 +1415,6 @@ def main() -> int:
 
         elf = inspect_elf(sample)
         validate_sample(sample, elf)
-        target_spec: TargetStateSpec | None = None
-        target_spec_path: Path | None = None
-        if args.target_spec is not None:
-            target_spec_path = Path(args.target_spec).expanduser().resolve()
-            try:
-                target_spec = TargetStateSpec.load(target_spec_path)
-            except TargetStateError as exc:
-                raise PipelineError(
-                    f"Invalid target-state specification: {exc}"
-                ) from exc
         plugin = resolve_or_build_plugin(
             project_root=project_root,
             explicit=args.plugin,
@@ -1478,16 +1444,6 @@ def main() -> int:
         report["output_root"] = str(output_root)
         report["plugin"] = {"path": str(plugin), "sha256": sha256_file(plugin)}
         report["qemu"] = qemu
-        report["target_state"] = (
-            {
-                "required": True,
-                "goal_id": target_spec.goal_id,
-                "spec_path": str(target_spec_path),
-                "spec_sha256": target_spec.source_sha256,
-            }
-            if target_spec is not None
-            else {"required": False}
-        )
 
         print("[+] TaintForge-IoT temporary unified static pipeline")
         print(f"[+] project: {project_root}")
@@ -1613,23 +1569,6 @@ def main() -> int:
         phase2_report_md = phase2_out / "report.md"
         runtime_requirements = phase2_out / "config" / "runtime_requirements.json"
         repair_plan = phase2_out / "config" / "repair_plan.json"
-        target_evaluation_path = (
-            phase2_out / "config" / "target_state_evaluation.json"
-        )
-
-        target_evaluation = None
-        if target_spec is not None:
-            try:
-                target_evaluation = TargetStateOracle().evaluate(
-                    phase2_out,
-                    target_spec,
-                )
-            except TargetStateError as exc:
-                raise PipelineError(
-                    f"Target-state evaluation failed: {exc}"
-                ) from exc
-            target_evaluation.save(target_evaluation_path)
-            generate_report(phase2_out)
 
         report["phase2"] = {
             "status": "completed",
@@ -1652,29 +1591,9 @@ def main() -> int:
             "repair_plan": relative_or_absolute(repair_plan, output_root)
             if repair_plan.exists()
             else None,
-            "target_state_evaluation": relative_or_absolute(
-                target_evaluation_path,
-                output_root,
-            )
-            if target_evaluation_path.exists()
-            else None,
-            "milestone_reached": (
-                target_evaluation.reached
-                if target_evaluation is not None
-                else None
-            ),
-            "milestone_reason": (
-                target_evaluation.reason
-                if target_evaluation is not None
-                else None
-            ),
             "privileged_bind_workaround": privileged_bind_state,
             "network_decision": network_decision,
         }
-
-        if target_evaluation is not None and not target_evaluation.reached:
-            report["phase2"]["status"] = "milestone_not_reached"
-            raise PipelineError(target_evaluation.reason)
 
         report["status"] = "completed"
         print()

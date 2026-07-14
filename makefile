@@ -1,7 +1,10 @@
 PYTHON ?= python
 DEMO_ARGS ?=
+ANALYZE_OUT ?= workdir/static_analysis
+ANALYZE_NETWORK ?= auto
+ANALYZE_ARGS ?=
 
-.PHONY: doctor test demo-static clean
+.PHONY: doctor test demo-static analyze-static clean
 
 doctor:
 	@missing=0; \
@@ -38,6 +41,16 @@ test:
 
 demo-static:
 	PYTHONPATH=. $(PYTHON) scripts/run_phase2_static_demo.py --force $(DEMO_ARGS)
+
+analyze-static:
+	@if test -z "$(strip $(SAMPLE))"; then \
+		echo "usage: make analyze-static SAMPLE=/path/to/static-i386-elf" >&2; \
+		exit 2; \
+	fi
+	PYTHONPATH=. $(PYTHON) scripts/run_static_pipeline.py "$(SAMPLE)" \
+		--out "$(ANALYZE_OUT)" \
+		--network "$(ANALYZE_NETWORK)" \
+		--force $(ANALYZE_ARGS)
 
 clean:
 	rm -rf build workdir samples/phase2_demo_i386 samples/c2_record_client_x86_64

@@ -6,6 +6,10 @@ TaintForge-IoT is a research prototype for connecting dynamic unpacking and
 environment-dependency extraction with controlled re-execution, runtime
 observation, and environment synthesis.
 
+> **Reviewers:** follow the focused [Reviewer Guide](REVIEWER_GUIDE.md) to
+> install dependencies, run the reproducible experiment, inspect its evidence,
+> and analyze a reviewer-provided binary.
+
 The repository is under active development. The current unified launcher is an
 MVP integration path for **statically linked Linux i386 ELF files**.
 
@@ -109,11 +113,17 @@ The demo automatically:
 2. runs an empty-contract baseline in disconnected private namespaces;
 3. runs Phase 1 under `qemu-i386` and retains `unpacked.bin` and
    `unpacked.json`;
-4. synthesizes the Phase 2 filesystem and controlled network environment;
-5. evaluates a versioned target-state specification;
-6. repeats Phase 2 three times as a small stability check;
-7. writes `workdir/phase2_static_demo/demo_summary.json` and
+4. verifies that the required file and TCP endpoint crossed the compatibility
+   bridge into `phase2_input.json`;
+5. synthesizes the Phase 2 filesystem and controlled network environment;
+6. evaluates a versioned target-state specification;
+7. repeats Phase 2 three times as a small stability check;
+8. writes `workdir/phase2_static_demo/demo_summary.json` and
    `demo_summary.md`.
+
+The fixture is statically linked, so an empty `library_dependencies` array is
+expected for this demo. Empty file or network dependencies are treated as an
+experiment failure rather than silently accepted.
 
 The target milestone is emitted only after both of these requirements are
 satisfied:
@@ -124,6 +134,44 @@ satisfied:
 
 `198.51.100.0/24` is the TEST-NET-2 documentation range. Controlled mode does
 not forward the sample to that address on the Internet.
+
+## Analyze a reviewer-provided static binary
+
+The reproducible `demo-static` target deliberately uses the repository fixture
+and its versioned milestone specification. To run the complete Phase 1 to
+Phase 2 pipeline on another supported binary, use:
+
+```bash
+make analyze-static SAMPLE=/absolute/path/to/sample
+```
+
+The default output directory is `workdir/static_analysis`, and the default
+network selection is `auto`. Both can be changed without editing the Makefile:
+
+```bash
+make analyze-static \
+  SAMPLE=/absolute/path/to/sample \
+  ANALYZE_OUT=workdir/reviewer_sample \
+  ANALYZE_NETWORK=none
+```
+
+Additional unified-launcher options can be forwarded through `ANALYZE_ARGS`:
+
+```bash
+make analyze-static \
+  SAMPLE=/absolute/path/to/sample \
+  ANALYZE_ARGS='--qemu-source /home/user/qemu --phase2-timeout 90'
+```
+
+This command validates that the input is an executable, statically linked,
+little-endian ELF32 Intel 80386 file before Phase 1 starts. It writes the
+normalized dependency contract, bridge audit, Phase 2 evidence, and pipeline
+reports under `ANALYZE_OUT`.
+
+Unlike `make demo-static`, a generic analysis does not claim a
+binary-specific behavioral milestone: the repository cannot infer the
+intended successful behavior of an arbitrary program. Reviewers should use
+the generated reports and runtime evidence to assess their sample.
 
 ## Safety
 
@@ -275,8 +323,6 @@ gcc \
   unpacker/qemu_unpacker.c \
   unpacker/dta.c \
   unpacker/trace.c \
-  unpacker/dse.c \
-  unpacker/dse_lift_x86.c \
   -o build/qemu_unpacker.so \
   $(pkg-config --cflags --libs glib-2.0 capstone)
 ```
