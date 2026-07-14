@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use TaintForge-IoT in research, please cite this repository."
+title: "TaintForge-IoT: Taint-Guided Minimal Environment Modeling for IoT Malware Analysis"
+type: software
+authors:
+  - family-names: Voronin
+    given-names: Roman
+  - family-names: Mashanov
+    given-names: Artemii
+repository-code: "https://github.com/Lisoon22/TaintForge-IoT"
+version: 0.5.0
+date-released: 2026-07-14

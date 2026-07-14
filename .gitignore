@@ -10,3 +10,4 @@ samples/c2_record_client_x86_64
 samples/qemu_smoke/arm_write_exit
 samples/qemu_smoke/mipsel_write_exit
 samples/qemu_smoke/arm_connect_loopback
+samples/phase2_demo_i386

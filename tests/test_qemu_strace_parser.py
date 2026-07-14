@@ -38,6 +38,9 @@ class QemuStraceParserTests(unittest.TestCase):
         open_event = next(event for event in events if event["syscall"] == "openat")
         self.assertEqual(open_event["path"], "/etc/config")
         self.assertEqual(open_event["errno"], "ENOENT")
+        self.assertFalse(open_event["success"])
+        write_event = next(event for event in events if event["syscall"] == "write")
+        self.assertTrue(write_event["success"])
 
 
 if __name__ == "__main__":

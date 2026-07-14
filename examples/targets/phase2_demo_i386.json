@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "goal_id": "phase2_dependency_contract_satisfied",
+  "description": "The static i386 target opened its declared file, connected to its declared endpoint, and emitted the milestone marker.",
+  "mode": "all",
+  "rules": [
+    {
+      "id": "stdout_milestone",
+      "type": "text_contains",
+      "source": "stdout",
+      "needle": "TAINTFORGE_PHASE2_MILESTONE",
+      "min_count": 1
+    },
+    {
+      "id": "required_file_opened",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "open",
+        "path": "/tmp/taintforge-phase2-demo.ready",
+        "success": true
+      },
+      "min_count": 1
+    },
+    {
+      "id": "declared_endpoint_connected",
+      "type": "event_count",
+      "source": "syscall",
+      "where": {
+        "syscall": "connect",
+        "remote_ip": "198.51.100.10",
+        "remote_port": 48101,
+        "success": true
+      },
+      "min_count": 1
+    },
+    {
+      "id": "controlled_network_observed",
+      "type": "event_count",
+      "source": "network",
+      "where": {
+        "event": "tcp_connection_open",
+        "original_remote_ip": "198.51.100.10",
+        "original_remote_port": 48101
+      },
+      "min_count": 1
+    }
+  ]
+}

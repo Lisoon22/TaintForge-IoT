@@ -9,6 +9,11 @@ observation, and environment synthesis.
 The repository is under active development. The current unified launcher is an
 MVP integration path for **statically linked Linux i386 ELF files**.
 
+The canonical demonstration is a reproducible scientific experiment, not only
+a launcher smoke test. It compares an empty-contract baseline with a
+dependency-guided Phase 2 environment and requires an explicit target-state
+oracle to confirm success.
+
 > [!IMPORTANT]
 > The temporary unified pipeline does not yet execute `unpacked.bin` as a
 > restored process snapshot. Phase 1 produces a raw dump and metadata, while
@@ -69,6 +74,56 @@ readelf -lW samples/test_stat | grep INTERP || true
 
 Dynamic binaries, ARM, AArch64, MIPS, x86-64, fixed-address snapshot replay,
 and register restoration are not supported by this temporary launcher.
+
+## Scientific static Phase 2 demo
+
+The demo tests the following scoped claim:
+
+> For the controlled static i386 target, the dependency contract observed in
+> Phase 1 enables Phase 2 to synthesize a trace-relative sufficient environment
+> that reaches an analyst-defined behavioral milestone, while the empty-contract
+> baseline does not.
+
+It does **not** claim that the generated environment is subset-minimal, that
+the raw `unpacked.bin` is executable, or that the local responder implements a
+real malware C2 protocol.
+
+Run the complete experiment from a clean checkout:
+
+```bash
+make doctor
+make test
+make demo-static
+```
+
+Optional launcher arguments can be forwarded without editing the Makefile. For
+example:
+
+```bash
+make demo-static DEMO_ARGS='--qemu-source /home/user/qemu --repetitions 5'
+```
+
+The demo automatically:
+
+1. builds a libc-independent static ELF32 i386 target;
+2. runs an empty-contract baseline in disconnected private namespaces;
+3. runs Phase 1 under `qemu-i386` and retains `unpacked.bin` and
+   `unpacked.json`;
+4. synthesizes the Phase 2 filesystem and controlled network environment;
+5. evaluates a versioned target-state specification;
+6. repeats Phase 2 three times as a small stability check;
+7. writes `workdir/phase2_static_demo/demo_summary.json` and
+   `demo_summary.md`.
+
+The target milestone is emitted only after both of these requirements are
+satisfied:
+
+- `/tmp/taintforge-phase2-demo.ready` exists inside the synthesized rootfs;
+- `connect(198.51.100.10:48101)` succeeds through the controlled local
+  responder.
+
+`198.51.100.0/24` is the TEST-NET-2 documentation range. Controlled mode does
+not forward the sample to that address on the Internet.
 
 ## Safety
 
@@ -151,13 +206,6 @@ git clone https://github.com/Lisoon22/TaintForge-IoT.git
 cd TaintForge-IoT
 ```
 
-Install the unified launcher:
-
-```bash
-cp /path/to/run_static_pipeline_v2.py scripts/run_static_pipeline.py
-chmod +x scripts/run_static_pipeline.py
-```
-
 Check the launcher:
 
 ```bash
@@ -210,7 +258,7 @@ PYTHONPATH=. python scripts/run_static_pipeline.py \
 The equivalent current build command is:
 
 ```bash
-cd /home/lisoon/taintforge
+cd TaintForge-IoT
 
 mkdir -p build
 
@@ -227,6 +275,8 @@ gcc \
   unpacker/qemu_unpacker.c \
   unpacker/dta.c \
   unpacker/trace.c \
+  unpacker/dse.c \
+  unpacker/dse_lift_x86.c \
   -o build/qemu_unpacker.so \
   $(pkg-config --cflags --libs glib-2.0 capstone)
 ```
@@ -252,10 +302,13 @@ PYTHONPATH=. python scripts/run_static_pipeline.py \
 
 ## Quick start
 
+For the scientific baseline/full/stability experiment, prefer `make demo-static`.
+The commands below remain useful for lower-level diagnostics.
+
 ### Stable smoke test without network emulation
 
 ```bash
-cd /home/lisoon/taintforge
+cd TaintForge-IoT
 
 PYTHONPATH=. python scripts/run_static_pipeline.py \
   samples/test_stat \
@@ -269,7 +322,7 @@ PYTHONPATH=. python scripts/run_static_pipeline.py \
 ### Full current network path for non-loopback dependencies
 
 ```bash
-cd /home/lisoon/taintforge
+cd TaintForge-IoT
 
 PYTHONPATH=. python scripts/run_static_pipeline.py \
   samples/test_stat \
@@ -284,6 +337,10 @@ PYTHONPATH=. python scripts/run_static_pipeline.py \
 `--network auto` selects the existing Phase 2 mode from the normalized network
 dependencies. For a sample with no network dependencies, the effective mode may
 be `none`.
+
+`none` now means a disconnected private network namespace. It is not an alias
+for the host network. Runtime evidence is written to `runtime_status.json` and
+`security_status.json`.
 
 ### Explicit prebuilt plugin
 
@@ -463,6 +520,7 @@ workdir/report_demo_static/
         ├── rootfs_diff.json
         ├── runtime_requirements.json
         ├── repair_plan.json
+        ├── target_state_evaluation.json
         └── observation_lifecycle.json
 ```
 
@@ -543,10 +601,7 @@ PYTHONPATH=. python scripts/run_sample.py \
 Run the Python test suite:
 
 ```bash
-PYTHONPATH=. python -m unittest discover \
-  -s tests \
-  -p 'test_*.py' \
-  -v
+make test
 ```
 
 Check the unified launcher syntax:
@@ -559,7 +614,7 @@ python -m py_compile scripts/run_static_pipeline.py
 
 ### `Could not find the compiled QEMU plugin`
 
-With launcher version `0.2.0`, the plugin is built automatically. Check:
+The current launcher builds the plugin automatically. Check:
 
 ```bash
 ls -l build/qemu_unpacker.so
@@ -637,12 +692,13 @@ tail -n 100 workdir/<run>/logs/phase1_stdout.log
 Verify the plugin directly:
 
 ```bash
+PROJECT_ROOT="$(pwd)"
 mkdir -p /tmp/tf-phase1-smoke
 cd /tmp/tf-phase1-smoke
 
 qemu-i386 \
-  -plugin /home/lisoon/taintforge/build/qemu_unpacker.so \
-  /home/lisoon/taintforge/samples/test_stat
+  -plugin "$PROJECT_ROOT/build/qemu_unpacker.so" \
+  "$PROJECT_ROOT/samples/test_stat"
 
 ls -l unpacked.bin unpacked.json
 ```
@@ -669,6 +725,10 @@ progress reporting. It does not yet provide:
 - ARM or MIPS Phase 1 support;
 - production-grade DTA/DSE;
 - automatic application and validation of the passive repair plan.
+
+The static demo demonstrates trace-relative sufficiency for a controlled
+fixture. It does not constitute malware-family evaluation, protocol-semantic
+rehosting, or a proof of environment minimality.
 
 The next execution milestone is to replace the temporary
 `original static ELF + Phase 1 metadata` bridge with a validated reconstructed

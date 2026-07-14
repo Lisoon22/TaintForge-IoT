@@ -1,0 +1,14 @@
+{
+  "oep": "0x8049000",
+  "arch": "x86",
+  "base": "0x8048000",
+  "regions": [],
+  "file_dependencies": [],
+  "network_dependencies": [],
+  "library_dependencies": [],
+  "anti_analysis": {
+    "cpuinfo_check": false,
+    "uname_check": false,
+    "ptrace_traceme": false
+  }
+}

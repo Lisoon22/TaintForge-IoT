@@ -2,6 +2,7 @@ from __future__ import annotations
 import textwrap
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,9 @@ class Phase2Orchestrator:
         )
         self.repair_plan_path = self.config_dir / "repair_plan.json"
         self.network_runner_path = self.config.out_dir / "run_network_sandbox.sh"
+        self.disconnected_runner_path = (
+            self.config.out_dir / "run_disconnected_sandbox.sh"
+        )
         self.run_manifest_path = self.config_dir / "run_manifest.json"
         self.copied_egress_policy_path = self.config_dir / "egress_policy.json"
         self.copied_record_policy_path = self.config_dir / "c2_record_policy.json"
@@ -93,9 +97,7 @@ class Phase2Orchestrator:
             raise OrchestratorError(f"Unsupported observation phase: {phase}")
 
         print(f"[+] Runtime observation phase: {phase}")
-        self.run_command(
-            [
-                "sudo",
+        command = [
                 "env",
                 f"PYTHONPATH={self.project_root}",
                 sys.executable,
@@ -106,7 +108,9 @@ class Phase2Orchestrator:
                 "--rootfs",
                 str(self.rootfs_dir),
             ]
-        )
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command)
 
 
 
@@ -292,6 +296,7 @@ class Phase2Orchestrator:
             "chroot",
             "mount",
             "unshare",
+            "ip",
             "hostname",
             "bash",
         ]
@@ -530,6 +535,8 @@ class Phase2Orchestrator:
             NetworkMode.BROKERED_RECORD,
         }:
             self.generate_network_runner()
+        elif self.config.network_mode == NetworkMode.NONE:
+            self.generate_disconnected_runner()
         else:
             print("[+] Network sandbox runner skipped")
 
@@ -658,7 +665,27 @@ class Phase2Orchestrator:
             ]
         )
 
+    def generate_disconnected_runner(self) -> None:
+        print("[+] Generating disconnected sandbox runner")
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/generate_sandbox_runner.py",
+                "--runtime",
+                str(self.runtime_path),
+                "--out",
+                str(self.disconnected_runner_path),
+                "--timeout",
+                str(self.config.timeout_seconds),
+                "--network-mode",
+                "none",
+            ]
+        )
+
     def ensure_sudo(self) -> None:
+        if os.geteuid() == 0:
+            print("[+] Already running with root privileges")
+            return
         print("[+] Checking sudo")
         self.run_command(["sudo", "-v"])
 
@@ -1204,81 +1231,29 @@ class Phase2Orchestrator:
         return False
     
     def run_sample_direct(self) -> None:
-        print("[+] Running sample directly without network sandbox")
-
-        runtime = json.loads(self.runtime_path.read_text(encoding="utf-8"))
-
-        rootfs = Path(runtime["rootfs"])
-        if not rootfs.is_absolute():
-            rootfs = self.project_root / rootfs
-
-        guest_binary = runtime.get("guest_binary", "/bin/unpacked.elf")
-        qemu_required = bool(runtime.get("qemu_required", False))
-
-        if qemu_required:
+        print("[+] Running sample in disconnected private namespaces")
+        if not self.disconnected_runner_path.is_file():
             raise OrchestratorError(
-                "Direct run for qemu_required=True is not implemented yet. "
-                "Use controlled network mode or add direct QEMU launcher."
+                "Disconnected sandbox runner was not generated"
             )
 
-        proc_dir = rootfs / "proc"
-        proc_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["bash", str(self.disconnected_runner_path)],
+            cwd=self.project_root,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise OrchestratorError(
+                "Disconnected sandbox infrastructure failed with code "
+                f"{result.returncode}; inspect logs/runtime_stderr.log"
+            )
 
-        stdout_path = self.logs_dir / "runtime_stdout.log"
-        stderr_path = self.logs_dir / "runtime_stderr.log"
-        strace_base = self.logs_dir / "strace"
-
-        mounted_proc = False
-
-        try:
-            if not proc_dir.is_mount():
-                self.run_command([
-                    "sudo",
-                    "mount",
-                    "-t",
-                    "proc",
-                    "proc",
-                    str(proc_dir),
-                ])
-                mounted_proc = True
-
-            cmd = [
-                "sudo",
-                "timeout",
-                str(self.config.timeout_seconds),
-                "strace",
-                "-ff",
-                "-o",
-                str(strace_base),
-                "chroot",
-                str(rootfs),
-                guest_binary,
-            ]
-
-            print("[cmd]", " ".join(cmd))
-
-            with stdout_path.open("w", encoding="utf-8") as stdout_file, \
-                stderr_path.open("w", encoding="utf-8") as stderr_file:
-                result = subprocess.run(
-                    cmd,
-                    cwd=self.project_root,
-                    text=True,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                )
-
-            if result.returncode != 0:
-                print(
-                    f"[!] Direct sample runner exited with code {result.returncode}. "
-                    "For malware this can be normal: crash/timeout/non-zero exit."
-                )
-
-        finally:
-            if mounted_proc:
-                self.run_command(
-                    ["sudo", "umount", str(proc_dir)],
-                    check=False,
-                )
+        runtime_status = self.logs_dir / "runtime_status.json"
+        security_status = self.logs_dir / "security_status.json"
+        if not runtime_status.is_file() or not security_status.is_file():
+            raise OrchestratorError(
+                "Disconnected sandbox did not produce status evidence"
+            )
 
     def run_sample(self) -> None:
         print("[+] Running sample")
@@ -1338,17 +1313,14 @@ class Phase2Orchestrator:
         if not self.config.out_dir.exists():
             return
 
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-
-        if not user:
-            return
+        user = self.invoking_user()
 
         print("[+] Fixing output ownership")
 
-        self.run_command(
-            ["sudo", "chown", "-R", f"{user}:{user}", str(self.config.out_dir)],
-            check=False,
-        )
+        command = ["chown", "-R", f"{user}:{user}", str(self.config.out_dir)]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command, check=False)
 
 
     def make_runtime_artifacts_readable(self) -> None:
@@ -1362,25 +1334,31 @@ class Phase2Orchestrator:
         if not self.logs_dir.exists():
             return
 
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-
-        if not user:
-            raise OrchestratorError(
-                "Cannot determine invoking user for runtime artifact ownership"
-            )
+        user = self.invoking_user()
 
         print("[+] Normalizing runtime artifact ownership")
 
-        self.run_command(
-            [
-                "sudo",
-                "chown",
-                "-R",
-                f"{user}:{user}",
-                str(self.logs_dir),
-            ],
-            check=True,
-        )
+        command = [
+            "chown",
+            "-R",
+            f"{user}:{user}",
+            str(self.logs_dir),
+        ]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command, check=True)
+
+    @staticmethod
+    def invoking_user() -> str:
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+        if user:
+            return user
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError as exc:
+            raise OrchestratorError(
+                "Cannot determine invoking user for artifact ownership"
+            ) from exc
 
     def print_build_summary(self) -> None:
         print()
