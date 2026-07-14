@@ -9,15 +9,21 @@
 #include "trace.h"
 #include "aux_trace.h"
 
+#define MAX_SLICE 512U
+
 typedef enum {
 	SYM_CONST,
 	SYM_VAR,
 
 	SYM_ADD,
 	SYM_SUB,
+	SYM_MUL,
 	SYM_XOR,
 	SYM_AND,
 	SYM_SHL,
+	SYM_LSHR, //logic
+	SYM_ASHR, //arith
+
     
 	SYM_EXTRACT, 	/* extract low from high bytes*/
 	SYM_ZEXT,	/* extend low to high with zeroes*/
@@ -92,6 +98,8 @@ SymExpr *dse_load_mem (DSECtx *ctx, const InsnAux *aux, uint32_t width_bits, boo
 void dse_store_mem(DSECtx *ctx, const InsnAux *aux, SymExpr *val, bool big_endian);
 void dse_set_reg (DSECtx *ctx, int rid, SymExpr *val, uint32_t natural_w);
 void dse_commit_low(DSECtx *ctx, const InsnAux *aux, int rid, SymExpr *val, uint32_t w, uint32_t natural_w);
+SymExpr *dse_read_rid_slice(DSECtx *ctx, const InsnAux *aux, int rid, uint32_t low_bit, uint32_t width, uint32_t natural_width);
+bool dse_commit_slice(DSECtx *ctx, const InsnAux *aux, int rid, SymExpr *value, uint32_t low_bit, uint32_t width,uint32_t natural_width);
 
 //init and basic operands DSE
 SymExpr *sym_expr_const(uint64_t val, uint32_t width);

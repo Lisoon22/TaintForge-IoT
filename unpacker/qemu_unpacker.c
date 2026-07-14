@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <qemu-plugin.h>
+#include <math.h>
 #include "dta.h"
 #include <capstone/capstone.h>
 #include <sys/socket.h>
@@ -13,6 +14,14 @@
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 static size_t page_size = 4096;
+
+//OEP scoring
+#define W_DSE    0.70
+#define W_UNMAP  0.20
+#define W_PROL   0.10
+#define W_ACTIVE (W_DSE + W_UNMAP + W_PROL)
+//tolerance
+#define SCORE_EPS 1e-9
 
 typedef enum {
 	ARCH_X86_32,
@@ -42,6 +51,8 @@ typedef struct {
 	bool dse_confirmed;
 	uint32_t dse_concretized;
 	uint32_t dse_total;
+	bool has_prologue;
+	bool jump_from_unmapped;
 } oep_cand_t;
 
 //got table reconstruct helper
@@ -103,6 +114,8 @@ static __thread uint64_t prev_jump_site = 0;
 static __thread int prev_target_reg = REG_INVALID;
 static __thread uint64_t prev_mem_taddr = 0;
 static __thread bool prev_jump_pending = false;
+static __thread uint64_t prev_mem_target_value = 0;
+static __thread bool prev_mem_target_valid = false;
 
 typedef struct {
 	bool active;
@@ -225,6 +238,15 @@ static const char *base_name(const char *path) {
 	if (!path) return NULL;
 	const char *s = strrchr(path, '/');
 	return s ? s + 1 : path;
+}
+
+static bool syscall_ret_is_error(int64_t ret)
+{
+    if (is_i386) {
+        const uint32_t raw_ret = (uint32_t)ret;
+        return raw_ret >= UINT32_MAX - 4094U;
+    }
+    return ret < 0;
 }
 
 static void record_resolved_import(uint64_t got_slot, uint64_t resolved_addr) {
@@ -396,24 +418,118 @@ static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_
 		cs_free(insn, n);
 		if (!ok) return false;
 	}
-	uint64_t v = 0;
 	GByteArray *arr = g_byte_array_new();
-	if (qemu_plugin_read_memory_vaddr(taddr, arr, 4))
-		for (int i = 0; i < 4 && i < (int)arr->len; i++)
-			v |= (uint64_t)arr->data[i] << (8 * i);
+	bool read_ok = qemu_plugin_read_memory_vaddr(taddr, arr, 4);
+	if (!read_ok || arr->len < 4) {
+		g_byte_array_free(arr, TRUE);
+		return false;
+	}
+
+	uint64_t value = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		value |= (uint64_t)arr->data[i] << (8 * i);
+	}
 	g_byte_array_free(arr, TRUE);
+
 	*out_addr = taddr;
-	*out_val  = v;
+	*out_val = value;
 	return true;
 }
 //separate rewrite and change
 static inline bool insn_overwrites_dst(uint16_t id) {
 	switch (id) {
-		case X86_INS_MOV: case X86_INS_MOVZX: case X86_INS_MOVSX: case X86_INS_POP: case X86_INS_LEA:
+		case X86_INS_MOV: case X86_INS_MOVZX: case X86_INS_MOVSX: case X86_INS_POP: case X86_INS_LEA: case X86_INS_XCHG:
 			return true;
 		default:
 			return false;
 	}
+}
+// xchg reg, reg
+static bool taint_xchg_reg_reg(uint64_t vaddr, const InsnMeta *meta) {
+	if (!meta || meta->insn_id != X86_INS_XCHG || meta->has_mem_read || meta->has_mem_write || meta->size == 0 || meta->size > 15) {
+		return false;
+	}
+
+	uint8_t code[16] = {0};
+	GByteArray *instruction_bytes = g_byte_array_new();
+	if (!instruction_bytes)	return false;
+
+	bool read_ok = qemu_plugin_read_memory_vaddr(vaddr, instruction_bytes, meta->size);
+
+	if (!read_ok || instruction_bytes->len < meta->size) {
+		g_byte_array_free(instruction_bytes, TRUE);
+		return false;
+	}
+
+	memcpy(code, instruction_bytes->data, meta->size);
+	g_byte_array_free(instruction_bytes, TRUE);
+
+	cs_insn *decoded = NULL;
+	size_t decoded_count = cs_disasm(cs_handle,code, meta->size, vaddr, 1, &decoded);
+	if (decoded_count != 1 || !decoded || !decoded->detail) {
+		if (decoded) {
+			cs_free(decoded, decoded_count);
+		}
+		return false;
+	}
+
+	const cs_x86 *x86 = &decoded->detail->x86;
+	if (x86->op_count != 2) {
+		cs_free(decoded, decoded_count);
+		return false;
+	}
+
+	const cs_x86_op *left =&x86->operands[0];
+	const cs_x86_op *right = &x86->operands[1];
+	if (left->type != X86_OP_REG || right->type != X86_OP_REG || left->size == 0 || left->size != right->size) {
+		cs_free(decoded, decoded_count);
+		return false;
+	}
+
+	int left_rid = x86_reg_to_rid(left->reg);
+	int right_rid = x86_reg_to_rid(right->reg);
+	if (left_rid < 0 || left_rid >= REG_COUNT || right_rid < 0 || right_rid >= REG_COUNT) {
+		cs_free(decoded, decoded_count);
+		return false;
+	}
+
+	uint32_t operand_bytes = (uint32_t)left->size;
+
+	if (operand_bytes == 0 || operand_bytes > 4) {
+		cs_free(decoded, decoded_count);
+		return false;
+	}
+
+	uint32_t left_offset = 0;
+	uint32_t right_offset = 0;
+
+	if (left->reg == X86_REG_AH || left->reg == X86_REG_BH || left->reg == X86_REG_CH || left->reg == X86_REG_DH) {
+		left_offset = 1;
+	}
+
+	if (right->reg == X86_REG_AH || right->reg == X86_REG_BH || right->reg == X86_REG_CH || right->reg == X86_REG_DH) {
+		right_offset = 1;
+	}
+
+	if ((left_offset + operand_bytes) > 4 || (right_offset + operand_bytes) > 4) {
+		cs_free( decoded, decoded_count);
+		return false;
+	}
+	uint8_t left_taint[4] = {0};
+	uint8_t right_taint[4] = {0};
+	for (uint32_t i = 0; i < operand_bytes; i++) {
+		left_taint[i] = reg_shadow.bytes[left_rid][left_offset + i];
+
+		right_taint[i] =reg_shadow.bytes[right_rid][right_offset + i];
+	}
+	for (uint32_t i = 0; i < operand_bytes; i++) {
+		reg_shadow.bytes[left_rid][left_offset + i] = right_taint[i];
+
+		reg_shadow.bytes[right_rid][right_offset + i] = left_taint[i];
+	}
+	cs_free(decoded, decoded_count);
+
+	return true;
 }
 
 static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
@@ -489,6 +605,120 @@ static void lib_update_mapping(uint32_t fd, uint64_t addr, uint64_t size) {
 	}
 }
 
+static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_addr){
+	if (!pending || !pending->active || pending->size == 0) {
+		return;
+	}
+	if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
+		fprintf(stderr,"[MMAP] invalid page size: 0x%lx\n",(unsigned long)page_size);
+		return;
+	}
+	if ((pending->size - 1) > UINT64_MAX - mapped_addr) {
+		fprintf(stderr,"[MMAP] range overflow: addr=0x%lx size=0x%lx\n", (unsigned long)mapped_addr, (unsigned long)pending->size);
+		return;
+	}
+	const char *name = (pending->syscall_num == 192) ? "mmap2" : "mmap";
+
+	fprintf(stderr, "[SYSCALL] %s requested=0x%lx mapped=0x%lx size=0x%lx prot=0x%x flags=0x%x fd=%d offset=0x%lx\n", name, (unsigned long)pending->requested_addr, (unsigned long)mapped_addr, (unsigned long)pending->size, pending->prot, pending->flags, pending->fd, (unsigned long)pending->offset);
+	lib_update_mapping((uint32_t)pending->fd, mapped_addr, pending->size);
+
+	if (!(pending->prot & 0x2) && !(pending->prot & 0x4)) return;
+
+	uint64_t page_mask = (uint64_t)page_size - 1;
+	uint64_t last_addr = mapped_addr + pending->size - 1;
+	uint64_t page_start = mapped_addr & ~page_mask;
+	uint64_t page_last = last_addr & ~page_mask;
+
+	for (uint64_t addr = page_start;; addr += page_size) {
+		gpointer key = (gpointer)(uintptr_t)addr;
+		page_t *p = g_hash_table_lookup(pages, key);
+
+		if (p) {
+			p->prot = pending->prot;
+		} else {
+			p = g_new0(page_t, 1);
+			p->prot = pending->prot;
+			g_hash_table_insert(pages, key, p);
+		}
+
+		if ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key)) {
+			p->dyn_exec = true;
+			p->gen_written = g_unpack_gen;
+
+			if (g_layer_has_cand) {
+				g_layer_dirty = true;
+			}
+		}
+		if (addr == page_last) {
+			break;
+		}
+	}
+}
+
+static void apply_pending_mprotect(const pending_mmap_t *pending) {
+	if (!pending || !pending->active || pending->size == 0) {
+		return;
+	}
+	
+	uint64_t addr = pending->requested_addr;
+	uint64_t size = pending->size;
+	int prot = pending->prot;
+	uint64_t page_mask = (uint64_t)page_size - 1;
+	uint64_t page_start = addr & ~page_mask;
+	uint64_t page_end = (addr + size + page_size - 1) & ~page_mask;
+
+	fprintf(stderr, "[SYSCALL] mprotect(0x%lx, 0x%lx, prot=0x%x)\n", (unsigned long)addr, (unsigned long)size, prot);
+
+	for (uint64_t page_addr = page_start; page_addr < page_end; page_addr += page_size) {
+		gpointer key = (gpointer)(uintptr_t)page_addr;
+		page_t *p = g_hash_table_lookup(pages, key);
+
+		if (p) {
+			p->prot = prot;
+		} else {
+			p = g_new0(page_t, 1);
+			p->prot = prot;
+			g_hash_table_insert(pages, key, p);
+		}
+		if (p->written && (prot & 0x4)) {
+			p->exec_after_write = true;
+		}
+		if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, key)) {
+			p->dyn_exec = true;
+			p->gen_written = g_unpack_gen;
+
+			if (g_layer_has_cand) {
+				g_layer_dirty = true;
+			}
+		}
+	}
+}
+
+static void apply_pending_munmap(const pending_mmap_t *pending) {
+	if (!pending || !pending->active || pending->size == 0) {
+		return;
+	}
+
+	uint64_t addr = pending->requested_addr;
+	uint64_t size = pending->size;
+	uint64_t page_mask = (uint64_t)page_size - 1;
+	uint64_t page_start = addr & ~page_mask;
+	uint64_t page_end = (addr + size + page_size - 1) & ~page_mask;
+
+	for (uint64_t page_addr = page_start; page_addr < page_end; page_addr += page_size) {
+		gpointer key = (gpointer)(uintptr_t)page_addr;
+		g_hash_table_add(unmapped_pages, key);
+
+		page_t *p = g_hash_table_lookup(pages, key);
+		if (p) {
+			g_hash_table_remove(pages, key);
+			g_free(p->wbitmap);
+			g_free(p);
+		}
+	}
+	fprintf(stderr, "[SYSCALL] munmap(0x%lx, 0x%lx)\n", (unsigned long)addr, (unsigned long)size);
+}
+
 static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 	for (GList *l = file_deps; l; l = l->next) {
 		file_dep_t *f = (file_dep_t*)l->data;
@@ -556,6 +786,8 @@ static GString *saved_reg = NULL;
 static uint64_t saved_base = 0;
 static bool saved_base_set = false;
 static uint64_t saved_oep = 0;
+static double g_oep_confidence = 0.0;
+static GString *g_oep_scoring = NULL;
 static bool image_captured = false;
 static bool g_static_binary = false;
 
@@ -585,17 +817,113 @@ static bool cand_in_main_image(const oep_cand_t *c) {
 
 //part of the concrete to total to determine the most accurate OEP
 static double cand_dse_ratio(const oep_cand_t *c) {
-	if (!c || c->dse_total == 0) return 0.0;
-	return (double)c->dse_concretized / (double)c->dse_total;
+	if (!c || c->dse_total == 0) return 1.0;
+	uint32_t failed = c->dse_concretized;
+	if (failed > c->dse_total) {
+		failed = c->dse_total;
+	}
+	return (double)failed / (double)c->dse_total;
 }
-//DSE strongest: 1. conc amount; 2. conc ratio; 3. unpack generation
+//check overall measurements
+static double cand_dse_strength(const oep_cand_t *c)
+{
+	if (!c || !c->dse_confirmed || c->dse_total == 0) return 0.0;
+	//lifting coverage
+	double quality = 1.0 - cand_dse_ratio(c);
+	uint32_t depth_total =c->dse_total;
+
+	if (depth_total > MAX_SLICE) {
+		depth_total = MAX_SLICE;
+	}
+	//depth check
+	double depth = log1p((double)depth_total) / log1p((double)MAX_SLICE);
+
+	return quality * depth;
+}
+//comparison of measurements
 static bool cand_stronger(const oep_cand_t *a, const oep_cand_t *b) {
-	if (a->dse_concretized != b->dse_concretized)
-		return a->dse_concretized > b->dse_concretized;
-	double ra = cand_dse_ratio(a), rb = cand_dse_ratio(b);
-	if (ra != rb) return ra > rb;
-	if (a->generation != b->generation) return a->generation > b->generation;
-	return a->icount < b->icount;
+	double strength_a = cand_dse_strength(a);
+	double strength_b = cand_dse_strength(b);
+	if (strength_a != strength_b) {
+		return strength_a > strength_b;
+	}
+	if (a->dse_confirmed && b->dse_confirmed) {
+		if (a->dse_total != b->dse_total) {
+			return a->dse_total > b->dse_total;
+		}
+		double ratio_a = cand_dse_ratio(a);
+		double ratio_b = cand_dse_ratio(b);
+		if (ratio_a != ratio_b) {
+			return ratio_a < ratio_b;
+		}
+	}
+
+	if (a->jump_from_unmapped != b->jump_from_unmapped) {
+		return a->jump_from_unmapped;
+	}
+	if (a->has_prologue != b->has_prologue) {
+		return a->has_prologue;
+	}
+	if (a->icount != b->icount) {
+		return a->icount < b->icount;
+	}
+	return a->addr < b->addr;
+}
+//read first bytes at candidate addr and checks prologue: push ebp; mov ebp,esp or endbr32
+static bool cand_has_prologue(uint64_t addr) {
+	uint8_t p[4];
+	if (!guest_read_bytes(addr, p, 4)) return false;
+	if (p[0] == 0x55 && p[1] == 0x89 && p[2] == 0xe5) return true;              //push ebp;mov ebp,esp
+	if (p[0] == 0xf3 && p[1] == 0x0f && p[2] == 0x1e && p[3] == 0xfb) return true; //endbr32
+	return false;
+}
+//trying to determine jump from basic code or stub
+static bool jump_site_is_unpacker(uint64_t jump_site) {
+	if (jump_site == 0) return false; //don't know source
+	uint64_t pg = jump_site & ~(page_size - 1);
+	page_t *jp = g_hash_table_lookup(pages, (gpointer)(uintptr_t)pg);
+	if (!jp) return true; //stub munmapped, high chanse of attempt to hide stub
+	if (jp->dyn_exec && !addr_in_lib(jump_site)) return true;//alloc on address of previously used page
+	if (jp->written && jp->exec_after_write) return true; //write then execute
+	return false; //ordinary page
+}
+
+//OEP scroing counting
+static double cand_score(const oep_cand_t *c) {
+	if (!c) return 0.0;
+	double s_dse = cand_dse_strength(c);
+	double s_prologue = c->has_prologue ? 1.0: 0.0;
+	double s_unmap = c->jump_from_unmapped ? 1.0 : 0.0;
+	return W_DSE * s_dse + W_UNMAP * s_unmap + W_PROL * s_prologue;
+}
+//tiebreak, SCORE_EPS difference
+static bool cand_score_better(const oep_cand_t *a,const oep_cand_t *b) {
+	double score_a =cand_score(a);
+	double score_b =cand_score(b);
+	if (score_a - score_b > SCORE_EPS) return true;
+	if (score_b - score_a > SCORE_EPS) return false;
+	return cand_stronger(a, b);
+}
+//confidence in [0,1]
+static double cand_confidence(const oep_cand_t *c){
+	if (W_ACTIVE <= 0.0) return 0.0;
+
+	return cand_score(c) /W_ACTIVE;
+}
+
+static bool cand_rank_better(
+	const oep_cand_t *a,
+	const oep_cand_t *b)
+{
+	if (!a) return false;
+	if (!b) return true;
+	bool a_in_main = cand_in_main_image(a);
+	bool b_in_main = cand_in_main_image(b);
+	if (a_in_main != b_in_main) {
+		return a_in_main;
+	}
+
+	return cand_score_better(a,b);
 }
 
 //union of oep choosing
@@ -603,26 +931,11 @@ static oep_cand_t *choose_oep_cand(void) {
 	oep_cand_t *best = NULL;
 	for (GList *l = oep_cands; l; l = l->next) {
 		oep_cand_t *c = (oep_cand_t*)l->data;
-		if (!cand_in_main_image(c) || !c->dse_confirmed) continue;
-		if (!best || cand_stronger(c, best)) {
+		if (!best || cand_rank_better(c, best)) {
 			best = c;
-			continue;
 		}
 	}
-	//fallback
-	if (best) return best;
-	oep_cand_t *fb = NULL, *last_any = NULL;
-	for (GList *l = oep_cands; l; l = l->next) {
-		oep_cand_t *c = (oep_cand_t*)l->data;
-		last_any = c;
-		if (!cand_in_main_image(c)) continue;
-		if (!fb || cand_stronger(c, fb)) {
-			fb = c;
-			continue;
-		}
-	}
-	if (fb) return fb;     //fallback1
-	return last_any;       //fallback2
+	return best;
 }
 
 //auxv PT_LOAD union, main logic
@@ -920,6 +1233,8 @@ static void write_report(void) {
 	fprintf(f_json, "{\n");
 	fprintf(f_json, "  \"oep\": \"0x%lx\",\n", saved_oep);
 	fprintf(f_json, "  \"arch\": \"x86\",\n");
+	fprintf(f_json, "  \"oep_confidence\": %.4f,\n", g_oep_confidence);
+	if (g_oep_scoring) fprintf(f_json, "%s", g_oep_scoring->str);
 	fprintf(f_json, "  \"base\": \"0x%lx\",\n", saved_base);
 	fprintf(f_json, "%s", saved_reg ? saved_reg->str : "  \"regions\": [],\n");
 
@@ -929,11 +1244,8 @@ static void write_report(void) {
 	for (GList *l = file_deps; l; l = l->next) {
 		file_dep_t *f = (file_dep_t*)l->data;
 		if (!f->path) continue;
-		//if (!path || !*path || *path != '/' || !is_valid_path(path)) continue;
-		//if (!first) fprintf(f_json, ", ");
 		if (!first) fprintf(f_json, ",\n");
 		fprintf(f_json, "    {\"path\": \"%s\", \"write\": %s}", f->path, f->write ? "true" : "false");
-		//fprintf(f_json, "\"%s\"", (char*)l->data);
 		first = false;
 	}
 	fprintf(f_json, "],\n");
@@ -998,15 +1310,68 @@ static void write_report(void) {
 	fprintf(stderr, "[DUMP] unpacked.json complete\n");
 }
 
+//collect top-3 candidates by weighted score
+static void build_oep_scoring(oep_cand_t *chosen) {
+	g_oep_confidence = chosen ? cand_confidence(chosen): 0.0;
+	guint count = g_list_length(oep_cands);
+	oep_cand_t **candidates = g_new0( oep_cand_t *, count ? count : 1);
+	guint actual_count = 0;
+
+	for (GList *l = oep_cands;l;l = l->next) {
+		candidates[actual_count++] = (oep_cand_t *)l->data;
+	}
+	guint top_count = actual_count < 3 ? actual_count : 3;
+	for (guint i = 0; i < top_count; i++) {
+		guint best_index = i;
+		for (guint j = i + 1; j < actual_count;j++) {
+			if (cand_rank_better(candidates[j],candidates[best_index])) {
+				best_index = j;
+			}
+		}
+		oep_cand_t *temporary = candidates[i];
+		candidates[i] =candidates[best_index];
+		candidates[best_index] = temporary;
+	}
+
+	if (g_oep_scoring) {
+		g_string_free(g_oep_scoring, TRUE);
+	}
+	g_oep_scoring = g_string_new(NULL);
+	g_string_append(g_oep_scoring, "  \"oep_candidates\": [\n");
+
+	for (guint i = 0;i < top_count; i++) {
+		oep_cand_t *candidate = candidates[i];
+		g_string_append_printf(g_oep_scoring,"    {\"addr\": \"0x%lx\", \"score\": %.4f, \"confidence\": %.4f, \"dse_confirmed\": %s, \"concretized\": %u, \"total\": %u, \"generation\": %u}%s\n",(unsigned long) candidate->addr, cand_score(candidate), cand_confidence(candidate), candidate->dse_confirmed ? "true" : "false", candidate->dse_concretized, candidate->dse_total, candidate->generation, (i + 1) < top_count ? "," : "");
+	}
+
+	g_string_append(g_oep_scoring,"  ],\n");
+	g_free(candidates);
+}
+
+static oep_cand_t *find_oep_cand(uint64_t addr) {
+	for (GList *l = oep_cands; l; l = l->next) {
+		oep_cand_t *candidate = (oep_cand_t *)l->data;
+		if (candidate->addr == addr) return candidate;
+	}
+	return NULL;
+}
 
 static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	//oep choose
+	oep_cand_t *chosen = NULL;
+	if (oep_found) {
+		chosen = find_oep_cand(oep_addr);
+	}
+
 	if (!oep_found && oep_cands) {
-		oep_cand_t *chosen = choose_oep_cand();
+		chosen = choose_oep_cand();
 		if (chosen) {
 			oep_addr = chosen->addr;
 			oep_found = true;
 		}
+	}
+	if (oep_cands) {
+		build_oep_scoring(chosen);
 	}
 
 	
@@ -1115,7 +1480,15 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	}
 
 	InsnMeta *meta = meta_lookup(vaddr);
-	if (!meta) return;
+	if (!meta) {
+		prev_jump_pending = false;
+		prev_jump_site = 0;
+		prev_target_reg =REG_INVALID;
+		prev_mem_taddr = 0;
+		prev_mem_target_value = 0;
+		prev_mem_target_valid = false;
+		return;
+}
 
 	//tracer
 	if (g_trace) {
@@ -1164,18 +1537,25 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		uint64_t page_addr = vaddr & ~(page_size - 1);
 		cur_pg = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
 	}
+	
+	bool prev_jump_matches = prev_jump_pending;
+	if (prev_jump_matches && prev_mem_target_valid) {
+		prev_jump_matches = ((uint32_t)vaddr == (uint32_t)prev_mem_target_value);
+	}
 
-	bool new_layer = now_unpacked && !oep_found && cur_pg && !cur_pg->exec_seen;
+	bool new_layer = now_unpacked && !oep_found && cur_pg && !cur_pg->exec_seen &&prev_jump_matches;
 	if (cur_pg) cur_pg->exec_seen = true;
 
 	if (new_layer) {
 		oep_cand_t *c = g_new0(oep_cand_t, 1);
 		c->addr = vaddr;
-		if (prev_jump_pending) {
+		c->has_prologue =cand_has_prologue(vaddr);
+		if (prev_jump_matches) {
 			c->jump_site = prev_jump_site;
 		} else {
-			c->jump_site = 0;
+			c->jump_site= 0;
 		}
+		c->jump_from_unmapped = jump_site_is_unpacker(c->jump_site);
 		if (g_layer_dirty) {
 			g_layer++;
 			g_layer_dirty = false;
@@ -1184,10 +1564,10 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		c->generation = g_layer;
 		c->icount = g_icount;
 		//dse confirming
-		if (prev_jump_pending) {
+		if (prev_jump_matches) {
 			if (prev_target_reg >= 0) {
 				c->dse_confirmed = dse_verify_oep_candidate(g_trace, prev_jump_site, prev_target_reg, vaddr,g_shadow, cs_handle);
-			} else if (prev_mem_taddr) {
+			} else if (prev_mem_target_valid) {
 				c->dse_confirmed = dse_verify_oep_candidate_mem(g_trace, g_aux, prev_jump_site, prev_mem_taddr, vaddr, g_shadow, cs_handle);
 			}
 		}
@@ -1198,11 +1578,13 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		oep_cands = g_list_append(oep_cands, c);
 		g_layer_has_cand = true;
 		g_last_cand_icount = g_icount;
-		prev_jump_pending = false;
-		prev_jump_site = 0;
-		prev_target_reg = REG_INVALID;
-		prev_mem_taddr = 0;
 	}
+	prev_jump_pending = false;
+	prev_jump_site = 0;
+	prev_target_reg = REG_INVALID;
+	prev_mem_taddr = 0;
+	prev_mem_target_value = 0;
+	prev_mem_target_valid = false;
 	//if we are too long in unpacked code without proceeding further - we end cycle
 	if (now_unpacked && !oep_found && g_last_cand_icount && (g_icount - g_last_cand_icount) > 200000) {
 		oep_cand_t *chosen = choose_oep_cand();
@@ -1214,7 +1596,27 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		}
 	}
 	//taint propagation
+	//xchg
+	if (meta->insn_id == X86_INS_XCHG) {
+		if (meta->has_mem_read || meta->has_mem_write) {
+			goto record_branch;
+		}
 
+		if (!taint_xchg_reg_reg(vaddr, meta)) {
+			uint32_t affected = meta->regs_read_mask | meta->regs_written_mask;
+			for (int rid = 0; rid < REG_COUNT; rid++) {
+				if (!(affected & (1U << rid))) {
+					continue;
+				}
+
+				for (int byte = 0; byte < 4; byte++) {
+					reg_shadow.bytes[rid][byte] = 1;
+				}
+			}
+		}
+
+	goto record_branch;
+	}
 	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
 	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
 		int reg = mask_first_reg(meta->regs_written_mask);
@@ -1273,22 +1675,35 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	record_branch:
 		if (meta->is_indirect_branch && !oep_found) { //indirect check
 			bool target_tainted = false;
+			uint64_t taddr = 0;
+			uint64_t tval = 0;
+			bool mem_target_valid = false;
 			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) { //on reg
 				target_tainted = reg_is_tainted(&reg_shadow, meta->branch_target_reg, 0x0F);
 			} else if (meta->branch_target_reg == REG_INVALID) { // on mem with reg, like [eax]
-				target_tainted = shadow_page_has_taint(g_shadow, vaddr);
+				if (dse_resolve_mem_target(vaddr,meta,&taddr,&tval)) {
+					for (uint32_t i = 0; i < 4; i++) {
+						if (shadow_is_tainted(g_shadow, taddr + i)) {
+							target_tainted = true;
+							break;
+						}
+					}
+					mem_target_valid = target_tainted;
+				}
 			}
 			if (target_tainted) {
 				prev_jump_site = vaddr;
 				prev_jump_pending = true;
 				prev_target_reg = meta->branch_target_reg;
-				prev_mem_taddr =0;
-				//for mem or ret, we need to do it inplace, when registers still suitable
-				if (meta->branch_target_reg == REG_INVALID) {
-					uint64_t taddr = 0, tval = 0;
-					if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {
-					       	prev_mem_taddr = taddr;
-					}
+				//valid target or not
+				if (mem_target_valid) {
+					prev_mem_taddr = taddr;
+					prev_mem_target_value = (uint64_t)(uint32_t)tval;
+					prev_mem_target_valid = true;
+				} else {
+					prev_mem_taddr = 0;
+					prev_mem_target_value = 0;
+					prev_mem_target_valid = false;
 				}
 			}
 		}
@@ -1628,97 +2043,41 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] shutdown fd=%d how=%ld\n", (int)a1, a2);
 	}else if (num == 192) { //mmap2
-		int prot = (int)a3;
-		lib_update_mapping((uint32_t)a5, a1, a2); //lib dump
-		if (prot & 0x2 || prot & 0x4) {
-			fprintf(stderr, "[SYSCALL] mmap2(0x%lx, 0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=0x%x)\n", a1, a2, (int)a3, (int)a4, (int)a5, (int)a6);
-			uint64_t page_start = a1 & ~(page_size - 1);
-			uint64_t page_end = (a1 + a2 + page_size - 1) & ~(page_size - 1);
-			for (uint64_t addr = page_start; addr < page_end; addr += page_size) {
-				page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
-				if (p) {
-					p->prot = prot;
-				} else {
-					p = g_new0(page_t, 1);
-					p->prot = prot;
-					g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
-				}
-				if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
-					p->dyn_exec = true;
-					p->gen_written = g_unpack_gen;
-					if (g_layer_has_cand) g_layer_dirty = true;
-				}
-			}
-		}
+		memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
+
+		g_pending_mmap.active = true;
+		g_pending_mmap.syscall_num = num;
+		g_pending_mmap.requested_addr = (uint32_t)a1;
+		g_pending_mmap.size = (uint32_t)a2;
+		g_pending_mmap.prot = (int)a3;
+		g_pending_mmap.flags = (uint32_t)a4;
+		g_pending_mmap.fd = (int32_t)(uint32_t)a5;
+		g_pending_mmap.offset = ((uint64_t)(uint32_t)a6) << 12;
 	} else if (num == 90) { //mmap
+		memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
 		GByteArray *buf = g_byte_array_new();
-		if (qemu_plugin_read_memory_vaddr(a1, buf, 24)) {
-			uint32_t *args = (uint32_t*)buf->data;
-			uint64_t addr = args[0];
-			uint64_t size = args[1];
-			int prot = args[2];
-			uint32_t flags = args[3];
-			uint32_t fd = args[4];
-			uint32_t off = args[5];
-			lib_update_mapping(fd, addr, size); //lib dump
-			if (prot & 0x2 || prot & 0x4) {
-				fprintf(stderr, "[SYSCALL] mmap(0x%lx, 0x%lx, prot=0x%x, flags=0x%x, fd=%u, offset=0x%x)\n", addr, size, prot, flags, fd, off);
-				uint64_t page_start = addr & ~(page_size - 1);
-				uint64_t page_end = (addr + size + page_size - 1) & ~(page_size - 1);
-				for (uint64_t addr = page_start; addr < page_end; addr += page_size) {
-					page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t)addr);
-					if (p) {
-						p->prot = prot;
-					} else {
-						p = g_new0(page_t, 1);
-						p->prot = prot;
-						g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
-					}
-					if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
-						p->dyn_exec = true;
-						p->gen_written = g_unpack_gen;
-						if (g_layer_has_cand) g_layer_dirty = true;
-					}
-				}
-			}
+		if (qemu_plugin_read_memory_vaddr(a1, buf, 24) && buf->len >= 24) {
+			uint32_t args[6];
+			memcpy(args, buf->data, sizeof(args));
+			g_pending_mmap.active = true;
+			g_pending_mmap.syscall_num = num;
+			g_pending_mmap.requested_addr = args[0];
+			g_pending_mmap.size = args[1];
+			g_pending_mmap.prot = (int)args[2];
+			g_pending_mmap.flags = args[3];
+			g_pending_mmap.fd = (int32_t)args[4];
+			g_pending_mmap.offset = args[5];
+		} else {
+			fprintf(stderr, "[MMAP] failed to read old mmap arguments at 0x%lx\n", (unsigned long)a1);
 		}
-		g_byte_array_free(buf, TRUE);
-	} else if (num == 125 || num == 380) { //mprotect
-		int prot = (int) a3;
-		uint64_t page_start = a1 & ~(page_size - 1);
-		uint64_t page_end = (a1 + a2 + page_size - 1) & ~(page_size- 1);
-		fprintf(stderr, "[SYSCALL] mprotect(0x%lx, 0x%lx, prot=0x%x)\n", a1, a2, prot);
-		for (uint64_t addr = page_start; addr < page_end; addr += page_size) {
-			page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) addr);
-			if (p) {
-				p->prot = prot;
-			} else {
-				p = g_new0(page_t, 1);
-				p->prot = prot;
-				g_hash_table_insert(pages, (gpointer)(uintptr_t)addr, p);
-			}
-			if (p && p->written && (prot & 0x4)) {
-				p->exec_after_write = true;  // written + потом exec = OEP candidate
-			}
-			if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, (gpointer)(uintptr_t)addr)) {
-				p->dyn_exec = true;
-				p->gen_written = g_unpack_gen;
-				if (g_layer_has_cand) g_layer_dirty = true;
-			}
-		}
-	} else if (num == 91) { //munmap
-		uint64_t page_start = a1 & ~(page_size - 1);
-		uint64_t page_end = (a1 + a2 + page_size - 1) & ~(page_size- 1);
-		for (uint64_t addr = page_start; addr < page_end; addr += page_size) {
-			g_hash_table_add(unmapped_pages, (gpointer)(uintptr_t)addr);
-			page_t *p = g_hash_table_lookup(pages, (gpointer)(uintptr_t) addr);
-			if (p) {
-				g_hash_table_remove(pages, (gpointer)(uintptr_t) addr);
-				g_free(p->wbitmap);
-				g_free(p);
-			}
-		}
-		fprintf(stderr, "[SYSCALL] munmap(0x%lx, 0x%lx)\n", a1, a2);
+		g_byte_array_free(buf, TRUE);		
+	} else if (num == 125 || num == 380 || num == 91) { //munmap & mprotect
+		memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
+		g_pending_mmap.active = true;
+		g_pending_mmap.syscall_num = num;
+		g_pending_mmap.requested_addr = (uint32_t)a1;
+		g_pending_mmap.size = (uint32_t)a2;
+		g_pending_mmap.prot = (num == 91) ? 0 : (int)(uint32_t)a3;
 	}
 }
 
@@ -1744,7 +2103,26 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 }
 
 static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, int64_t ret) {
-	if ((int64_t)ret < 0) {
+	const bool syscall_failed = syscall_ret_is_error(ret);
+
+	if (g_pending_mmap.active) {
+		pending_mmap_t pending = g_pending_mmap;
+		memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
+		if (pending.syscall_num != num) {
+			fprintf(stderr, "[SYSCALL] pending operation mismatch: expected=%ld actual=%ld\n", (long)pending.syscall_num, (long)num);
+		} else if (syscall_failed) {
+			fprintf(stderr, "[SYSCALL] memory operation failed: num=%ld ret=%ld\n", (long)num, (long)ret);
+		} else if (pending.syscall_num == 90 || pending.syscall_num == 192) { //mmap
+			uint64_t mapped_addr = is_i386 ? (uint64_t)(uint32_t)ret: (uint64_t)ret;
+			apply_pending_mmap(&pending, mapped_addr);
+		} else if (pending.syscall_num == 125 || pending.syscall_num == 380) { //mprotect
+			apply_pending_mprotect(&pending);
+		} else if (pending.syscall_num == 91) { //munmap
+			apply_pending_munmap(&pending);
+		}
+	}
+
+	if (syscall_failed) {
 		pending_socketcall_subcall = -1;
 		pending_socket_domain = -1;
 		pending_dup_fd = -1;
