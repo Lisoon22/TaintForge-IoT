@@ -30,12 +30,22 @@ class RunReportGenerator:
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.network_events_path = self.logs_dir / "network_events.jsonl"
         self.runtime_status_path = self.logs_dir / "runtime_status.json"
+        self.prebuilt_execution_path = self.config_dir / "prebuilt_execution.json"
+        self.prebuilt_runner_manifest_path = (
+            self.config_dir / "prebuilt_runner_manifest.json"
+        )
+        self.network_backend_manifest_path = (
+            self.config_dir / "network_backend_manifest.json"
+        )
+        self.target_state_evaluation_path = (
+            self.config_dir / "target_state_evaluation.json"
+        )
         self.security_status_path = self.logs_dir / "security_status.json"
         self.syscall_events_path = self.logs_dir / "syscall_events.jsonl"
         self.syscall_summary_path = self.logs_dir / "syscall_events.summary.json"
-        self.rootfs_snapshot_before_path = self.logs_dir / "rootfs_snapshot_before.json"
-        self.rootfs_snapshot_after_path = self.logs_dir / "rootfs_snapshot_after.json"
-        self.rootfs_diff_path = self.logs_dir / "rootfs_diff.json"
+        self.rootfs_snapshot_before_path = self.config_dir / "rootfs_before.json"
+        self.rootfs_snapshot_after_path = self.config_dir / "rootfs_after.json"
+        self.rootfs_diff_path = self.config_dir / "rootfs_diff.json"
 
         self.report_json_path = self.out_dir / "report.json"
         self.report_md_path = self.out_dir / "report.md"
@@ -60,24 +70,6 @@ class RunReportGenerator:
         syscall_events: list[dict[str, Any]],
         syscall_summary: dict[str, Any],
     ) -> dict[str, Any]:
-        if syscall_summary:
-            return {
-                "events_total": syscall_summary.get("events_total", len(syscall_events)),
-                "by_syscall": syscall_summary.get("by_syscall", {}),
-                "by_category": syscall_summary.get("by_category", {}),
-                "by_context": syscall_summary.get("by_context", {}),
-                "paths": syscall_summary.get("paths", []),
-                "guest_paths": syscall_summary.get(
-                    "guest_paths",
-                    syscall_summary.get("paths", []),
-                ),
-                "host_wrapper_paths": syscall_summary.get("host_wrapper_paths", []),
-                "all_paths": syscall_summary.get("all_paths", []),
-                "network_targets": syscall_summary.get("network_targets", []),
-                "high_risk_count": syscall_summary.get("high_risk_count", 0),
-                "high_risk_events": syscall_summary.get("high_risk_events", []),
-            }
-
         by_syscall = Counter(
             str(event.get("syscall", "unknown"))
             for event in syscall_events
@@ -137,7 +129,17 @@ class RunReportGenerator:
             "events_total": len(syscall_events),
             "by_syscall": dict(by_syscall),
             "by_category": dict(by_category),
+            "by_context": syscall_summary.get(
+                "by_context",
+                {"guest": len(syscall_events)} if syscall_events else {},
+            ),
             "paths": paths,
+            "guest_paths": paths,
+            "host_wrapper_paths": syscall_summary.get(
+                "host_wrapper_paths",
+                [],
+            ),
+            "all_paths": syscall_summary.get("all_paths", paths),
             "network_targets": network_targets,
             "network_attempts_count": len(network_attempts),
             "network_attempts": network_attempts[:100],
@@ -153,8 +155,17 @@ class RunReportGenerator:
         library_plan = self.load_json_optional(self.library_plan_path)
         library_resolution = self.load_json_optional(self.library_resolution_path)
         network_events = self.load_jsonl_optional(self.network_events_path)
-        runtime_status = self.load_json_optional(self.runtime_status_path)
+        prebuilt_runner_manifest = self.load_json_optional(
+            self.prebuilt_runner_manifest_path
+        )
+        network_backend_manifest = self.load_json_optional(
+            self.network_backend_manifest_path
+        )
+        runtime_status = self.load_runtime_status(prebuilt_runner_manifest)
         security_status = self.load_json_optional(self.security_status_path)
+        target_state_evaluation = self.load_json_optional(
+            self.target_state_evaluation_path
+        )
         raw_syscall_events = self.load_jsonl_optional(self.syscall_events_path)
         syscall_summary = self.load_json_optional(self.syscall_summary_path)
         rootfs_diff = self.load_json_optional(self.rootfs_diff_path)
@@ -179,12 +190,20 @@ class RunReportGenerator:
             ),
             "syscalls": self.build_syscalls_section(
                 syscall_events=syscall_events,
-                syscall_summary={},
+                syscall_summary=syscall_summary,
             ),
             "filesystem": self.build_filesystem_section(rootfs_diff),
+            "target_state": self.build_target_state_section(
+                target_state_evaluation
+            ),
             "artifacts": self.build_artifacts_section(network_events),
             "logs": self.build_logs_section(),
-            "security": self.build_security_section(network_policy=network_policy, security_status=security_status),
+            "security": self.build_security_section(
+                network_policy=network_policy,
+                security_status=security_status,
+                prebuilt_runner_manifest=prebuilt_runner_manifest,
+                network_backend_manifest=network_backend_manifest,
+            ),
         }
 
         self.save_json_report(report)
@@ -202,6 +221,16 @@ class RunReportGenerator:
             "syscall_events": self.rel(self.syscall_events_path),
             "syscall_summary": self.rel(self.syscall_summary_path),
             "runtime_status": self.rel(self.runtime_status_path),
+            "prebuilt_execution": self.rel(self.prebuilt_execution_path),
+            "prebuilt_runner_manifest": self.rel(
+                self.prebuilt_runner_manifest_path
+            ),
+            "network_backend_manifest": self.rel(
+                self.network_backend_manifest_path
+            ),
+            "target_state_evaluation": self.rel(
+                self.target_state_evaluation_path
+            ),
             "security_status": self.rel(self.security_status_path),
             "runtime_stdout": self.rel(self.logs_dir / "runtime_stdout.log"),
             "runtime_stderr": self.rel(self.logs_dir / "runtime_stderr.log"),
@@ -210,6 +239,47 @@ class RunReportGenerator:
             "rootfs_snapshot_before": self.rel(self.rootfs_snapshot_before_path),
             "rootfs_snapshot_after": self.rel(self.rootfs_snapshot_after_path),
             "rootfs_diff": self.rel(self.rootfs_diff_path),
+        }
+
+    def load_runtime_status(
+        self,
+        prebuilt_runner_manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        legacy = self.load_json_optional(self.runtime_status_path)
+        if legacy:
+            return legacy
+
+        prebuilt = self.load_json_optional(self.prebuilt_execution_path)
+        if not prebuilt:
+            return {}
+
+        status = dict(prebuilt)
+        status["exit_code"] = prebuilt.get("guest_exit_code")
+        status.setdefault(
+            "timeout_seconds",
+            prebuilt_runner_manifest.get("timeout_seconds"),
+        )
+        return status
+
+    @staticmethod
+    def build_target_state_section(
+        evaluation: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not evaluation:
+            return {
+                "evaluated": False,
+                "reached": None,
+            }
+        return {
+            "evaluated": True,
+            "goal_id": evaluation.get("goal_id"),
+            "reached": evaluation.get("reached"),
+            "reason": evaluation.get("reason"),
+            "matched_rules": evaluation.get("matched_rules"),
+            "total_rules": evaluation.get("total_rules"),
+            "spec_sha256": evaluation.get("spec_sha256"),
+            "evaluation_sha256": evaluation.get("evaluation_sha256"),
+            "rules": evaluation.get("rules", []),
         }
 
     def build_runtime_section(self, runtime: dict[str, Any], runtime_status: dict[str, Any]) -> dict[str, Any]:
@@ -419,57 +489,116 @@ class RunReportGenerator:
         self,
         network_policy: dict[str, Any],
         security_status: dict[str, Any],
+        prebuilt_runner_manifest: dict[str, Any],
+        network_backend_manifest: dict[str, Any],
     ) -> dict[str, Any]:
         catch_all = network_policy.get("catch_all", {})
+        isolation = prebuilt_runner_manifest.get("isolation", {})
+        if not isinstance(isolation, dict):
+            isolation = {}
+
+        def observed(
+            security_key: str,
+            isolation_key: str | None = None,
+        ) -> Any:
+            if security_key in security_status:
+                return security_status.get(security_key)
+            key = isolation_key or security_key
+            if key in isolation:
+                return isolation.get(key)
+            return None
+
+        backend_state = network_backend_manifest.get("state")
+        backend_verified = backend_state in {"ready", "cleaned"}
+        backend_plan = network_backend_manifest.get("plan")
+        if not isinstance(backend_plan, dict):
+            backend_plan = {}
+        disconnected = (
+            security_status.get("network_mode") == "none"
+            and security_status.get("network_connected") is False
+        )
+
+        allow_internet: Any = None
+        if "allow_internet" in network_backend_manifest:
+            allow_internet = network_backend_manifest.get("allow_internet")
+        elif "allow_internet" in network_policy:
+            allow_internet = network_policy.get("allow_internet")
+
+        proc_mode = security_status.get("proc_mode")
+        if proc_mode is None and isolation.get("proc_private_mount") is True:
+            proc_mode = "private_procfs_mount"
+
+        evidence_sources = []
+        for path in (
+            self.security_status_path,
+            self.prebuilt_runner_manifest_path,
+            self.network_backend_manifest_path,
+        ):
+            if path.is_file():
+                evidence_sources.append(self.rel(path))
 
         return {
-            "isolation_ready": security_status.get("isolation_ready", False),
-            "chroot_enabled": True,
-            "network_namespace_enabled": security_status.get(
-                "network_namespace",
-                True,
+            "evidence_sources": evidence_sources,
+            "isolation_ready": observed("isolation_ready"),
+            "chroot_enabled": observed("chroot", "chroot"),
+            "network_namespace_enabled": observed(
+                "network_namespace"
             ),
-            "pid_namespace_enabled": security_status.get(
-                "pid_namespace",
-                False,
-            ),
-            "mount_namespace_enabled": security_status.get(
-                "mount_namespace",
-                False,
-            ),
-            "uts_namespace_enabled": security_status.get(
-                "uts_namespace",
-                False,
-            ),
-            "ipc_namespace_enabled": security_status.get(
-                "ipc_namespace",
-                False,
-            ),
-            "user_namespace_enabled": security_status.get(
-                "user_namespace",
-                False,
-            ),
+            "pid_namespace_enabled": observed("pid_namespace"),
+            "mount_namespace_enabled": observed("mount_namespace"),
+            "uts_namespace_enabled": observed("uts_namespace"),
+            "ipc_namespace_enabled": observed("ipc_namespace"),
+            "user_namespace_enabled": observed("user_namespace"),
             "mount_propagation": security_status.get(
                 "mount_propagation",
             ),
             "sandbox_hostname": security_status.get(
                 "sandbox_hostname",
             ),
-            "proc_mode": security_status.get(
-                "proc_mode",
-                "static_rootfs_stubs",
+            "proc_mode": proc_mode,
+            "network_backend_state": backend_state,
+            "iptables_default_deny_expected": (
+                True
+                if backend_verified
+                else security_status.get("network_default_deny")
             ),
-            "iptables_default_deny_expected": True,
-            "host_ip_forwarding_expected": False,
-            "allow_internet": bool(
-                network_policy.get("allow_internet", False)
+            "host_ip_forwarding_expected": (
+                False
+                if backend_verified
+                and network_backend_manifest.get(
+                    "host_ip_forwarding_modified"
+                ) is False
+                else None
             ),
-            "known_endpoint_dnat": True,
-            "tcp_catch_all_redirect": bool(
-                catch_all.get("enabled", False)
+            "allow_internet": allow_internet,
+            "known_endpoint_dnat": (
+                False
+                if disconnected
+                else bool(backend_plan.get("host_services"))
+                if backend_verified
+                else None
             ),
-            "udp_catch_all_redirect": bool(
-                catch_all.get("udp_enabled", False)
+            "tcp_catch_all_redirect": (
+                False
+                if disconnected
+                else bool(backend_plan.get("catch_all_enabled"))
+                if backend_verified
+                else (
+                    bool(catch_all.get("enabled"))
+                    if "enabled" in catch_all
+                    else None
+                )
+            ),
+            "udp_catch_all_redirect": (
+                False
+                if disconnected
+                else bool(backend_plan.get("catch_all_enabled"))
+                if backend_verified
+                else (
+                    bool(catch_all.get("udp_enabled"))
+                    if "udp_enabled" in catch_all
+                    else None
+                )
             ),
             "strace_enabled": security_status.get(
                 "strace_enabled",
@@ -501,6 +630,7 @@ class RunReportGenerator:
         network = report["network"]
         syscalls = report["syscalls"]
         filesystem = report["filesystem"]
+        target_state = report["target_state"]
         artifacts = report["artifacts"]
         security = report["security"]
         logs = report["logs"]
@@ -537,6 +667,19 @@ class RunReportGenerator:
             lines.append(f"- Finished at UTC: `{status.get('finished_at_utc')}`")
             lines.append(f"- Command: `{status.get('command')}`")
             lines.append("")
+
+        lines.append("## Target state")
+        lines.append("")
+        lines.append(f"- Evaluated: `{target_state.get('evaluated')}`")
+        lines.append(f"- Goal: `{target_state.get('goal_id')}`")
+        lines.append(f"- Reached: `{target_state.get('reached')}`")
+        lines.append(f"- Reason: `{target_state.get('reason')}`")
+        lines.append(
+            "- Matched rules: `"
+            f"{target_state.get('matched_rules')}/"
+            f"{target_state.get('total_rules')}`"
+        )
+        lines.append("")
 
         host_binary = runtime.get("host_binary")
         if host_binary:

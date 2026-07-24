@@ -124,6 +124,7 @@ class SyscallEvent:
     pid: Optional[int] = None
     return_value: Optional[int] = None
     errno: Optional[str] = None
+    success: Optional[bool] = None
 
     path: Optional[str] = None
     paths: list[str] = field(default_factory=list)
@@ -258,6 +259,7 @@ def parse_strace_line(
             args="",
             result=exit_match.group("exit_code"),
             return_value=int(exit_match.group("exit_code")),
+            success=int(exit_match.group("exit_code")) == 0,
             execution_context=execution_context,
         )
 
@@ -272,6 +274,7 @@ def parse_strace_line(
             raw=line,
             args="",
             result=signal_match.group("signal"),
+            success=False,
             execution_context=execution_context
         )
 
@@ -309,6 +312,11 @@ def parse_syscall_match(
         pid=int(pid_raw) if pid_raw else None,
         return_value=return_value,
         errno=errno,
+        success=(
+            None
+            if return_value is None
+            else return_value >= 0
+        ),
         path=paths[0] if paths else None,
         paths=paths,
         remote_ip=remote_ip,
@@ -324,20 +332,22 @@ def parse_result(result: str) -> tuple[Optional[int], Optional[str]]:
     if result.startswith("?"):
         return None, None
 
-    first = result.split(maxsplit=1)[0]
+    match = re.match(
+        r"^(?P<value>-?(?:0x[0-9a-fA-F]+|\d+))"
+        r"(?:<[^>]*>)?"
+        r"(?:\s+(?P<errno>[A-Z][A-Z0-9_]+)\b)?",
+        result,
+    )
+    if match is None:
+        return None, None
 
     try:
-        return int(first), None
+        return_value = int(match.group("value"), 0)
     except ValueError:
-        pass
+        return None, None
 
-    errno = None
-
-    parts = result.split()
-    if len(parts) >= 2 and parts[0] == "-1":
-        errno = parts[1]
-
-    return None, errno
+    errno = match.group("errno") if return_value < 0 else None
+    return return_value, errno
 
 
 def extract_paths(syscall: str, args: str) -> list[str]:

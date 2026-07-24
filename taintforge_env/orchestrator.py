@@ -1,7 +1,10 @@
 from __future__ import annotations
+import ipaddress
 import textwrap
 import json
 import os
+import pwd
+import signal
 import shutil
 import subprocess
 import sys
@@ -67,6 +70,12 @@ class Phase2Orchestrator:
         self.run_id = create_run_id(self.config.binary_path)
 
         self.network_policy_path = self.config_dir / "network_policy.json"
+        self.host_network_policy_path = (
+            self.config_dir / "network_policy_host.json"
+        )
+        self.loopback_network_policy_path = (
+            self.config_dir / "network_policy_loopback.json"
+        )
         self.library_plan_path = self.config_dir / "library_plan.json"
         self.library_resolution_path = self.config_dir / "library_resolution.json"
         self.runtime_path = self.config_dir / "runtime.json"
@@ -75,6 +84,9 @@ class Phase2Orchestrator:
         )
         self.repair_plan_path = self.config_dir / "repair_plan.json"
         self.network_runner_path = self.config.out_dir / "run_network_sandbox.sh"
+        self.disconnected_runner_path = (
+            self.config.out_dir / "run_disconnected_sandbox.sh"
+        )
         self.run_manifest_path = self.config_dir / "run_manifest.json"
         self.copied_egress_policy_path = self.config_dir / "egress_policy.json"
         self.copied_record_policy_path = self.config_dir / "c2_record_policy.json"
@@ -93,9 +105,7 @@ class Phase2Orchestrator:
             raise OrchestratorError(f"Unsupported observation phase: {phase}")
 
         print(f"[+] Runtime observation phase: {phase}")
-        self.run_command(
-            [
-                "sudo",
+        command = [
                 "env",
                 f"PYTHONPATH={self.project_root}",
                 sys.executable,
@@ -106,7 +116,9 @@ class Phase2Orchestrator:
                 "--rootfs",
                 str(self.rootfs_dir),
             ]
-        )
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command)
 
 
 
@@ -292,6 +304,7 @@ class Phase2Orchestrator:
             "chroot",
             "mount",
             "unshare",
+            "ip",
             "hostname",
             "bash",
         ]
@@ -305,6 +318,8 @@ class Phase2Orchestrator:
                 "iptables",
                 "ss",
                 "conntrack",
+                "setpriv",
+                "sysctl",
             ])
 
         missing = [tool for tool in required if shutil.which(tool) is None]
@@ -521,6 +536,8 @@ class Phase2Orchestrator:
         if self.config.network_mode == NetworkMode.BROKERED_RECORD:
             self.configure_record_network_policy()
 
+        self.prepare_known_service_policies()
+
         self.analyze_libraries()
         self.resolve_libraries()
         self.prepare_runtime()
@@ -530,6 +547,8 @@ class Phase2Orchestrator:
             NetworkMode.BROKERED_RECORD,
         }:
             self.generate_network_runner()
+        elif self.config.network_mode == NetworkMode.NONE:
+            self.generate_disconnected_runner()
         else:
             print("[+] Network sandbox runner skipped")
 
@@ -549,6 +568,75 @@ class Phase2Orchestrator:
                 "--catch-all-port",
                 str(self.config.catch_all_port),
             ]
+        )
+
+    @staticmethod
+    def service_uses_loopback(service: dict) -> bool:
+        remote_ip = service.get("remote_ip")
+        if not isinstance(remote_ip, str):
+            return False
+        try:
+            return ipaddress.ip_address(remote_ip).is_loopback
+        except ValueError:
+            return False
+
+    def prepare_known_service_policies(self) -> None:
+        """Split known responders by their required network placement.
+
+        A 127/8 dependency cannot be redirected to the host-side veth without
+        changing its semantics.  Preserve that endpoint and run its responder
+        inside the named network namespace instead.
+        """
+        raw = json.loads(self.network_policy_path.read_text(encoding="utf-8"))
+        services = raw.get("services", [])
+        if not isinstance(services, list):
+            raise OrchestratorError("network policy services must be a list")
+
+        host_services: list[dict] = []
+        loopback_services: list[dict] = []
+        effective_services: list[dict] = []
+
+        for item in services:
+            if not isinstance(item, dict):
+                raise OrchestratorError(
+                    "network policy service entries must be objects"
+                )
+            service = dict(item)
+            if (
+                self.config.network_mode == NetworkMode.EMULATED
+                and service.get("service_type") == "tcp"
+                and self.service_uses_loopback(service)
+            ):
+                try:
+                    remote_port = int(service["remote_port"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise OrchestratorError(
+                        "loopback TCP service has an invalid remote port"
+                    ) from exc
+                service["bind_ip"] = str(service["remote_ip"])
+                service["bind_port"] = remote_port
+                loopback_services.append(service)
+            else:
+                host_services.append(service)
+            effective_services.append(service)
+
+        effective = {**raw, "services": effective_services}
+        host = {**raw, "services": host_services}
+        loopback = {**raw, "services": loopback_services}
+
+        for path, payload in (
+            (self.network_policy_path, effective),
+            (self.host_network_policy_path, host),
+            (self.loopback_network_policy_path, loopback),
+        ):
+            path.write_text(
+                json.dumps(payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        print(
+            "[+] Known TCP responder placement: "
+            f"host={len(host_services)}, loopback={len(loopback_services)}"
         )
 
     def configure_record_network_policy(self) -> None:
@@ -658,7 +746,27 @@ class Phase2Orchestrator:
             ]
         )
 
+    def generate_disconnected_runner(self) -> None:
+        print("[+] Generating disconnected sandbox runner")
+        self.run_command(
+            [
+                sys.executable,
+                "scripts/generate_sandbox_runner.py",
+                "--runtime",
+                str(self.runtime_path),
+                "--out",
+                str(self.disconnected_runner_path),
+                "--timeout",
+                str(self.config.timeout_seconds),
+                "--network-mode",
+                "none",
+            ]
+        )
+
     def ensure_sudo(self) -> None:
+        if os.geteuid() == 0:
+            print("[+] Already running with root privileges")
+            return
         print("[+] Checking sudo")
         self.run_command(["sudo", "-v"])
 
@@ -729,6 +837,41 @@ class Phase2Orchestrator:
         )
 
         self.validate_namespace_rules()
+        self.configure_loopback_service_privileges()
+
+    def configure_loopback_service_privileges(self) -> None:
+        raw = json.loads(
+            self.loopback_network_policy_path.read_text(encoding="utf-8")
+        )
+        ports = [
+            int(service["bind_port"])
+            for service in raw.get("services", [])
+            if service.get("service_type") == "tcp"
+        ]
+        if not ports or min(ports) >= 1024:
+            return
+
+        minimum_port = min(ports)
+        print(
+            "[+] Allowing the unprivileged namespace responder to bind "
+            f"loopback port {minimum_port}"
+        )
+        self.run_command(
+            [
+                "sudo",
+                "ip",
+                "netns",
+                "exec",
+                self.config.namespace,
+                "sysctl",
+                "-q",
+                "-w",
+                (
+                    "net.ipv4.ip_unprivileged_port_start="
+                    f"{minimum_port}"
+                ),
+            ]
+        )
 
     def validate_namespace_rules(self) -> None:
         print("[+] Validating iptables rules")
@@ -802,6 +945,12 @@ class Phase2Orchestrator:
             "netns",
             "exec",
             self.config.namespace,
+            "setpriv",
+            "--reuid",
+            str(os.getuid()),
+            "--regid",
+            str(os.getgid()),
+            "--clear-groups",
             "env",
             f"PYTHONPATH={self.project_root}",
             sys.executable,
@@ -855,28 +1004,69 @@ class Phase2Orchestrator:
         )
 
     def start_known_network_emulator(self) -> None:
-        if not self.network_policy_has_known_tcp_services():
+        host_services = self.network_policy_has_known_tcp_services(
+            self.host_network_policy_path
+        )
+        loopback_services = self.network_policy_has_known_tcp_services(
+            self.loopback_network_policy_path
+        )
+        if not host_services and not loopback_services:
             print("[!] No known TCP services; skipping mini-FakeNet")
             return
 
-        print("[+] Starting known TCP mini-FakeNet")
+        if host_services:
+            print("[+] Starting host-side known TCP mini-FakeNet")
+            self.start_process(
+                [
+                    sys.executable,
+                    "scripts/start_network_emulator.py",
+                    "--policy",
+                    str(self.host_network_policy_path),
+                    "--log-dir",
+                    str(self.logs_dir),
+                    "--backend-source",
+                    "host",
+                ],
+                self.logs_dir / "network_emulator_stdout.log",
+                self.logs_dir / "network_emulator_stderr.log",
+            )
 
-        stdout_path = self.logs_dir / "network_emulator_stdout.log"
-        stderr_path = self.logs_dir / "network_emulator_stderr.log"
+        if loopback_services:
+            print("[+] Starting namespace-local loopback mini-FakeNet")
+            self.start_process(
+                [
+                    "sudo",
+                    "ip",
+                    "netns",
+                    "exec",
+                    self.config.namespace,
+                    "setpriv",
+                    "--reuid",
+                    str(os.getuid()),
+                    "--regid",
+                    str(os.getgid()),
+                    "--clear-groups",
+                    "env",
+                    f"PYTHONPATH={self.project_root}",
+                    sys.executable,
+                    "scripts/start_network_emulator.py",
+                    "--policy",
+                    str(self.loopback_network_policy_path),
+                    "--log-dir",
+                    str(self.logs_dir),
+                    "--backend-source",
+                    "loopback",
+                ],
+                self.logs_dir / "network_loopback_emulator_stdout.log",
+                self.logs_dir / "network_loopback_emulator_stderr.log",
+            )
 
-        cmd = [
-            sys.executable,
-            "scripts/start_network_emulator.py",
-            "--policy",
-            str(self.network_policy_path),
-            "--log-dir",
-            str(self.logs_dir),
-        ]
-
-        self.start_process(cmd, stdout_path, stderr_path)
-
-    def network_policy_has_known_tcp_services(self) -> bool:
-        raw = json.loads(self.network_policy_path.read_text(encoding="utf-8"))
+    def network_policy_has_known_tcp_services(
+        self,
+        path: Path | None = None,
+    ) -> bool:
+        policy_path = path or self.network_policy_path
+        raw = json.loads(policy_path.read_text(encoding="utf-8"))
 
         for service in raw.get("services", []):
             if service.get("service_type") == "tcp":
@@ -891,14 +1081,16 @@ class Phase2Orchestrator:
         self.wait_for_netns_port(self.config.udp_catch_all_port, timeout=5)
 
     def wait_for_known_emulator_if_needed(self) -> None:
-        if not self.network_policy_has_known_tcp_services():
-            return
+        host_raw = json.loads(
+            self.host_network_policy_path.read_text(encoding="utf-8")
+        )
+        loopback_raw = json.loads(
+            self.loopback_network_policy_path.read_text(encoding="utf-8")
+        )
 
-        print("[+] Waiting for known TCP mini-FakeNet")
-
-        raw = json.loads(self.network_policy_path.read_text(encoding="utf-8"))
-
-        for service in raw.get("services", []):
+        if host_raw.get("services"):
+            print("[+] Waiting for host-side known TCP mini-FakeNet")
+        for service in host_raw.get("services", []):
             if service.get("service_type") != "tcp":
                 continue
 
@@ -906,6 +1098,13 @@ class Phase2Orchestrator:
             bind_port = int(service.get("bind_port"))
 
             self.wait_for_host_port(bind_ip, bind_port, timeout=5)
+
+        if loopback_raw.get("services"):
+            print("[+] Waiting for namespace-local loopback mini-FakeNet")
+        for service in loopback_raw.get("services", []):
+            if service.get("service_type") != "tcp":
+                continue
+            self.wait_for_netns_port(int(service["bind_port"]), timeout=5)
 
     def wait_for_netns_port(self, port: int, timeout: int) -> None:
         deadline = time.time() + timeout
@@ -1023,9 +1222,21 @@ class Phase2Orchestrator:
             print(result.stderr, end="")
 
         if result.returncode != 0:
+            stdout_tail = "\n".join(result.stdout.splitlines()[-30:])
+            stderr_tail = "\n".join(result.stderr.splitlines()[-30:])
             raise OrchestratorError(
-                "Network self-test command failed. "
-                f"See {stdout_path} and {stderr_path}"
+                "Network self-test command failed with exit code "
+                f"{result.returncode}. See {stdout_path} and {stderr_path}."
+                + (
+                    f"\nSelf-test stdout:\n{stdout_tail}"
+                    if stdout_tail
+                    else ""
+                )
+                + (
+                    f"\nSelf-test stderr:\n{stderr_tail}"
+                    if stderr_tail
+                    else ""
+                )
             )
 
         time.sleep(0.5)
@@ -1204,81 +1415,29 @@ class Phase2Orchestrator:
         return False
     
     def run_sample_direct(self) -> None:
-        print("[+] Running sample directly without network sandbox")
-
-        runtime = json.loads(self.runtime_path.read_text(encoding="utf-8"))
-
-        rootfs = Path(runtime["rootfs"])
-        if not rootfs.is_absolute():
-            rootfs = self.project_root / rootfs
-
-        guest_binary = runtime.get("guest_binary", "/bin/unpacked.elf")
-        qemu_required = bool(runtime.get("qemu_required", False))
-
-        if qemu_required:
+        print("[+] Running sample in disconnected private namespaces")
+        if not self.disconnected_runner_path.is_file():
             raise OrchestratorError(
-                "Direct run for qemu_required=True is not implemented yet. "
-                "Use controlled network mode or add direct QEMU launcher."
+                "Disconnected sandbox runner was not generated"
             )
 
-        proc_dir = rootfs / "proc"
-        proc_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["bash", str(self.disconnected_runner_path)],
+            cwd=self.project_root,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise OrchestratorError(
+                "Disconnected sandbox infrastructure failed with code "
+                f"{result.returncode}; inspect logs/runtime_stderr.log"
+            )
 
-        stdout_path = self.logs_dir / "runtime_stdout.log"
-        stderr_path = self.logs_dir / "runtime_stderr.log"
-        strace_base = self.logs_dir / "strace"
-
-        mounted_proc = False
-
-        try:
-            if not proc_dir.is_mount():
-                self.run_command([
-                    "sudo",
-                    "mount",
-                    "-t",
-                    "proc",
-                    "proc",
-                    str(proc_dir),
-                ])
-                mounted_proc = True
-
-            cmd = [
-                "sudo",
-                "timeout",
-                str(self.config.timeout_seconds),
-                "strace",
-                "-ff",
-                "-o",
-                str(strace_base),
-                "chroot",
-                str(rootfs),
-                guest_binary,
-            ]
-
-            print("[cmd]", " ".join(cmd))
-
-            with stdout_path.open("w", encoding="utf-8") as stdout_file, \
-                stderr_path.open("w", encoding="utf-8") as stderr_file:
-                result = subprocess.run(
-                    cmd,
-                    cwd=self.project_root,
-                    text=True,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                )
-
-            if result.returncode != 0:
-                print(
-                    f"[!] Direct sample runner exited with code {result.returncode}. "
-                    "For malware this can be normal: crash/timeout/non-zero exit."
-                )
-
-        finally:
-            if mounted_proc:
-                self.run_command(
-                    ["sudo", "umount", str(proc_dir)],
-                    check=False,
-                )
+        runtime_status = self.logs_dir / "runtime_status.json"
+        security_status = self.logs_dir / "security_status.json"
+        if not runtime_status.is_file() or not security_status.is_file():
+            raise OrchestratorError(
+                "Disconnected sandbox did not produce status evidence"
+            )
 
     def run_sample(self) -> None:
         print("[+] Running sample")
@@ -1310,7 +1469,10 @@ class Phase2Orchestrator:
 
         for proc in self.processes:
             if proc.poll() is None:
-                proc.terminate()
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
         deadline = time.time() + 3
 
@@ -1319,7 +1481,10 @@ class Phase2Orchestrator:
                 time.sleep(0.1)
 
             if proc.poll() is None:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
         self.processes.clear()
 
@@ -1338,17 +1503,14 @@ class Phase2Orchestrator:
         if not self.config.out_dir.exists():
             return
 
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-
-        if not user:
-            return
+        user = self.invoking_user()
 
         print("[+] Fixing output ownership")
 
-        self.run_command(
-            ["sudo", "chown", "-R", f"{user}:{user}", str(self.config.out_dir)],
-            check=False,
-        )
+        command = ["chown", "-R", f"{user}:{user}", str(self.config.out_dir)]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command, check=False)
 
 
     def make_runtime_artifacts_readable(self) -> None:
@@ -1362,25 +1524,31 @@ class Phase2Orchestrator:
         if not self.logs_dir.exists():
             return
 
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
-
-        if not user:
-            raise OrchestratorError(
-                "Cannot determine invoking user for runtime artifact ownership"
-            )
+        user = self.invoking_user()
 
         print("[+] Normalizing runtime artifact ownership")
 
-        self.run_command(
-            [
-                "sudo",
-                "chown",
-                "-R",
-                f"{user}:{user}",
-                str(self.logs_dir),
-            ],
-            check=True,
-        )
+        command = [
+            "chown",
+            "-R",
+            f"{user}:{user}",
+            str(self.logs_dir),
+        ]
+        if os.geteuid() != 0:
+            command.insert(0, "sudo")
+        self.run_command(command, check=True)
+
+    @staticmethod
+    def invoking_user() -> str:
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER")
+        if user:
+            return user
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError as exc:
+            raise OrchestratorError(
+                "Cannot determine invoking user for artifact ownership"
+            ) from exc
 
     def print_build_summary(self) -> None:
         print()
@@ -1497,6 +1665,7 @@ class Phase2Orchestrator:
             stdout=stdout_file,
             stderr=stderr_file,
             text=True,
+            process_group=0,
         )
 
         self.processes.append(proc)
