@@ -341,7 +341,8 @@ static bool lift_pop(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const 
 }
 //lifter leave
 static bool lift_leave(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux, const DseArch *arch) {
-	if (!ctx || !x86 || !aux || !aux->has_mem_read || arch->natural_width != 32 || x86->op_count != 0) {
+	(void)insn;
+	if (!ctx || !x86 || !aux || !arch || !aux->has_mem_read || arch->natural_width != 32 || x86->op_count != 0) {
 		return false;
 	}
 
@@ -382,6 +383,78 @@ static bool lift_leave(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, cons
 	dse_set_reg(ctx, REG_RBP, restored_frame_pointer,32);
 
 	return true;
+}
+//lifter popal
+static bool lift_popal(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux, const DseArch *arch) {
+	(void)insn;
+
+	if (!ctx || !x86 || !aux || !arch || arch->natural_width != 32 || x86->op_count != 0 || aux->mem_read_count < 7) {
+		return false;
+	}
+	//32 bits popal
+	for (unsigned i = 0; i < (sizeof(x86->prefix)/sizeof(x86->prefix[0])); i++) {
+		if (x86->prefix[i] == 0x66 || x86->prefix[i] == 0x67) {
+			return false;
+		}
+	}
+	static const uint32_t stack_offsets[7] = {0,4,8,16,20,24,28};
+	static const x86_reg destination_registers[7] = {X86_REG_EDI, X86_REG_ESI, X86_REG_EBP, X86_REG_EBX, X86_REG_EDX, X86_REG_ECX, X86_REG_EAX};
+	SymExpr *values[7] = {0};
+	int destination_rids[7];
+
+	uint32_t old_esp =(uint32_t) aux->reg_vals[REG_RSP];
+
+	for (uint32_t i = 0; i < 7; i++) {
+		destination_rids[i] = x86_reg_to_rid(destination_registers[i]);
+		if (destination_rids[i] < 0 || destination_rids[i] >= REG_COUNT) {
+			goto fail;
+		}
+
+		uint32_t expected_addr = old_esp + stack_offsets[i];
+		const DseMemRead *read = NULL;
+		for (uint32_t j = 0;j < aux->mem_read_count; j++) {
+			const DseMemRead *candidate = &aux->mem_reads[j];
+			if ((uint32_t)candidate->addr == expected_addr && candidate->size == 4) {
+				read = candidate;
+				break;
+			}
+		}
+		if (!read) {
+			goto fail;
+		}
+		InsnAux selected_read = *aux;
+		selected_read.has_mem_read = true;
+		selected_read.mem_read_addr = read->addr;
+		selected_read.mem_read_val = read->value;
+		selected_read.mem_read_taint = read->taint;
+
+		values[i] = dse_load_mem(ctx, &selected_read, 32, arch->big_endian);
+		if (!values[i]) {
+			goto fail;
+		}
+	}
+	SymExpr *old_stack_pointer = dse_read_rid_fit(ctx, aux, REG_RSP, 32, 32);
+	if (!old_stack_pointer) {
+		goto fail;
+	}
+
+	SymExpr *new_stack_pointer = sym_expr_add( old_stack_pointer, sym_expr_const(32, 32));
+	if (!new_stack_pointer) {
+		goto fail;
+	}
+	
+	for (uint32_t i = 0; i < 7; i++) {
+		dse_set_reg(ctx, destination_rids[i],values[i], 32);
+		values[i] = NULL;
+	}
+
+	dse_set_reg(ctx, REG_RSP, new_stack_pointer, 32);
+	return true;
+fail:
+	for (uint32_t i = 0;i < 7; i++) {
+		sym_expr_free(values[i]);
+	}
+	return false;
 }
 //lifter xchg
 static bool lift_xchg(DSECtx *ctx, const cs_insn *insn, const cs_x86 *x86, const InsnAux *aux, const DseArch *arch) {
@@ -555,6 +628,8 @@ static bool x86_lift_one(DSECtx *ctx, const cs_insn *insn, const InsnAux *aux, c
 			return lift_pop(ctx, insn, x86, aux, arch);
 		case X86_INS_LEAVE:
 			return lift_leave(ctx, insn, x86, aux, arch);
+		case X86_INS_POPAL:
+			return lift_popal(ctx, insn, x86, aux, arch);
 		case X86_INS_XCHG:
 			return lift_xchg(ctx,insn, x86, aux, arch);
 		case X86_INS_NOP:

@@ -9,6 +9,13 @@
 
 //aux ring for trace add info
 typedef struct {
+	uint64_t addr;
+	uint64_t value;
+	uint8_t taint;
+	uint8_t size;
+} DseMemRead;
+
+typedef struct {
 	bool valid;
 	uint64_t pc;
 	uint64_t reg_vals[REG_COUNT];   /* snapshot before the insn */
@@ -19,6 +26,8 @@ typedef struct {
 	uint8_t mem_read_taint;
 	bool has_mem_write;
 	uint64_t mem_write_addr;
+	uint8_t mem_read_count;
+	DseMemRead mem_reads[8];
 } InsnAux;
 
 typedef struct {

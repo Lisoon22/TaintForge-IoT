@@ -1,9 +1,9 @@
 {
   "oep": "0x804ade0",
   "arch": "x86",
-  "oep_confidence": 0.8973,
+  "oep_confidence": 0.8986,
   "oep_candidates": [
-    {"addr": "0x804ade0", "score": 0.8973, "confidence": 0.8973, "dse_confirmed": true, "concretized": 2, "total": 512, "generation": 0},
+    {"addr": "0x804ade0", "score": 0.8986, "confidence": 0.8986, "dse_confirmed": true, "concretized": 1, "total": 512, "generation": 0},
     {"addr": "0x8099790", "score": 0.4232, "confidence": 0.4232, "dse_confirmed": true, "concretized": 0, "total": 2, "generation": 1},
     {"addr": "0x806af50", "score": 0.4232, "confidence": 0.4232, "dse_confirmed": true, "concretized": 0, "total": 2, "generation": 2}
   ],

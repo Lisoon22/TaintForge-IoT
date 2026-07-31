@@ -1027,7 +1027,7 @@ bool dse_verify_oep_candidate(TraceBuffer *tb, uint64_t trigger_pc, RegId target
 	       target = NULL;
 	}
 	bool confirmed = false;
-	if (target && dse_expr_has_var(target)) {
+	if (target) {
 		confirmed = (dse_check_oep_reachable(&ctx, target, oep_candidate) == 1);
 	}
 	sym_expr_free(target);
@@ -1092,7 +1092,6 @@ int trace_get_slice_mem(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t 
 }
 
 bool dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_pc, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
-	(void)shadow;
 	const TraceEntry *slice[MAX_SLICE];
 	int n = trace_get_slice_mem(tb, ring, trigger_pc, target_addr, slice, MAX_SLICE);
 	if (n <= 0) return false;
@@ -1102,20 +1101,32 @@ bool dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *ring, uint6
 	dse_lift_begin(&ctx);
 	for (int i = 0; i < n; i++) {
 		InsnMeta *meta = meta_lookup(slice[i]->pc);
-		if (!meta) continue;
+		if (!meta) {
+			g_total ++;
+			g_concretized++;
+			continue;
+		}
 		dse_lift_insn(&ctx, slice[i], meta, cs_handle);
 	}
 
+	uint8_t target_taint_mask = 0;
+	if (shadow) {
+		for (uint32_t i = 0; i < 4; i++) {
+			if (shadow_is_tainted(shadow, target_addr + i)) {
+				target_taint_mask |= (uint8_t)(1u << i);
+			}
+		}
+	}
 	InsnAux probe;
 	memset(&probe, 0, sizeof(probe));
 	probe.has_mem_read  = true;
 	probe.mem_read_addr = target_addr;
 	probe.mem_read_val  = oep_candidate;
-	probe.mem_read_taint = 0x0F;
+	probe.mem_read_taint = target_taint_mask;
 	SymExpr *te = dse_load_mem(&ctx, &probe, 32, false);  /* 32-bit, LSB*/
 
 	bool ok = false;
-	if (te && dse_expr_has_var(te)) {
+	if (te) {
 		ok = (dse_check_oep_reachable(&ctx, te, oep_candidate) == 1);
 	}
 	sym_expr_free(te);

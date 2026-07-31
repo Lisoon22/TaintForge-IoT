@@ -23,6 +23,12 @@ static size_t page_size = 4096;
 //tolerance
 #define SCORE_EPS 1e-9
 
+//p_filesz fallback
+#define MAX_INITIAL_TAINT_BYTES (256ULL * 1024ULL * 1024ULL)
+#define MAX_PENDING_IOV 1024U
+#define GUEST_MAP_ANONYMOUS 0x20U
+#define MAX_AUXV_ARGC (1U << 20)
+
 typedef enum {
 	ARCH_X86_32,
 	ARCH_ARM,
@@ -92,11 +98,16 @@ static bool g_reg_read_error_reported[REG_COUNT];
 static uint64_t g_main_lo = 0;
 static uint64_t g_main_hi = 0;
 static bool g_main_known = false;
+static bool g_initial_taint_seeded = false;
 //ld base
 static uint64_t g_ld_base = 0;
 //AT_ENTRY in packed file typically points to packer's stub
 static uint64_t g_stub_entry = 0;
 static bool g_auxv_done = false;
+static uint32_t g_auxv_attempts = 0;
+static uint64_t g_auxv_next_retry = 1;
+static bool g_initial_sp_valid = false;
+static uint64_t g_initial_sp = 0;
 //TODO stub for multiarch
 static const DseArch *g_plugin_arch = &dse_arch_x86;
 //additional OEP checks
@@ -116,6 +127,32 @@ static __thread uint64_t prev_mem_taddr = 0;
 static __thread bool prev_jump_pending = false;
 static __thread uint64_t prev_mem_target_value = 0;
 static __thread bool prev_mem_target_valid = false;
+static __thread bool prev_target_tainted = false;
+
+
+#define DTA_TEST_MAGIC UINT32_C(0x44544154)
+
+typedef enum {
+	DTA_TEST_SINK_SKIP = 0,
+	DTA_TEST_SINK_CLEAN = 1,
+	DTA_TEST_SINK_TAINTED = 2
+} dta_test_sink_t;
+
+static uint32_t g_dta_test_total;
+static uint32_t g_dta_test_failed;
+
+static __thread bool g_dta_test_last_indirect_valid;
+static __thread bool g_dta_test_last_indirect_tainted;
+
+typedef struct {
+	uint64_t pc;
+	bool active;
+	RegShadow pre_regs;
+	bool last_read_valid;
+	uint32_t last_read_size;
+	uint8_t last_read_taint;
+} dta_mem_transfer_t;
+static __thread dta_mem_transfer_t g_dta_mem_transfer;
 
 typedef struct {
 	bool active;
@@ -128,6 +165,23 @@ typedef struct {
 	uint64_t offset;
 } pending_mmap_t;
 static __thread pending_mmap_t g_pending_mmap;
+
+typedef struct {
+	uint64_t base;
+	uint64_t size;
+} pending_iov_t;
+
+typedef struct {
+	bool active;
+	int64_t syscall_num;
+	int32_t fd;
+	bool taint_source;
+	uint32_t iov_count;
+	uint64_t requested_size;
+	pending_iov_t iov[MAX_PENDING_IOV];
+} pending_input_t;
+static __thread pending_input_t g_pending_input;
+
 //read <=8 raw bytes from guest memory
 static bool guest_read_bytes(uint64_t gaddr, uint8_t *out, uint32_t n) {
 	GByteArray *b = g_byte_array_new();
@@ -180,6 +234,7 @@ static bool is_i386 = false;
 typedef struct {
 	char *path;
 	bool write;
+	bool taint_source;
 } file_dep_t;
 typedef struct {
 	char *path;
@@ -202,12 +257,137 @@ static GList *lib_deps = NULL;
 static GHashTable *g_sockets = NULL;
 static GHashTable *file_fd = NULL;
 //fd
-static char *pending_open_path = NULL;
-static bool pending_open_is_lib = false;
-static bool pending_open_write = false;
+static __thread char *pending_open_path = NULL;
+static __thread bool pending_open_is_lib = false;
+static __thread bool pending_open_write = false;
 
 static GList *resolved_imports = NULL;
 static GHashTable *resolved_imports_by_slot = NULL; //got slot thing
+//all sorts of taint like from file, network, etc.
+static bool fd_is_taint_source(int32_t fd) {
+	if (fd < 0) return false;
+	if (g_sockets && g_hash_table_contains(g_sockets, GINT_TO_POINTER(fd))) {
+		return true;
+	}
+
+	if (file_fd) {
+		file_dep_t *file = g_hash_table_lookup(file_fd, GINT_TO_POINTER(fd));
+		if (file) {
+			return file->taint_source;
+		}
+	}
+	return true;
+}
+
+static void pending_input_reset(void) {
+	memset(&g_pending_input, 0, sizeof(g_pending_input));
+}
+
+static void pending_input_capture_linear(int64_t syscall_num, int32_t fd, uint64_t buffer, uint64_t size, bool force_taint) {
+	if (size == 0) return;
+
+	g_pending_input.active = true;
+	g_pending_input.syscall_num = syscall_num;
+	g_pending_input.fd = fd;
+	g_pending_input.taint_source = force_taint || fd_is_taint_source(fd);
+	g_pending_input.iov_count = 1;
+	g_pending_input.requested_size = size;
+	g_pending_input.iov[0].base = buffer;
+	g_pending_input.iov[0].size = size;
+}
+
+static bool pending_input_capture_iov(int64_t syscall_num, int32_t fd, uint64_t iov_addr, int64_t iov_count, bool force_taint) {
+	if (iov_count <= 0) {
+		return iov_count == 0;
+	}
+
+	if ((uint64_t)iov_count > MAX_PENDING_IOV) {
+		fprintf(stderr, "[DTA] readv iov_count=%ld exceeds limit %u\n", (long)iov_count, MAX_PENDING_IOV);
+		return false;
+	}
+
+	uint32_t word_size = guest_ptr_bytes();
+	uint64_t entry_size = (uint64_t)word_size * 2U;
+	uint64_t requested_size = 0;
+	for (uint32_t i = 0; i < (uint32_t)iov_count; i++) {
+		if ((uint64_t)i > (UINT64_MAX - iov_addr) / entry_size) {
+			fprintf(stderr, "[DTA] readv iovec address overflow\n");
+			return false;
+		}
+
+		uint64_t entry =iov_addr + (uint64_t)i * entry_size;
+		uint64_t base = 0;
+		uint64_t size = 0;
+		if (!guest_read_uint(entry, word_size, &base) || !guest_read_uint(entry + word_size, word_size, &size)) {
+			fprintf(stderr, "[DTA] failed to read iovec[%u] at 0x%lx\n", i, (unsigned long)entry);
+			return false;
+		}
+
+		g_pending_input.iov[i].base = base;
+		g_pending_input.iov[i].size = size;
+
+		if (size > UINT64_MAX - requested_size) {
+			fprintf(stderr, "[DTA] readv requested size overflow\n");
+			return false;
+		}
+		requested_size += size;
+	}
+	if (requested_size == 0) {
+		return true;
+	}
+	g_pending_input.active = true;
+	g_pending_input.syscall_num = syscall_num;
+	g_pending_input.fd = fd;
+	g_pending_input.taint_source = force_taint || fd_is_taint_source(fd);
+	g_pending_input.iov_count = (uint32_t)iov_count;
+	g_pending_input.requested_size = requested_size;
+	return true;
+}
+
+static void apply_pending_input(int64_t syscall_num, int64_t syscall_ret) {
+	if (!g_pending_input.active) {
+		return;
+	}
+	if (g_pending_input.syscall_num != syscall_num) {
+		fprintf(stderr, "[DTA] pending input mismatch: expected=%ld actual=%ld\n", (long)g_pending_input.syscall_num, (long)syscall_num);
+		pending_input_reset();
+		return;
+	}
+	if (syscall_ret <= 0) {
+		pending_input_reset();
+		return;
+	}
+	uint64_t remaining = (uint64_t)syscall_ret;
+	if (remaining > g_pending_input.requested_size) {
+		remaining = g_pending_input.requested_size;
+	}
+	bool seeded_any = false;
+	for (uint32_t i = 0; i < g_pending_input.iov_count && remaining > 0; i++) {
+		uint64_t chunk = g_pending_input.iov[i].size;
+		if (chunk > remaining) {
+			chunk = remaining;
+		}
+		if (chunk == 0) {
+			continue;
+		}
+		uint64_t base = g_pending_input.iov[i].base;
+
+		if (g_pending_input.taint_source) {
+			if (!shadow_taint_range(g_shadow, base,chunk,0)) {
+				fprintf(stderr, "[DTA] failed to taint input range addr=0x%lx size=0x%lx\n", (unsigned long)base, (unsigned long)chunk);
+			} else {
+				seeded_any = true;
+			}
+		} else {
+			shadow_untaint_range(g_shadow, base, chunk);
+		}
+		remaining -= chunk;
+	}
+	if (seeded_any) {
+		g_taint_seen = true;
+	}
+	pending_input_reset();
+}
 
 //stub for dynamic reconstruction
 static const char *addr_lib_path(uint64_t addr) {
@@ -435,101 +615,201 @@ static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_
 	*out_val = value;
 	return true;
 }
-//separate rewrite and change
-static inline bool insn_overwrites_dst(uint16_t id) {
-	switch (id) {
-		case X86_INS_MOV: case X86_INS_MOVZX: case X86_INS_MOVSX: case X86_INS_POP: case X86_INS_LEA: case X86_INS_XCHG:
-			return true;
-		default:
-			return false;
-	}
-}
-// xchg reg, reg
-static bool taint_xchg_reg_reg(uint64_t vaddr, const InsnMeta *meta) {
-	if (!meta || meta->insn_id != X86_INS_XCHG || meta->has_mem_read || meta->has_mem_write || meta->size == 0 || meta->size > 15) {
-		return false;
-	}
+static uint8_t shadow_load_taint_mask(uint64_t vaddr, uint32_t size) {
+	uint8_t result = 0;
+	uint32_t width = size < MAX_REG_BYTES ? size : MAX_REG_BYTES;
 
-	uint8_t code[16] = {0};
-	GByteArray *instruction_bytes = g_byte_array_new();
-	if (!instruction_bytes)	return false;
-
-	bool read_ok = qemu_plugin_read_memory_vaddr(vaddr, instruction_bytes, meta->size);
-
-	if (!read_ok || instruction_bytes->len < meta->size) {
-		g_byte_array_free(instruction_bytes, TRUE);
-		return false;
-	}
-
-	memcpy(code, instruction_bytes->data, meta->size);
-	g_byte_array_free(instruction_bytes, TRUE);
-
-	cs_insn *decoded = NULL;
-	size_t decoded_count = cs_disasm(cs_handle,code, meta->size, vaddr, 1, &decoded);
-	if (decoded_count != 1 || !decoded || !decoded->detail) {
-		if (decoded) {
-			cs_free(decoded, decoded_count);
+	for (uint32_t byte = 0; byte < width; byte++) {
+		if (shadow_is_tainted(g_shadow, vaddr + byte)) {
+			result |= (uint8_t)(1U << byte);
 		}
+	}
+	return result;
+}
+
+static uint8_t dta_test_register_mask(RegId reg, uint8_t width)
+{
+	uint8_t result = 0;
+
+	if (reg < 0 || reg >= REG_COUNT) {
+		return 0;
+	}
+
+	if (width > MAX_REG_BYTES) {
+		width = MAX_REG_BYTES;
+	}
+
+	for (uint8_t byte = 0; byte < width; byte++) {
+		if (reg_shadow.bytes[reg][byte]) {
+			result |= (uint8_t)(1U << byte);
+		}
+	}
+
+	return result;
+}
+
+static bool dta_test_handle_marker(int64_t syscall_num,
+				   uint64_t a1,
+				   uint64_t a2,
+				   uint64_t a3,
+				   uint64_t a5,
+				   uint64_t a6)
+{
+	if (!is_i386 ||
+	    syscall_num != 20 || /* i386 getpid */
+	    (uint32_t)a1 != DTA_TEST_MAGIC) {
 		return false;
 	}
 
-	const cs_x86 *x86 = &decoded->detail->x86;
-	if (x86->op_count != 2) {
-		cs_free(decoded, decoded_count);
-		return false;
+	uint32_t test_id = (uint32_t)a2;
+	uint32_t control = (uint32_t)a3;
+	uint32_t mem_spec = (uint32_t)a6;
+
+	uint8_t expected_reg = (uint8_t)(control & 0xffU);
+	uint8_t expected_sink =
+		(uint8_t)((control >> 8) & 0xffU);
+
+	uint64_t mem_addr = (uint64_t)(uint32_t)a5;
+	uint8_t expected_mem = (uint8_t)(mem_spec & 0xffU);
+	uint8_t mem_width =
+		(uint8_t)((mem_spec >> 8) & 0xffU);
+
+	uint8_t actual_reg =
+		dta_test_register_mask(REG_RSI, 4);
+
+	uint8_t actual_mem = 0;
+	bool memory_ok;
+
+	if (mem_width == 0) {
+		memory_ok = true;
+	} else if (mem_width <= MAX_REG_BYTES && g_shadow) {
+		actual_mem =
+			shadow_load_taint_mask(mem_addr, mem_width);
+		memory_ok = actual_mem == expected_mem;
+	} else {
+		memory_ok = false;
 	}
 
-	const cs_x86_op *left =&x86->operands[0];
-	const cs_x86_op *right = &x86->operands[1];
-	if (left->type != X86_OP_REG || right->type != X86_OP_REG || left->size == 0 || left->size != right->size) {
-		cs_free(decoded, decoded_count);
-		return false;
+	bool sink_ok = false;
+	const char *expected_sink_name = "invalid";
+	const char *actual_sink_name = "none";
+
+	if (g_dta_test_last_indirect_valid) {
+		actual_sink_name =
+			g_dta_test_last_indirect_tainted
+				? "tainted"
+				: "clean";
 	}
 
-	int left_rid = x86_reg_to_rid(left->reg);
-	int right_rid = x86_reg_to_rid(right->reg);
-	if (left_rid < 0 || left_rid >= REG_COUNT || right_rid < 0 || right_rid >= REG_COUNT) {
-		cs_free(decoded, decoded_count);
-		return false;
+	switch ((dta_test_sink_t)expected_sink) {
+	case DTA_TEST_SINK_SKIP:
+		expected_sink_name = "skip";
+		sink_ok = true;
+		break;
+
+	case DTA_TEST_SINK_CLEAN:
+		expected_sink_name = "clean";
+		sink_ok =
+			g_dta_test_last_indirect_valid &&
+			!g_dta_test_last_indirect_tainted;
+		break;
+
+	case DTA_TEST_SINK_TAINTED:
+		expected_sink_name = "tainted";
+		sink_ok =
+			g_dta_test_last_indirect_valid &&
+			g_dta_test_last_indirect_tainted;
+		break;
+
+	default:
+		sink_ok = false;
+		break;
 	}
 
-	uint32_t operand_bytes = (uint32_t)left->size;
+	bool register_ok = actual_reg == expected_reg;
+	bool passed = register_ok && memory_ok && sink_ok;
 
-	if (operand_bytes == 0 || operand_bytes > 4) {
-		cs_free(decoded, decoded_count);
-		return false;
+	g_dta_test_total++;
+
+	if (!passed) {
+		g_dta_test_failed++;
 	}
 
-	uint32_t left_offset = 0;
-	uint32_t right_offset = 0;
+	fprintf(stderr,
+		"[DTA-TEST %s] id=%u "
+		"reg(actual=0x%02x expected=0x%02x) "
+		"mem(addr=0x%08lx width=%u "
+		"actual=0x%02x expected=0x%02x) "
+		"sink(actual=%s expected=%s)\n",
+		passed ? "PASS" : "FAIL",
+		test_id,
+		actual_reg,
+		expected_reg,
+		(unsigned long)mem_addr,
+		mem_width,
+		actual_mem,
+		expected_mem,
+		actual_sink_name,
+		expected_sink_name);
 
-	if (left->reg == X86_REG_AH || left->reg == X86_REG_BH || left->reg == X86_REG_CH || left->reg == X86_REG_DH) {
-		left_offset = 1;
-	}
-
-	if (right->reg == X86_REG_AH || right->reg == X86_REG_BH || right->reg == X86_REG_CH || right->reg == X86_REG_DH) {
-		right_offset = 1;
-	}
-
-	if ((left_offset + operand_bytes) > 4 || (right_offset + operand_bytes) > 4) {
-		cs_free( decoded, decoded_count);
-		return false;
-	}
-	uint8_t left_taint[4] = {0};
-	uint8_t right_taint[4] = {0};
-	for (uint32_t i = 0; i < operand_bytes; i++) {
-		left_taint[i] = reg_shadow.bytes[left_rid][left_offset + i];
-
-		right_taint[i] =reg_shadow.bytes[right_rid][right_offset + i];
-	}
-	for (uint32_t i = 0; i < operand_bytes; i++) {
-		reg_shadow.bytes[left_rid][left_offset + i] = right_taint[i];
-
-		reg_shadow.bytes[right_rid][right_offset + i] = left_taint[i];
-	}
-	cs_free(decoded, decoded_count);
+	/*
+	 * Следующий marker не должен случайно использовать результат
+	 * предыдущего indirect branch.
+	 */
+	g_dta_test_last_indirect_valid = false;
+	g_dta_test_last_indirect_tainted = false;
 
 	return true;
+}
+
+
+static void shadow_store_taint_mask(uint64_t vaddr, uint32_t size, uint8_t taint_mask) {
+	for (uint32_t byte = 0; byte < size; byte++) {
+		bool tainted = byte < MAX_REG_BYTES && (taint_mask & (uint8_t)(1U << byte)) != 0;
+		if (tainted) {
+			shadow_taint_byte(g_shadow, vaddr + byte, g_current_ip);
+			g_taint_seen = true;
+		} else {
+			shadow_untaint_byte(g_shadow, vaddr + byte);
+		}
+	}
+}
+
+static void apply_memory_store_taint(uint64_t vaddr, uint32_t size, const InsnMeta *meta) {
+	if (!g_shadow || size == 0) return;
+	if (size > MAX_REG_BYTES) {
+		if (!shadow_taint_range(g_shadow, vaddr, size, g_current_ip)) {
+			fprintf(stderr, "[DTA] failed to taint wide store addr=0x%lx size=%u\n", (unsigned long)vaddr, size);
+		} else {
+			g_taint_seen = true;
+		}
+		g_dta_mem_transfer.last_read_valid = false;
+		return;
+	}
+	bool context_valid = g_dta_mem_transfer.active && g_dta_mem_transfer.pc == g_current_ip;
+	if (!meta || !context_valid) {
+		uint8_t full_mask = size == MAX_REG_BYTES ? UINT8_MAX : (uint8_t)((1U << size) - 1U);
+		shadow_store_taint_mask(vaddr, size, full_mask);
+		g_dta_mem_transfer.last_read_valid = false;
+		return;
+	}
+	uint8_t old_mem_taint = shadow_load_taint_mask(vaddr, size);
+	uint8_t effective_old_mem_taint = old_mem_taint;
+	if (meta->has_mem_read) {
+		effective_old_mem_taint = dta_effective_mem_read_taint( &g_dta_mem_transfer.pre_regs, meta, old_mem_taint, (uint8_t)size);
+	}
+	bool source_mem_valid = g_dta_mem_transfer.last_read_valid && g_dta_mem_transfer.last_read_size == size;
+	uint8_t source_mem_taint = source_mem_valid ? g_dta_mem_transfer.last_read_taint : 0;
+	uint8_t result_taint = 0;
+	DtaTransferResult result = dta_compute_mem_write_taint(&g_dta_mem_transfer.pre_regs, meta, effective_old_mem_taint, source_mem_valid, source_mem_taint, (uint8_t)size, &result_taint);
+	if (result == DTA_TRANSFER_NOT_APPLICABLE) {
+		result_taint = size == MAX_REG_BYTES ? UINT8_MAX : (uint8_t)((1U << size) - 1U);
+	}
+	if (meta->insn_id == X86_INS_XCHG) {
+		(void)dta_apply_mem_read_transfer( &reg_shadow,&g_dta_mem_transfer.pre_regs, meta, old_mem_taint, (uint8_t)size);
+	}
+	shadow_store_taint_mask(vaddr, size, result_taint);
+	g_dta_mem_transfer.last_read_valid = false;
 }
 
 static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
@@ -540,32 +820,107 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
 			g_cur_aux->has_mem_write  = true;
 			g_cur_aux->mem_write_addr = vaddr;
 		}
+		InsnMeta *meta = meta_lookup(g_current_ip);
+		apply_memory_store_taint(vaddr, sz,meta);
 		return;
 	}
 	//taint byte by byte
-	uint8_t tmask = 0;
-	for (uint32_t i = 0; i < sz && i < 8; i++) {
-		if (shadow_is_tainted(g_shadow, vaddr + i)) tmask |= (1u << i);
-	}
 	//mem2reg propagate
 	InsnMeta *meta = meta_lookup(g_current_ip);
-	if (meta && meta->wr_reg >= 0) {
-		bool overwrite = insn_overwrites_dst(meta->insn_id);
-		propagate_mem2reg(&reg_shadow, meta->wr_reg, meta->wr_mask, tmask, overwrite);
+	bool context_valid = g_dta_mem_transfer.active && g_dta_mem_transfer.pc == g_current_ip;
+	uint8_t mem_width = (uint8_t)(sz < MAX_REG_BYTES ? sz : MAX_REG_BYTES);
+	uint8_t raw_tmask = shadow_load_taint_mask(vaddr, sz);
+	uint8_t tmask = raw_tmask;
+	if (meta && context_valid) {
+		tmask = dta_effective_mem_read_taint(&g_dta_mem_transfer.pre_regs, meta, raw_tmask, mem_width);
+	}
+	if (context_valid) {
+		g_dta_mem_transfer.last_read_valid = true;
+		g_dta_mem_transfer.last_read_size = sz;
+		g_dta_mem_transfer.last_read_taint = tmask;
+	}
+	if (meta && meta->insn_id == X86_INS_POPAL) {
+		if (g_cur_aux && sz == 4) {
+			uint32_t old_esp =(uint32_t)g_cur_aux->reg_vals[REG_RSP];
+			uint32_t offset =(uint32_t)vaddr - old_esp;
+			x86_reg destination = X86_REG_INVALID;
+
+			switch (offset) {
+				case 0:
+					destination = X86_REG_EDI;
+					break;
+				case 4:
+					destination = X86_REG_ESI;
+					break;
+				case 8:
+					destination = X86_REG_EBP;
+					break;
+				case 16:
+					destination = X86_REG_EBX;
+					break;
+				case 20:
+					destination = X86_REG_EDX;
+					break;
+				case 24:
+					destination = X86_REG_ECX;
+					break;
+				case 28:
+					destination = X86_REG_EAX;
+					break;
+				default:
+					break;
+			}
+			if (destination != X86_REG_INVALID) {
+				int rid =x86_reg_to_rid(destination);
+				if (rid >= 0 && rid < REG_COUNT) {
+					for (uint32_t i = 0; i < 4; i++) {
+						reg_shadow.bytes[rid][i] = (tmask >> i) & 1u;
+					}
+				}
+			}
+		}
+	} else if (meta && meta->insn_id == X86_INS_LEAVE) {
+		uint8_t old_ebp_taint[4];
+		for (uint32_t i = 0; i < 4; i++) {
+			old_ebp_taint[i] =reg_shadow.bytes[REG_RBP][i];
+		}
+		for (uint32_t i = 0; i < 4; i++) {
+			reg_shadow.bytes[REG_RSP][i] = old_ebp_taint[i];
+		}
+		uint32_t popped_bytes = sz < 4 ? sz : 4;
+		for (uint32_t i = 0; i < popped_bytes;i++) {
+			reg_shadow.bytes[REG_RBP][i] = (tmask >> i) & 1u;
+		}
+	} else if (meta && context_valid) {
+		(void)dta_apply_mem_read_transfer(&reg_shadow, &g_dta_mem_transfer.pre_regs, meta,raw_tmask, mem_width);
+	} else if (meta) {
+		RegSlice dst = meta_first_reg_write(meta);
+		if (reg_slice_is_valid(dst)) {
+			reg_slice_taint_set(&reg_shadow, dst, g_current_ip);
+
+		}
 	}
 	if (g_cur_aux) {
-		g_cur_aux->has_mem_read  = true;
-		g_cur_aux->mem_read_addr = vaddr;
 		GByteArray *arr = g_byte_array_new();
-		uint64_t val = 0;
-		if (qemu_plugin_read_memory_vaddr(vaddr, arr, sz)) {
-			for (uint32_t i = 0; i < sz && i < arr->len && i < 8; i++) {
-				val |= (uint64_t)arr->data[i] << (8 * i);
+		uint64_t value = 0;
+		if (qemu_plugin_read_memory_vaddr(vaddr,arr,sz)) {
+			for (uint32_t i = 0;i < sz && i < arr->len && i < 8;i++) {
+				value |= (uint64_t)arr->data[i] << (8 * i);
 			}
 		}
 		g_byte_array_free(arr, TRUE);
-		g_cur_aux->mem_read_val   = val;
+		g_cur_aux->has_mem_read = true;
+		g_cur_aux->mem_read_addr = vaddr;
+		g_cur_aux->mem_read_val = value;
 		g_cur_aux->mem_read_taint = tmask;
+		if (g_cur_aux->mem_read_count < 8) {
+			DseMemRead *read = &g_cur_aux->mem_reads[g_cur_aux->mem_read_count];
+			read->addr = vaddr;
+			read->value = value;
+			read->taint = tmask;
+			read->size = (uint8_t)sz;
+			g_cur_aux->mem_read_count++;
+		}
 	}
 }
 
@@ -622,17 +977,25 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
 	fprintf(stderr, "[SYSCALL] %s requested=0x%lx mapped=0x%lx size=0x%lx prot=0x%x flags=0x%x fd=%d offset=0x%lx\n", name, (unsigned long)pending->requested_addr, (unsigned long)mapped_addr, (unsigned long)pending->size, pending->prot, pending->flags, pending->fd, (unsigned long)pending->offset);
 	lib_update_mapping((uint32_t)pending->fd, mapped_addr, pending->size);
 
-	if (!(pending->prot & 0x2) && !(pending->prot & 0x4)) return;
-
 	uint64_t page_mask = (uint64_t)page_size - 1;
 	uint64_t last_addr = mapped_addr + pending->size - 1;
 	uint64_t page_start = mapped_addr & ~page_mask;
 	uint64_t page_last = last_addr & ~page_mask;
+	uint64_t mapped_size = (page_last - page_start) +(uint64_t)page_size;
+	shadow_untaint_range(g_shadow, page_start, mapped_size);
+	bool anonymous_mapping = (pending->flags & GUEST_MAP_ANONYMOUS) != 0 || pending->fd < 0;
+	if (!anonymous_mapping && fd_is_taint_source(pending->fd)) {
+		if (!shadow_taint_range(g_shadow, mapped_addr, pending->size,0)) {
+			fprintf(stderr, "[DTA] failed to taint file-backed mmap addr=0x%lx size=0x%lx fd=%d\n", (unsigned long)mapped_addr, (unsigned long)pending->size, pending->fd);
+		} else {
+			g_taint_seen = true;
+		}
+	}
+	if (!(pending->prot & 0x2) && !(pending->prot & 0x4)) return;
 
 	for (uint64_t addr = page_start;; addr += page_size) {
 		gpointer key = (gpointer)(uintptr_t)addr;
 		page_t *p = g_hash_table_lookup(pages, key);
-
 		if (p) {
 			p->prot = pending->prot;
 		} else {
@@ -640,11 +1003,9 @@ static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_ad
 			p->prot = pending->prot;
 			g_hash_table_insert(pages, key, p);
 		}
-
 		if ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key)) {
 			p->dyn_exec = true;
 			p->gen_written = g_unpack_gen;
-
 			if (g_layer_has_cand) {
 				g_layer_dirty = true;
 			}
@@ -698,14 +1059,26 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
 	if (!pending || !pending->active || pending->size == 0) {
 		return;
 	}
+	if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
+		fprintf(stderr, "[MUNMAP] invalid page size: 0x%lx\n", (unsigned long)page_size);
+		return;
+	}
 
 	uint64_t addr = pending->requested_addr;
 	uint64_t size = pending->size;
+	if ((size - 1) > UINT64_MAX - addr) {
+		fprintf(stderr, "[MUNMAP] range overflow: addr=0x%lx size=0x%lx\n", (unsigned long)addr, (unsigned long)size);
+		return;
+	}
 	uint64_t page_mask = (uint64_t)page_size - 1;
+	uint64_t last_addr = addr + size - 1;
 	uint64_t page_start = addr & ~page_mask;
-	uint64_t page_end = (addr + size + page_size - 1) & ~page_mask;
+	uint64_t page_last = last_addr & ~page_mask;
+	uint64_t unmapped_size = (page_last - page_start) + (uint64_t)page_size;
+	
+	shadow_untaint_range(g_shadow, page_start, unmapped_size);
 
-	for (uint64_t page_addr = page_start; page_addr < page_end; page_addr += page_size) {
+	for (uint64_t page_addr = page_start;; page_addr += page_size) {
 		gpointer key = (gpointer)(uintptr_t)page_addr;
 		g_hash_table_add(unmapped_pages, key);
 
@@ -715,23 +1088,36 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
 			g_free(p->wbitmap);
 			g_free(p);
 		}
+		if (page_addr == page_last) {
+			break;
+		}
 	}
+
 	fprintf(stderr, "[SYSCALL] munmap(0x%lx, 0x%lx)\n", (unsigned long)addr, (unsigned long)size);
 }
 
 static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 	for (GList *l = file_deps; l; l = l->next) {
-		file_dep_t *f = (file_dep_t*)l->data;
-		if (f->path && strcmp(f->path, path) == 0) return f;
+		file_dep_t *f = (file_dep_t *)l->data;
+		if (f->path && strcmp(f->path, path) == 0) {
+			if (is_lib) {
+				f->taint_source = false;
+			}
+			return f;
+		}
 	}
 	file_dep_t *f = g_new0(file_dep_t, 1);
 	f->path = g_strdup(path);
 	f->write = false;
+	//external - taint source, lib - clear
+	f->taint_source = !is_lib;
 	file_deps = g_list_append(file_deps, f);
 	if (is_lib && !strstr(path, ".cache")) {
 		for (GList *l = lib_deps; l; l = l->next) {
-			lib_mapping_t *lm = (lib_mapping_t*)l->data;
-			if (lm->path && strcmp(lm->path, path) == 0) return f;
+			lib_mapping_t *lm = (lib_mapping_t *)l->data;
+			if (lm->path && strcmp(lm->path, path) == 0) {
+				return f;
+			}
 		}
 		lib_mapping_t *lm = g_new0(lib_mapping_t, 1);
 		lm->path = g_strdup(path);
@@ -739,6 +1125,7 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 		lm->size = 0;
 		lib_deps = g_list_append(lib_deps, lm);
 	}
+
 	return f;
 }
 //mark write
@@ -773,11 +1160,7 @@ static void mark_written(uint64_t vaddr, uint32_t size) {
 }
 
 static void on_mem_write(unsigned int vcpu_idx, qemu_plugin_meminfo_t info, uint64_t vaddr, void *userdata) {
-	g_taint_seen = true;
 	uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
-	for (uint32_t i = 0; i < size; i++) {
-		shadow_taint_byte(g_shadow, vaddr + i, g_current_ip);
-	}
 	mark_written(vaddr, size);
 }
 
@@ -939,23 +1322,66 @@ static oep_cand_t *choose_oep_cand(void) {
 }
 
 //auxv PT_LOAD union, main logic
-static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num,uint64_t base_adjust) {
-	if (!phdr_va || !num || ent < 8) return false;
+static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num, uint64_t base_adjust) {
+	if (!phdr_va || !num || num > 512) {
+		return false;
+	}
 	bool w64 = (guest_ptr_bytes() == 8);
 	uint64_t off_vaddr = w64 ? 16 : 8;
 	uint64_t off_memsz = w64 ? 40 : 20;
+	uint64_t min_ent = w64 ? 56 : 32;
 	uint32_t fld = w64 ? 8 : 4;
-	uint64_t lo = UINT64_MAX, hi = 0;
-	for (uint64_t i = 0; i < num && i < 512; i++) {
+	if (ent < min_ent) {
+		return false;
+	}
+
+	uint64_t lo = UINT64_MAX;
+	uint64_t hi = 0;
+	for (uint64_t i = 0; i < num; i++) {
+		if (i > (UINT64_MAX - phdr_va) / ent) {
+			return false;
+		}
 		uint64_t ph = phdr_va + i * ent;
-		uint64_t p_type = 0, p_vaddr = 0, p_memsz = 0;
-		if (!guest_read_uint(ph, 4, &p_type)) break;
-		if (p_type != 1) continue;
-		if (!guest_read_uint(ph + off_vaddr, fld, &p_vaddr)) break;
-		if (!guest_read_uint(ph + off_memsz, fld, &p_memsz)) break;
+		uint64_t p_type = 0;
+		uint64_t p_vaddr = 0;
+		uint64_t p_memsz = 0;
+		if (!guest_read_uint(ph, 4, &p_type)) {
+			return false;
+		}
+		if (p_type != 1) { // PT_LOAD
+			continue;
+		}
+		if (ph > UINT64_MAX - off_memsz) {
+			return false;
+		}
+		if (!guest_read_uint(ph + off_vaddr,fld, &p_vaddr) || !guest_read_uint(ph + off_memsz, fld, &p_memsz)) {
+			return false;
+		}
+		if (p_memsz == 0) {
+			continue;
+		}
+		if (p_vaddr > UINT64_MAX - base_adjust) {
+			return false;
+		}
 		uint64_t start = p_vaddr + base_adjust;
-		if (start < lo) lo = start;
-		if (start + p_memsz > hi) hi = start + p_memsz;
+		if (!w64) {
+			const uint64_t guest_limit = 1ULL << 32;
+			if (start >= guest_limit) {
+				continue;
+			}
+			if (p_memsz > guest_limit - start) {
+				p_memsz = guest_limit - start;
+			}
+		}
+		if (p_memsz > UINT64_MAX - start) {
+			return false;
+		}
+		if (start < lo) {
+			lo = start;
+		}
+		if (start + p_memsz > hi) {
+			hi = start + p_memsz;
+		}
 	}
 	if (hi > lo) {
 		g_main_lo = lo;
@@ -965,83 +1391,268 @@ static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num,uint6
 	}
 	return false;
 }
-//read auxv
-static void read_auxv_from_stack(void) {
-	uint32_t pb = guest_ptr_bytes();
-	uint64_t sp = 0;
-	if (!dse_read_reg(REG_RSP, &sp)) { fprintf(stderr, "[AUXV] fail: cannot read REG_RSP\n"); return; }
-	if (pb == 4) sp &= 0xFFFFFFFFULL;
-
-	uint64_t argc = 0;
-	if (!guest_read_uint(sp, pb, &argc)) { fprintf(stderr, "[AUXV] fail: cannot read argc at sp=0x%lx\n", (unsigned long)sp); return; }
-	uint64_t p = sp + pb;
-	p += argc * pb;
-	p += pb;
-	for (int guard = 0; guard < 8192; guard++) {
-		uint64_t e = 0;
-		if (!guest_read_uint(p, pb, &e)) return;
-		p += pb;
-		if (e == 0) break;
+//init taint
+static bool seed_main_file_taint(uint64_t phdr_va, uint64_t ent, uint64_t num, uint64_t base_adjust) {
+	if (g_initial_taint_seeded) return true;
+	if (!g_shadow || !phdr_va || !num || num > 512) {
+		return false;
 	}
-
-	uint64_t at_phdr = 0, at_phent = 0, at_phnum = 0, ptphdr_vaddr = 0;
-	bool have_ptphdr = false;
-	uint64_t scan = p;
-	for (int guard = 0; guard < 128; guard++) {
-		uint64_t type = 0, val = 0;
-		if (!guest_read_uint(scan, pb, &type)) { fprintf(stderr, "[AUXV] fail: auxv type read at 0x%lx\n", (unsigned long)scan); return; }
-		if (!guest_read_uint(scan + pb, pb, &val)) { fprintf(stderr, "[AUXV] fail: auxv val read at 0x%lx\n", (unsigned long)(scan+pb)); return; }
-		scan += 2 * pb;
-		if (type == AT_NULL) break;
-		switch (type) {
-			case AT_PHDR:  at_phdr  = val; break;
-			case AT_PHENT: at_phent = val; break;
-			case AT_PHNUM: at_phnum = val; break;
-			case AT_BASE:  g_ld_base = val; break;
-			case AT_ENTRY: g_stub_entry = val; break;
-			case AT_PAGESZ:
-				if (val && (size_t)val != page_size)
-					fprintf(stderr, "[AUXV] AT_PAGESZ=0x%lx differs from page_size=0x%lx\n", (unsigned long)val, (unsigned long)page_size);
-				if (val) page_size = (size_t)val;
-				break;
-		}
-	}
-
-	if (!at_phdr || !at_phnum || at_phent <8) { fprintf(stderr, "[AUXV] fail: no AT_PHDR (phdr=0x%lx phnum=%lu phent=%lu)\n", (unsigned long)at_phdr, (unsigned long)at_phnum, (unsigned long)at_phent); return; }
-
 	bool w64 = (guest_ptr_bytes() == 8);
 	uint64_t off_vaddr = w64 ? 16 : 8;
+	uint64_t off_filesz = w64 ? 32 : 16;
+	uint64_t off_memsz = w64 ? 40 : 20;
+	uint64_t min_ent = w64 ? 56 : 32;
 	uint32_t fld = w64 ? 8 : 4;
+	if (ent < min_ent) {
+		return false;
+	}
+	typedef struct {
+		uint64_t start;
+		uint64_t size;
+	} initial_taint_range_t;
+	initial_taint_range_t ranges[512];
+	uint32_t range_count = 0;
+	uint64_t total = 0;
+	for (uint64_t i = 0; i < num; i++) {
+		if (i > (UINT64_MAX - phdr_va) / ent) {
+			return false;
+		}
+		uint64_t ph = phdr_va + i * ent;
+		uint64_t p_type = 0;
+		uint64_t p_vaddr = 0;
+		uint64_t p_filesz = 0;
+		uint64_t p_memsz = 0;
+		if (!guest_read_uint(ph, 4, &p_type)) {
+			return false;
+		}
+		if (p_type != 1) { // PT_LOAD
+			continue;
+		}
+		if (ph > UINT64_MAX - off_memsz || !guest_read_uint(ph + off_vaddr, fld, &p_vaddr) || !guest_read_uint(ph + off_filesz, fld, &p_filesz) || !guest_read_uint(ph + off_memsz, fld, &p_memsz)) {
+			return false;
+		}
+		if (p_filesz == 0 || p_memsz == 0) {
+			continue;
+		}
+		if (p_filesz > p_memsz) {
+			p_filesz = p_memsz;
+		}
+		if (p_vaddr > UINT64_MAX - base_adjust) {
+			return false;
+		}
+		uint64_t start = p_vaddr + base_adjust;
+		if (!w64) {
+			const uint64_t guest_limit = 1ULL << 32;
+			if (start >= guest_limit) {
+				continue;
+			}
+			if (p_filesz > guest_limit - start) {
+				p_filesz = guest_limit - start;
+			}
+		}
+		if (p_filesz == 0) continue;
+		if (p_filesz > MAX_INITIAL_TAINT_BYTES - total) {
+			fprintf(stderr, "[DTA] initial taint exceeds limit 0x%lx\n", (unsigned long) MAX_INITIAL_TAINT_BYTES);
+			return false;
+		}
+		ranges[range_count].start = start;
+		ranges[range_count].size = p_filesz;
+		range_count++;
+		total += p_filesz;
+	}
+	if (range_count == 0 || total == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < range_count; i++) {
+		if (!shadow_taint_range(g_shadow, ranges[i].start, ranges[i].size, 0)) {
+			fprintf(stderr, "[DTA] failed to seed PT_LOAD range addr=0x%lx size=0x%lx\n", (unsigned long)ranges[i].start, (unsigned long)ranges[i].size);
+			return false;
+		}
+	}
+	g_initial_taint_seeded = true;
+	g_taint_seen = true;
+	fprintf(stderr, "[DTA] seeded %lu file-backed bytes from main ELF\n", (unsigned long)total);
+	return true;
+}
+//read auxv
+static bool read_auxv_from_stack(void) {
+	uint32_t pb = guest_ptr_bytes();
+	uint64_t sp = 0;
+	if (g_initial_sp_valid) {
+		sp = g_initial_sp;
+	} else {
+		if (!dse_read_reg(REG_RSP, &sp)) {
+			fprintf(stderr, "[AUXV] fail: cannot read initial REG_RSP\n");
+			return false;
+		}
+		if (pb == 4) {
+			sp &= 0xFFFFFFFFULL;
+		}
+		if (sp == 0) {
+			fprintf(stderr, "[AUXV] fail: initial REG_RSP is zero\n");
+			return false;
+		}
+		g_initial_sp = sp;
+		g_initial_sp_valid = true;
+	}
+	uint64_t argc = 0;
+	if (!guest_read_uint(sp, pb, &argc)) {
+		fprintf(stderr, "[AUXV] fail: cannot read argc at sp=0x%lx\n", (unsigned long)sp);
+		return false;
+	}
+	if (sp > UINT64_MAX - pb || argc > MAX_AUXV_ARGC || argc > (UINT64_MAX - sp - pb) / pb) {
+		fprintf(stderr, "[AUXV] fail: invalid argc=%lu\n", (unsigned long)argc);
+		return false;
+	}
+	uint64_t p = sp + pb + argc * pb;
+	if (p > UINT64_MAX - pb) {
+		return false;
+	}
+	p += pb;
+
+	bool env_end_found = false;
+
+	for (int guard = 0; guard < 8192; guard++) {
+		uint64_t env = 0;
+		if (!guest_read_uint(p, pb, &env)) {
+			fprintf(stderr, "[AUXV] fail: envp read at 0x%lx\n", (unsigned long)p);
+			return false;
+		}
+		if (p > UINT64_MAX - pb) {
+			return false;
+		}
+		p += pb;
+		if (env == 0) {
+			env_end_found = true;
+			break;
+		}
+	}
+	if (!env_end_found) {
+		fprintf(stderr, "[AUXV] fail: envp terminator not found\n");
+		return false;
+	}
+	uint64_t at_phdr = 0;
+	uint64_t at_phent = 0;
+	uint64_t at_phnum = 0;
+	uint64_t at_base = 0;
+	uint64_t at_entry = 0;
+	uint64_t at_pagesz = 0;
+	bool aux_end_found = false;
+	uint64_t scan = p;
+	for (int guard = 0; guard < 128; guard++) {
+		uint64_t type = 0;
+		uint64_t val = 0;
+		if (scan > UINT64_MAX - pb || !guest_read_uint(scan, pb, &type)) {
+			fprintf(stderr, "[AUXV] fail: auxv type read at 0x%lx\n", (unsigned long)scan);
+			return false;
+		}
+		if (!guest_read_uint(scan + pb, pb, &val)) {
+			fprintf(stderr, "[AUXV] fail: auxv value read at 0x%lx\n", (unsigned long)(scan + pb));
+			return false;
+		}
+		if (scan > UINT64_MAX - 2U * pb) {
+			return false;
+		}
+		scan += 2U * pb;
+		if (type == AT_NULL) {
+			aux_end_found = true;
+			break;
+		}
+		switch (type) {
+		case AT_PHDR:
+			at_phdr = val;
+			break;
+		case AT_PHENT:
+			at_phent = val;
+			break;
+		case AT_PHNUM:
+			at_phnum = val;
+			break;
+		case AT_BASE:
+			at_base = val;
+			break;
+		case AT_ENTRY:
+			at_entry = val;
+			break;
+		case AT_PAGESZ:
+			at_pagesz = val;
+			break;
+		}
+	}
+	if (!aux_end_found) {
+		fprintf(stderr, "[AUXV] fail: AT_NULL not found\n");
+		return false;
+	}
+	bool w64 = (guest_ptr_bytes() == 8);
+	uint64_t min_phent = w64 ? 56 : 32;
+
+	if (!at_phdr || !at_phnum || at_phnum > 512 || at_phent < min_phent) {
+		fprintf(stderr, "[AUXV] fail: invalid PHDR data (phdr=0x%lx phnum=%lu phent=%lu)\n", (unsigned long)at_phdr, (unsigned long)at_phnum, (unsigned long)at_phent);
+		return false;
+	}
+	uint64_t off_vaddr = w64 ? 16 : 8;
+	uint32_t fld = w64 ? 8 : 4;
+	uint64_t ptphdr_vaddr = 0;
 	uint64_t min_load_vaddr = UINT64_MAX;
-	for (uint64_t i = 0; i < at_phnum && i < 512; i++) {
+	bool have_ptphdr = false;
+	for (uint64_t i = 0; i < at_phnum; i++) {
+		if (i > (UINT64_MAX - at_phdr) / at_phent) {
+			return false;
+		}
 		uint64_t ph = at_phdr + i * at_phent;
-		uint64_t p_type = 0, p_vaddr = 0;
-		if (!guest_read_uint(ph, 4, &p_type)) break;
-		if (p_type == 6) { //PT_PHDR
-			if (guest_read_uint(ph + off_vaddr, fld, &p_vaddr) && p_vaddr <= at_phdr) {
-				ptphdr_vaddr = p_vaddr;
+		uint64_t p_type = 0;
+		uint64_t p_vaddr = 0;
+		if (!guest_read_uint(ph, 4, &p_type) || ph > UINT64_MAX - off_vaddr || !guest_read_uint(ph + off_vaddr, fld, &p_vaddr)) {
+			return false;
+		}
+		if (p_type == 6) { // PT_PHDR
+			if (p_vaddr <= at_phdr) {
+				ptphdr_vaddr= p_vaddr;
 				have_ptphdr = true;
 			}
-		} else if (p_type == 1) { //PT_LOAD
-			if (guest_read_uint(ph + off_vaddr, fld, &p_vaddr) && p_vaddr < min_load_vaddr) {
+		} else if (p_type == 1) { // PT_LOAD
+			if (p_vaddr < min_load_vaddr) {
 				min_load_vaddr = p_vaddr;
 			}
 		}
 	}
-	uint64_t bias;
+	uint64_t effective_page_size = at_pagesz ? at_pagesz : page_size;
+
+	if (effective_page_size == 0 || (effective_page_size & (effective_page_size - 1)) != 0) {
+		fprintf(stderr, "[AUXV] fail: invalid AT_PAGESZ=0x%lx\n", (unsigned long)effective_page_size);
+		return false;
+	}
+	uint64_t bias = 0;
 	if (have_ptphdr) {
-		//bias = runtime phdr address - PT_PHDR.p_vaddr
+		if (at_phdr < ptphdr_vaddr) {
+			return false;
+		}
 		bias = at_phdr - ptphdr_vaddr;
 	} else if (min_load_vaddr != UINT64_MAX) {
-		//fallback for stubs without PT_PHDR
-		uint64_t pmask = ~((uint64_t)page_size - 1);
-		bias = (at_phdr & pmask) - (min_load_vaddr & pmask);
+		uint64_t page_mask = ~(effective_page_size - 1);
+		uint64_t runtime_page = at_phdr & page_mask;
+		uint64_t load_page = min_load_vaddr & page_mask;
+
+		if (runtime_page < load_page) {
+			return false;
+		}
+		bias = runtime_page - load_page;
 	} else {
-		bias = 0;
+		fprintf(stderr, "[AUXV] fail: no PT_LOAD program header\n");
+		return false;
 	}
-	if (window_from_phdrs(at_phdr, at_phent, at_phnum, bias)) {
-		fprintf(stderr, "[WINDOW] auxv: main [0x%lx,0x%lx) ld_base=0x%lx entry=0x%lx bias=0x%lx\n", (unsigned long)g_main_lo, (unsigned long)g_main_hi, (unsigned long)g_ld_base, (unsigned long)g_stub_entry,(unsigned long)bias);
+	//seeding + window = success
+	if (!window_from_phdrs(at_phdr, at_phent, at_phnum, bias) || !seed_main_file_taint(at_phdr, at_phent, at_phnum, bias)) {
+		return false;
 	}
+	if (at_pagesz && at_pagesz != page_size) {
+		fprintf(stderr, "[AUXV] AT_PAGESZ=0x%lx differs from default page_size=0x%lx\n", (unsigned long)at_pagesz, (unsigned long)page_size);
+	}
+	page_size = (size_t)effective_page_size;
+	g_ld_base = at_base;
+	g_stub_entry = at_entry;
+	fprintf(stderr, "[WINDOW] auxv: main [0x%lx,0x%lx) ld_base=0x%lx entry=0x%lx bias=0x%lx\n", (unsigned long)g_main_lo, (unsigned long)g_main_hi, (unsigned long)g_ld_base, (unsigned long)g_stub_entry, (unsigned long)bias);
+	return true;
 }
 //bases form ELF phdrs, fallback if no auxv read
 static bool window_from_elf_header(uint64_t base) {
@@ -1443,13 +2054,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	}
 }
 
-static int mask_first_reg(uint32_t mask) {
-	for (int i = 0; i < REG_COUNT; i++) {
-		if (mask & (1U << i)) return i;
-	}
-	return -1;
-}
-
 static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
 	for (size_t i = 0; i < size; i++) {
 		uint64_t addr = vaddr + i;
@@ -1470,25 +2074,40 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
 
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t vaddr = (uint64_t)(uintptr_t) udata;
+	g_cur_aux = NULL;
 	g_current_ip = vaddr;
+	g_dta_mem_transfer.active = true;
+	g_dta_mem_transfer.pc = vaddr;
+	g_dta_mem_transfer.pre_regs = reg_shadow;
+	g_dta_mem_transfer.last_read_valid = false;
+	g_dta_mem_transfer.last_read_size = 0;
+	g_dta_mem_transfer.last_read_taint = 0;
 	g_icount++;
 
-	if (!g_auxv_done) { 
-		if (!g_regs_ready) dse_init_reg_handles();
-		g_auxv_done = true;
-		read_auxv_from_stack();
+	if (!g_auxv_done && g_icount >= g_auxv_next_retry) {
+		if (!g_regs_ready) {
+			dse_init_reg_handles();
+		}
+		g_auxv_attempts++;
+		g_auxv_done = read_auxv_from_stack();
+		if (!g_auxv_done) {
+			uint32_t shift = g_auxv_attempts < 16 ? g_auxv_attempts : 16;
+			uint64_t delay = 1ULL << shift;
+			g_auxv_next_retry = g_icount > UINT64_MAX - delay ? UINT64_MAX : g_icount + delay;
+		}
 	}
 
 	InsnMeta *meta = meta_lookup(vaddr);
-	if (!meta) {
+	if (!meta){
 		prev_jump_pending = false;
 		prev_jump_site = 0;
 		prev_target_reg =REG_INVALID;
 		prev_mem_taddr = 0;
 		prev_mem_target_value = 0;
 		prev_mem_target_valid = false;
+		prev_target_tainted = false;
 		return;
-}
+	}
 
 	//tracer
 	if (g_trace) {
@@ -1573,7 +2192,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		}
 		c->dse_concretized = dse_lift_concretized_count();
 		c->dse_total =dse_lift_total_count();
-		fprintf(stderr,"[OEP-CAND gen=%u] 0x%lx (jmp@0x%lx) dse=%s ""(concretized %u/%u; aux_miss %u, unsup %u)\n", c->generation, (unsigned long)c->addr, (unsigned long)c->jump_site, c->dse_confirmed ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
+		fprintf(stderr, "[OEP-CAND gen=%u] 0x%lx jmp@0x%lx) target_taint=%s dse=%s (concretized %u/%u; aux_miss %u, unsup %u)\n", c->generation, (unsigned long)c->addr, (unsigned long)c->jump_site, prev_target_tainted ? "yes" : "no", c->dse_confirmed ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
 		//proceed to next layer
 		oep_cands = g_list_append(oep_cands, c);
 		g_layer_has_cand = true;
@@ -1585,7 +2204,8 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	prev_mem_taddr = 0;
 	prev_mem_target_value = 0;
 	prev_mem_target_valid = false;
-	//if we are too long in unpacked code without proceeding further - we end cycle
+	prev_target_tainted = false;
+	//if we are too long in unpacked code without proceeding further - we end the cycle
 	if (now_unpacked && !oep_found && g_last_cand_icount && (g_icount - g_last_cand_icount) > 200000) {
 		oep_cand_t *chosen = choose_oep_cand();
 		if (chosen) {
@@ -1595,107 +2215,34 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			do_dump(oep_addr);
 		}
 	}
-	//taint propagation
-	//xchg
-	if (meta->insn_id == X86_INS_XCHG) {
-		if (meta->has_mem_read || meta->has_mem_write) {
-			goto record_branch;
-		}
-
-		if (!taint_xchg_reg_reg(vaddr, meta)) {
-			uint32_t affected = meta->regs_read_mask | meta->regs_written_mask;
-			for (int rid = 0; rid < REG_COUNT; rid++) {
-				if (!(affected & (1U << rid))) {
-					continue;
-				}
-
-				for (int byte = 0; byte < 4; byte++) {
-					reg_shadow.bytes[rid][byte] = 1;
-				}
-			}
-		}
-
-	goto record_branch;
-	}
-	//xor or sub with itself, like sub al, al or xor al, al. have to lead to taint clean
-	if ((meta->insn_id == X86_INS_XOR || meta->insn_id == X86_INS_SUB) && meta->regs_read_mask == meta->regs_written_mask && meta->regs_read_mask != 0) {
-		int reg = mask_first_reg(meta->regs_written_mask);
-		if (reg >= 0) reg_propagate_clear(&reg_shadow, reg);
-		goto record_branch;
-	}
-	//if const have been changed we will see at mem_taint
-	if (meta->regs_read_mask == 0 && meta->regs_written_mask != 0 && !meta->has_mem_read && !meta->has_mem_write) {
-		int dst = mask_first_reg(meta->regs_written_mask);
-		if (dst >= 0) reg_propagate_clear(&reg_shadow, dst);
-		goto record_branch;
-	}
-	// lea with two registers
-	if (meta->insn_id == X86_INS_LEA) {
-		int dst = meta->wr_reg;
-		int src1 = -1, src2 = -1;
-		for (int i = 0; i < REG_COUNT; i++) {
-			if (meta->mem_addr_reg_mask & (1U << i)) {
-				if (src1 < 0){ 
-					src1 = i;
-				}else { 
-					src2 = i;
-					break;
-				}
-			}
-		}
-		if (dst >= 0 && src1 >= 0) {
-			propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
-		} else if (dst >= 0) {
-			reg_propagate_clear(&reg_shadow, dst);   // lea eax,[const]
-		}
-		goto record_branch;
-	}
-	int num_src_regs = __builtin_popcount(meta->regs_read_mask);
-	if (!meta->has_mem_read) {
-		if (num_src_regs == 1 && meta->wr_reg >= 0 && meta->rd_reg >= 0) {
-			propagate_reg2reg(&reg_shadow, meta->wr_reg, meta->wr_off, meta->wr_mask, meta->rd_reg, meta->rd_off,meta->rd_mask, meta->insn_id);
-		} else if (num_src_regs >= 2 && meta->regs_written_mask) { //reg2reg with arith
-			int dst = mask_first_reg(meta->regs_written_mask);
-			int src1 = -1, src2 = -1;
-			for (int i = 0; i < REG_COUNT; i++) {
-				if (meta->regs_read_mask & (1U << i)) {
-					if (src1 < 0) {
-				       		src1 = i;
-					} else { 
-						src2 = i; 
-						break;
-					}
-				}
-			}
-			if (src1 >= 0 && dst >= 0) {
-				propagate_reg2reg_arith(&reg_shadow, dst, src1, src2, meta->insn_id);
-			}
-		}
-	}
-	record_branch:
-		if (meta->is_indirect_branch && !oep_found) { //indirect check
+	(void)dta_apply_reg_transfer(&reg_shadow, meta);
+	bool track_indirect = meta->is_indirect_branch && !oep_found;
+	if (track_indirect) { //indirect check
+			bool target_resolved = false;
 			bool target_tainted = false;
+			bool mem_target_valid = false;
 			uint64_t taddr = 0;
 			uint64_t tval = 0;
-			bool mem_target_valid = false;
-			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) { //on reg
+			//jmp/call reg
+			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) {
+				target_resolved = true;
 				target_tainted = reg_is_tainted(&reg_shadow, meta->branch_target_reg, 0x0F);
-			} else if (meta->branch_target_reg == REG_INVALID) { // on mem with reg, like [eax]
-				if (dse_resolve_mem_target(vaddr,meta,&taddr,&tval)) {
-					for (uint32_t i = 0; i < 4; i++) {
-						if (shadow_is_tainted(g_shadow, taddr + i)) {
-							target_tainted = true;
-							break;
-						}
-					}
-					mem_target_valid = target_tainted;
+			//jmp/call [mem] or ret
+			} else if (meta->branch_target_reg == REG_INVALID) {
+				if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {
+					target_resolved = true;
+					mem_target_valid = true;
+					//check target mem
+					uint8_t target_taint = shadow_load_taint_mask(taddr, 4);
+					target_taint = dta_effective_mem_read_taint(&g_dta_mem_transfer.pre_regs, meta, target_taint, 4);
+					target_tainted = target_taint != 0;
 				}
 			}
-			if (target_tainted) {
+			if (target_resolved) {
 				prev_jump_site = vaddr;
 				prev_jump_pending = true;
 				prev_target_reg = meta->branch_target_reg;
-				//valid target or not
+				prev_target_tainted = target_tainted;
 				if (mem_target_valid) {
 					prev_mem_taddr = taddr;
 					prev_mem_target_value = (uint64_t)(uint32_t)tval;
@@ -1706,12 +2253,12 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 					prev_mem_target_valid = false;
 				}
 			}
-		}
-		//got
-		if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&meta->insn_id != X86_INS_RET && lib_deps) {
-			uint64_t slot = 0, val = 0;
-			if (dse_resolve_mem_target(vaddr, meta, &slot, &val)) record_resolved_import(slot, val);
-		}
+	}
+	//got
+	if (meta->is_indirect_branch && meta->branch_target_reg == REG_INVALID &&meta->insn_id != X86_INS_RET && lib_deps) {
+		uint64_t slot = 0, val = 0;
+		if (dse_resolve_mem_target(vaddr, meta, &slot, &val)) record_resolved_import(slot, val);
+	}
 }
 
 //for network
@@ -1723,8 +2270,15 @@ static int pending_socket_type = -1;
 static int pending_dup_fd = -1;
 
 static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
+	pending_input_reset();
 	//x86
-	if (num == 5) {  //open
+	if (is_i386 && num == 3) { // read
+		pending_input_capture_linear( num, (int32_t)(uint32_t)a1, (uint32_t)a2, (uint32_t)a3, false);
+	} else if (is_i386 && num == 180) { // pread64
+	pending_input_capture_linear(num, (int32_t)(uint32_t)a1, (uint32_t)a2, (uint32_t)a3,false);
+	} else if (is_i386 && num == 145) { // readv
+		pending_input_capture_iov( num, (int32_t)(uint32_t)a1, (uint32_t)a2, (int32_t)(uint32_t)a3, false);
+	} else if (num == 5) {  //open
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
 			pending_open_is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
@@ -1888,8 +2442,9 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					fprintf(stderr, "[NET] send fd=%d\n", fd);
 					break;
 				}
-			case 10: { //recv
+			case 10: { // recv
 					int fd = (int)args[0];
+					pending_input_capture_linear(num,fd, args[1],args[2], true);
 					net_dep_t *event = g_new0(net_dep_t, 1);
 					event->fd = fd;
 					g_strlcpy(event->op, "recv", sizeof(event->op));
@@ -1920,14 +2475,15 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 					}
 					break;
 				 }
-			case 12: {//recvfrom
-					int fd = (int)args[0];
-					net_dep_t *event = g_new0(net_dep_t, 1);
-					event->fd = fd;
-					g_strlcpy(event->op, "recv", sizeof(event->op));
-					net_deps = g_list_append(net_deps, event);
-					fprintf(stderr, "[NET] recvfrom fd=%d\n", fd);
-					break;
+			case 12: { // recvfrom
+					 int fd = (int)args[0];
+					 pending_input_capture_linear(num, fd, args[1], args[2], true);
+					 net_dep_t *event = g_new0(net_dep_t, 1);
+					 event->fd = fd;
+					 g_strlcpy(event->op, "recv", sizeof(event->op));
+					 net_deps = g_list_append(net_deps, event);
+					 fprintf(stderr,"[NET] recvfrom fd=%d\n", fd);
+					 break;
 				 }
 			case 13: { //shutdown
 					int fd = (int)args[0];
@@ -2030,10 +2586,11 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			net_deps = g_list_append(net_deps, event);
 			fprintf(stderr, "[NET] sendto fd=%d (no addr)\n", (int)a1);
 		}
-	} else if ((is_i386 && num == 372) || (!is_i386 && num == 45)) {  // recvfrom
+	} else if ((is_i386 && num == 371) || (!is_i386 && num == 45)) {  // recvfrom
+		pending_input_capture_linear(num, (int32_t)(uint32_t)a1,is_i386 ? (uint32_t)a2 : a2, is_i386 ? (uint32_t)a3 : a3,true);
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
-		g_strlcpy(event->op, "recv", sizeof(event->op));
+		g_strlcpy(event->op,"recv", sizeof(event->op));
 		net_deps = g_list_append(net_deps, event);
 		fprintf(stderr, "[NET] recvfrom fd=%d\n", (int)a1);
 	} else if ((is_i386 && num == 373) || (!is_i386 && num == 48)) {  // shutdown
@@ -2104,6 +2661,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
 
 static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, int64_t ret) {
 	const bool syscall_failed = syscall_ret_is_error(ret);
+	apply_pending_input(num, ret);
 
 	if (g_pending_mmap.active) {
 		pending_mmap_t pending = g_pending_mmap;
@@ -2133,7 +2691,7 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
 
 	if (pending_open_path) {
 		file_dep_t *f = add_file_dep(pending_open_path, pending_open_is_lib);
-		f->write = pending_open_write;
+		f->write |= pending_open_write;
 		g_hash_table_insert(file_fd, GINT_TO_POINTER((int)ret), f);
 		g_free(pending_open_path);
 		pending_open_path = NULL;
