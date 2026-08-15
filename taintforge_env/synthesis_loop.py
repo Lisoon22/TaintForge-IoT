@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
 from .iteration_controller import (
+    DEFAULT_DISCOVERY_GOAL_ID,
     IterationController,
     IterationControllerError,
     IterationState,
@@ -124,20 +125,8 @@ class SynthesisLoopResult:
 
 
 class EnvironmentSynthesisLoop:
-    """Thin orchestration layer over controller and prebuilt runner.
-
-    This class deliberately owns no repair, progress, snapshot, or execution
-    semantics.  It only advances the already-validated state machine:
-
-        prepare -> execute+complete -> inspect session decision -> repeat
-
-    A separate non-blocking loop lock prevents two automation processes from
-    driving the same session concurrently.  Individual controller transitions
-    continue to use the controller's own lock.
-    """
-
     SCHEMA_VERSION = 1
-    LOOP_VERSION = 4
+    LOOP_VERSION = 5
     BINDING_FILENAME = "synthesis_loop.json"
     EVENT_FILENAME = "synthesis_events.jsonl"
     REPORT_JSON_FILENAME = "synthesis_report.json"
@@ -222,6 +211,23 @@ class EnvironmentSynthesisLoop:
                             stop_reason=result.stop_reason,
                         )
                         return result
+                    if session.state == SessionState.FAILED:
+                        result = self._finalize(
+                            controller=controller,
+                            binding=binding,
+                            invocation_id=invocation_id,
+                            outcome=LoopOutcome.INTERVENTION_REQUIRED,
+                            stop_reason=session.stop_reason,
+                            executions=executions,
+                            last_error=None,
+                        )
+                        self._append_event(
+                            "invocation_finished",
+                            invocation_id=invocation_id,
+                            outcome=result.outcome.value,
+                            stop_reason=result.stop_reason,
+                        )
+                        return result
                     if session.state != SessionState.ACTIVE:
                         raise SynthesisLoopError(
                             f"iteration session is not runnable: {session.state.value}"
@@ -256,6 +262,13 @@ class EnvironmentSynthesisLoop:
                             environment_snapshot_id=(
                                 latest.environment_snapshot_id
                             ),
+                            environment_manifest_id=(
+                                latest.environment_manifest_id
+                            ),
+                            environment_manifest_version=(
+                                latest.environment_manifest_version
+                            ),
+                            attempt_id=latest.attempt_id,
                             parent_snapshot_id=latest.parent_snapshot_id,
                         )
                         controller.verify()
@@ -293,6 +306,8 @@ class EnvironmentSynthesisLoop:
                         "iteration_completed",
                         invocation_id=invocation_id,
                         iteration=runner_result.iteration_index,
+                        attempt_id=runner_result.attempt_id,
+                        attempt_result=str(runner_result.attempt_result_path),
                         guest_exit_code=runner_result.guest_exit_code,
                         timed_out=runner_result.timed_out,
                         stop_reason=runner_result.stop_reason,
@@ -383,6 +398,25 @@ class EnvironmentSynthesisLoop:
             raise SynthesisLoopError("synthesis loop snapshot store mismatch")
         if binding.get("max_iterations") != manifest.max_iterations:
             raise SynthesisLoopError("synthesis loop iteration budget mismatch")
+        session_bindings = {
+            "environment_manifest_store": manifest.environment_manifest_store,
+            "seed_environment_manifest_id": (
+                manifest.seed_environment_manifest_id
+            ),
+            "sample_sha256": manifest.sample_sha256,
+            "packed_binary_sha256": manifest.packed_binary_sha256,
+            "attempt_goal_id": manifest.goal_id,
+        }
+        drift = [
+            key
+            for key, expected in session_bindings.items()
+            if binding.get(key) != expected
+        ]
+        if drift:
+            raise SynthesisLoopError(
+                "synthesis loop session binding mismatch: "
+                + ", ".join(drift)
+            )
 
         template_runtime = Path(str(binding.get("template_runtime")))
         _validate_regular_file(template_runtime, "bound template runtime")
@@ -393,6 +427,19 @@ class EnvironmentSynthesisLoop:
         _validate_regular_file(host_binary, "bound host binary")
         if _sha256_file(host_binary) != binding.get("host_binary_sha256"):
             raise SynthesisLoopError("bound host binary was modified")
+        if binding.get("host_binary_sha256") != manifest.packed_binary_sha256:
+            raise SynthesisLoopError(
+                "bound host binary does not match the session packed binary"
+            )
+        if binding.get("target_elf_sha256") != manifest.sample_sha256:
+            raise SynthesisLoopError(
+                "bound target ELF does not match the session sample"
+            )
+        bound_goal = binding.get("target_goal_id") or DEFAULT_DISCOVERY_GOAL_ID
+        if bound_goal != manifest.goal_id:
+            raise SynthesisLoopError(
+                "bound target goal does not match the session attempt goal"
+            )
 
         qemu_host_raw = binding.get("qemu_host_path")
         qemu_digest = binding.get("qemu_host_sha256")
@@ -460,6 +507,12 @@ class EnvironmentSynthesisLoop:
                 session_dir=self.config.session_dir,
                 snapshot_store=self.config.snapshot_store,
                 seed_rootfs=self.config.seed_rootfs,
+                sample_sha256=target_identity["target_elf_sha256"],
+                packed_binary_sha256=target_identity["host_binary_sha256"],
+                goal_id=(
+                    target_identity["target_goal_id"]
+                    or DEFAULT_DISCOVERY_GOAL_ID
+                ),
                 max_iterations=self.config.max_iterations,
             )
             controller = IterationController(self.config.session_dir)
@@ -635,6 +688,7 @@ class EnvironmentSynthesisLoop:
         session: SessionManifest,
         target_identity: dict[str, Any],
     ) -> dict[str, Any]:
+        self._validate_session_target_identity(session, target_identity)
         return {
             "schema_version": self.SCHEMA_VERSION,
             "loop_version": self.LOOP_VERSION,
@@ -642,9 +696,40 @@ class EnvironmentSynthesisLoop:
             "session_dir": str(self.config.session_dir),
             "snapshot_store": session.snapshot_store,
             "seed_snapshot_id": session.seed_snapshot_id,
+            "environment_manifest_store": session.environment_manifest_store,
+            "seed_environment_manifest_id": (
+                session.seed_environment_manifest_id
+            ),
+            "sample_sha256": session.sample_sha256,
+            "packed_binary_sha256": session.packed_binary_sha256,
+            "attempt_goal_id": session.goal_id,
             "max_iterations": session.max_iterations,
             **target_identity,
         }
+
+    @staticmethod
+    def _validate_session_target_identity(
+        session: SessionManifest,
+        target_identity: dict[str, Any],
+    ) -> None:
+        if session.sample_sha256 != target_identity.get("target_elf_sha256"):
+            raise SynthesisLoopError(
+                "session sample does not match the selected target ELF"
+            )
+        if session.packed_binary_sha256 != target_identity.get(
+            "host_binary_sha256"
+        ):
+            raise SynthesisLoopError(
+                "session packed binary does not match the selected host binary"
+            )
+        goal_id = (
+            target_identity.get("target_goal_id")
+            or DEFAULT_DISCOVERY_GOAL_ID
+        )
+        if session.goal_id != goal_id:
+            raise SynthesisLoopError(
+                "session goal does not match the selected target-state goal"
+            )
 
     def _verify_config_binding(
         self,
@@ -660,6 +745,11 @@ class EnvironmentSynthesisLoop:
             "session_dir",
             "snapshot_store",
             "seed_snapshot_id",
+            "environment_manifest_store",
+            "seed_environment_manifest_id",
+            "sample_sha256",
+            "packed_binary_sha256",
+            "attempt_goal_id",
             "max_iterations",
             "template_run_dir",
             "template_runtime",
@@ -788,6 +878,13 @@ class EnvironmentSynthesisLoop:
                     "state": record.state.value,
                     "environment_snapshot_id": record.environment_snapshot_id,
                     "parent_snapshot_id": record.parent_snapshot_id,
+                    "environment_manifest_id": record.environment_manifest_id,
+                    "environment_manifest_version": (
+                        record.environment_manifest_version
+                    ),
+                    "attempt_id": record.attempt_id,
+                    "attempt_contract": record.attempt_contract,
+                    "attempt_result": record.attempt_result,
                     "progress": record.progress,
                     "stop_reason": record.stop_reason,
                     "directory": record.directory,
@@ -826,6 +923,14 @@ class EnvironmentSynthesisLoop:
                 "target_spec_path": binding.get("target_spec_path"),
                 "target_spec_sha256": binding.get("target_spec_sha256"),
                 "target_goal_id": binding.get("target_goal_id"),
+                "attempt_goal_id": binding.get("attempt_goal_id"),
+                "sample_sha256": binding.get("sample_sha256"),
+                "packed_binary_sha256": binding.get(
+                    "packed_binary_sha256"
+                ),
+                "seed_environment_manifest_id": binding.get(
+                    "seed_environment_manifest_id"
+                ),
                 "timeout_seconds": binding.get("timeout_seconds"),
                 "max_iterations": binding.get("max_iterations"),
                 "network_mode": binding.get("network_mode"),
@@ -848,8 +953,11 @@ class EnvironmentSynthesisLoop:
             "",
             "## Iterations",
             "",
-            "| Index | State | Environment | Progress | Stop reason |",
-            "|---:|---|---|---|---|",
+            (
+                "| Index | State | Snapshot | Manifest | Attempt | "
+                "Progress | Stop reason |"
+            ),
+            "|---:|---|---|---|---|---|---|",
         ]
         for item in iterations:
             progress = item["progress"] or {}
@@ -858,6 +966,8 @@ class EnvironmentSynthesisLoop:
                 "| "
                 f"{item['index']} | `{item['state']}` | "
                 f"`{item['environment_snapshot_id']}` | "
+                f"`{item['environment_manifest_id']}` | "
+                f"`{item['attempt_id']}` | "
                 f"`{classification}` | `{item['stop_reason']}` |"
             )
         _atomic_write_text(

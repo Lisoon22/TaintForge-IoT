@@ -495,10 +495,9 @@ class ManifestDiff:
 
 
 class EnvironmentManifestStore:
-    """Append-only storage and parent-chain verification for semantic manifests."""
 
     def __init__(self, directory: str | Path) -> None:
-        self.directory = Path(directory).resolve(strict=False)
+        self.directory = Path(directory).expanduser().absolute()
 
     def path_for_version(self, version: int) -> Path:
         if version < 0:
@@ -528,7 +527,16 @@ class EnvironmentManifestStore:
         return path
 
     def load(self, version: int) -> EnvironmentManifest:
-        return EnvironmentManifest.load(self.path_for_version(version))
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise EnvironmentManifestError(
+                f"environment manifest store is invalid: {self.directory}"
+            )
+        path = self.path_for_version(version)
+        if path.is_symlink() or not path.is_file():
+            raise EnvironmentManifestError(
+                f"environment manifest is invalid: {path}"
+            )
+        return EnvironmentManifest.load(path)
 
     def verify_chain(self, through_version: int | None = None) -> tuple[EnvironmentManifest, ...]:
         if not self.directory.is_dir() or self.directory.is_symlink():
@@ -544,6 +552,10 @@ class EnvironmentManifestStore:
             ]
         if not paths:
             raise EnvironmentManifestError("environment manifest store is empty")
+        if any(path.is_symlink() or not path.is_file() for path in paths):
+            raise EnvironmentManifestError(
+                "environment manifest chain contains an invalid file"
+            )
         manifests = tuple(EnvironmentManifest.load(path) for path in paths)
         versions = [item.manifest_version for item in manifests]
         if versions != list(range(len(manifests))):

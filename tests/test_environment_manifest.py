@@ -146,6 +146,23 @@ class EnvironmentManifestTests(unittest.TestCase):
             ):
                 store.save(child)
 
+    def test_store_rejects_symlinked_manifest(self) -> None:
+        seed = self.make_seed()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = EnvironmentManifestStore(root / "manifests")
+            manifest_path = store.save(seed)
+            outside = root / "outside-manifest.json"
+            seed.save(outside)
+            manifest_path.unlink()
+            manifest_path.symlink_to(outside)
+
+            with self.assertRaisesRegex(
+                EnvironmentManifestError,
+                "manifest is invalid",
+            ):
+                store.load(0)
+
     def test_duplicate_resources_are_rejected(self) -> None:
         entry = self.make_entry()
         with self.assertRaisesRegex(

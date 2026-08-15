@@ -17,6 +17,7 @@ ATTEMPT_CONTRACT_VERSION = 1
 ATTEMPT_RESULT_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_ATTEMPT_ID_RE = re.compile(r"attempt-[0-9]{3,}-[0-9a-f]{12}")
 
 
 class AttemptValidationError(RuntimeError):
@@ -530,6 +531,160 @@ class AttemptResult:
     def load(cls, path: str | Path) -> AttemptResult:
         return cls.from_dict(_load_json(path, "attempt result"))
 
+#store contract and it's result binded by hashes
+class AttemptStore:
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory).expanduser().absolute()
+
+    def attempt_directory(self, attempt_id: str) -> Path:
+        self._validate_attempt_id(attempt_id)
+        return self.directory / attempt_id
+
+    def contract_path(self, attempt_id: str) -> Path:
+        return self.attempt_directory(attempt_id) / "contract.json"
+
+    def result_path(self, attempt_id: str) -> Path:
+        return self.attempt_directory(attempt_id) / "result.json"
+
+    def save_contract(self, contract: AttemptContract) -> Path:
+        attempt_dir = self._prepare_attempt_directory(contract.attempt_id)
+        path = attempt_dir / "contract.json"
+        if path.is_symlink():
+            raise AttemptValidationError("attempt contract path must not be a symlink")
+        if path.exists():
+            existing = AttemptContract.load(path)
+            if existing.contract_sha256 != contract.contract_sha256:
+                raise AttemptValidationError(
+                    f"attempt contract is immutable: {contract.attempt_id}"
+                )
+            return path
+        _append_only_write_json(path, contract.to_dict())
+        return path
+
+    def save_result(self, result: AttemptResult) -> Path:
+        contract = self.load_contract(result.attempt_id)
+        self._validate_result_link(contract, result)
+        attempt_dir = self._prepare_attempt_directory(result.attempt_id)
+        path = attempt_dir / "result.json"
+        if path.is_symlink():
+            raise AttemptValidationError("attempt result path must not be a symlink")
+        if path.exists():
+            existing = AttemptResult.load(path)
+            if existing.result_sha256 != result.result_sha256:
+                raise AttemptValidationError(
+                    f"attempt result is immutable: {result.attempt_id}"
+                )
+            return path
+        _append_only_write_json(path, result.to_dict())
+        return path
+
+    def load_contract(self, attempt_id: str) -> AttemptContract:
+        path = self._validated_artifact_path(
+            attempt_id,
+            "contract.json",
+        )
+        return AttemptContract.load(path)
+
+    def load_result(self, attempt_id: str) -> AttemptResult:
+        path = self._validated_artifact_path(
+            attempt_id,
+            "result.json",
+        )
+        result = AttemptResult.load(path)
+        contract = self.load_contract(attempt_id)
+        self._validate_result_link(contract, result)
+        return result
+
+    def verify_attempt(
+        self,
+        attempt_id: str,
+        *,
+        require_result: bool,
+    ) -> tuple[AttemptContract, AttemptResult | None]:
+        contract = self.load_contract(attempt_id)
+        result_path = self.result_path(attempt_id)
+        if result_path.is_symlink():
+            raise AttemptValidationError("attempt result path must not be a symlink")
+        if not result_path.exists():
+            if require_result:
+                raise AttemptValidationError(
+                    f"completed attempt lacks a result: {attempt_id}"
+                )
+            return contract, None
+        return contract, self.load_result(attempt_id)
+
+    def list_attempt_ids(self) -> tuple[str, ...]:
+        if not self.directory.exists():
+            return ()
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise AttemptValidationError("attempt store is invalid")
+        attempt_ids: list[str] = []
+        paths = list(self.directory.iterdir())
+        for path in paths:
+            if path.is_symlink() or not path.is_dir():
+                raise AttemptValidationError(
+                    f"attempt store contains an invalid entry: {path.name}"
+                )
+            self._validate_attempt_id(path.name)
+        for path in sorted(
+            paths,
+            key=lambda item: int(item.name.split("-", 2)[1]),
+        ):
+            attempt_ids.append(path.name)
+        return tuple(attempt_ids)
+
+    def _prepare_attempt_directory(self, attempt_id: str) -> Path:
+        self._validate_attempt_id(attempt_id)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise AttemptValidationError("attempt store must not be a symlink")
+        attempt_dir = self.attempt_directory(attempt_id)
+        attempt_dir.mkdir(exist_ok=True)
+        if attempt_dir.is_symlink() or not attempt_dir.is_dir():
+            raise AttemptValidationError("attempt directory must not be a symlink")
+        return attempt_dir
+
+    def _validated_artifact_path(
+        self,
+        attempt_id: str,
+        filename: str,
+    ) -> Path:
+        self._validate_attempt_id(attempt_id)
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise AttemptValidationError("attempt store is invalid")
+        attempt_dir = self.attempt_directory(attempt_id)
+        if attempt_dir.is_symlink() or not attempt_dir.is_dir():
+            raise AttemptValidationError("attempt directory is invalid")
+        path = attempt_dir / filename
+        if path.is_symlink() or not path.is_file():
+            raise AttemptValidationError(
+                f"attempt {filename.removesuffix('.json')} is invalid: {attempt_id}"
+            )
+        return path
+
+    @staticmethod
+    def _validate_result_link(
+        contract: AttemptContract,
+        result: AttemptResult,
+    ) -> None:
+        if result.attempt_id != contract.attempt_id:
+            raise AttemptValidationError("attempt result id does not match contract")
+        if result.contract_sha256 != contract.contract_sha256:
+            raise AttemptValidationError(
+                "attempt result contract digest does not match persisted contract"
+            )
+        if result.initial_stage != contract.initial_stage:
+            raise AttemptValidationError(
+                "attempt result initial stage does not match contract"
+            )
+
+    @staticmethod
+    def _validate_attempt_id(attempt_id: str) -> None:
+        if not isinstance(attempt_id, str) or not _ATTEMPT_ID_RE.fullmatch(
+            attempt_id
+        ):
+            raise AttemptValidationError("attempt store id is invalid")
+
 
 def make_attempt_id(
     *,
@@ -655,6 +810,41 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             temporary = Path(stream.name)
         os.replace(temporary, path)
         os.chmod(path, 0o644)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def _append_only_write_json(path: Path, payload: dict[str, Any]) -> None:
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary = Path(stream.name)
+        os.chmod(temporary, 0o644)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise AttemptValidationError(
+                f"refusing to overwrite attempt artifact: {path}"
+            ) from exc
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink(missing_ok=True)

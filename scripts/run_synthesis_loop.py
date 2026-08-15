@@ -7,6 +7,7 @@ from pathlib import Path
 
 from taintforge_env.synthesis_loop import (
     EnvironmentSynthesisLoop,
+    LoopOutcome,
     SynthesisLoopConfig,
     SynthesisLoopError,
 )
@@ -15,12 +16,7 @@ from taintforge_env.synthesis_loop import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Drive the TaintForge-IoT environment synthesis state machine: "
-            "prepare an immutable iteration, execute its prebuilt rootfs, "
-            "complete the observation, and repeat until a controller stop "
-            "condition or invocation step limit is reached. Native and "
-            "static QEMU user-mode execution are selected automatically from "
-            "the bound ELF target."
+            "Drive the TaintForge-IoT environment synthesis state machine: prepare an immutable iteration, execute its prebuilt rootfs, complete the observation, and repeat until a controller stop condition or invocation step limit is reached. Native and static QEMU user-mode execution are selected automatically from the bound ELF target."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -130,7 +126,7 @@ def main() -> int:
         print(f"[+] Total iterations: {result.total_iterations}")
         print(f"[+] JSON report: {result.report_json}")
         print(f"[+] Markdown report: {result.report_markdown}")
-        return 0
+        return 2 if result.outcome == LoopOutcome.INTERVENTION_REQUIRED else 0
     except SynthesisLoopError as exc:
         print(f"[!] Environment synthesis loop failed: {exc}")
         return 2

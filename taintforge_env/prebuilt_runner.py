@@ -17,6 +17,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol, Sequence
 
+from .attempt import AttemptContract, AttemptStore, AttemptValidationError
 from .controlled_network_backend import (
     ControlledNetworkBackend,
     ControlledNetworkConfig,
@@ -104,8 +105,6 @@ NetworkBackendFactory = Callable[
 
 
 class SubprocessCommandExecutor:
-    """Execute host commands while keeping command construction testable."""
-
     def run(
         self,
         command: Sequence[str],
@@ -173,6 +172,7 @@ class PreparedRunContext:
     run_dir: Path
     claim_path: Path
     execution_plan: ExecutionPlan
+    attempt_contract: AttemptContract
     target_spec: TargetStateSpec | None = None
 
 
@@ -185,6 +185,8 @@ class PrebuiltRunnerResult:
     stop_reason: str | None
     progress: dict[str, Any]
     claim_path: Path
+    attempt_id: str
+    attempt_result_path: Path
     target_reached: bool = False
     target_evaluation_path: Path | None = None
     network_mode: str = "none"
@@ -235,23 +237,7 @@ class PrebuiltRunnerConfig:
 
 
 class PrebuiltRootfsRunner:
-    """Execute one prepared iteration without rebuilding its rootfs.
-
-    This adapter closes the current Phase 2 iteration boundary for both
-    network-disabled and controlled-network execution.  It verifies the prepared execution clone
-    against the immutable environment snapshot, claims the iteration exactly
-    once, runs the sample in private Linux namespaces, produces the normal
-    observation/requirements/repair artifacts, and finally completes the
-    IterationController record.
-
-    Execution is delegated to a verified backend selected from the actual
-    ELF header. Native targets retain host strace; foreign ARM/MIPS/AArch64
-    targets use a statically linked QEMU user-mode binary bind-mounted only
-    into the disposable execution clone. The controlled network backend
-    preserves original endpoints and never enables arbitrary Internet access.
-    """
-
-    ADAPTER_VERSION = 4
+    ADAPTER_VERSION = 5
     TEMPLATE_CONFIG_ALLOWLIST = (
         "library_plan.json",
         "library_resolution.json",
@@ -280,7 +266,10 @@ class PrebuiltRootfsRunner:
         self.execution_resolver = ExecutionBackendResolver()
 
     def validate(self) -> PreparedRunContext:
-        session = self.controller.load()
+        try:
+            session = self.controller.verify()
+        except IterationControllerError as exc:
+            raise PrebuiltRunnerError(str(exc)) from exc
         if session.state != SessionState.ACTIVE:
             raise PrebuiltRunnerError(
                 f"iteration session is not active: {session.state.value}"
@@ -350,6 +339,31 @@ class PrebuiltRootfsRunner:
             )
         except ExecutionBackendError as exc:
             raise PrebuiltRunnerError(str(exc)) from exc
+        actual_binary_sha256 = _sha256_file(host_binary)
+        if actual_binary_sha256 != session.packed_binary_sha256:
+            raise PrebuiltRunnerError(
+                "prepared session is bound to a different packed binary: "
+                f"expected {session.packed_binary_sha256}, "
+                f"got {actual_binary_sha256}"
+            )
+        if execution_plan.target.sha256 != session.sample_sha256:
+            raise PrebuiltRunnerError(
+                "prepared session is bound to a different target ELF: "
+                f"expected {session.sample_sha256}, "
+                f"got {execution_plan.target.sha256}"
+            )
+
+        try:
+            attempt_contract = AttemptStore(
+                self.config.session_dir / "attempts"
+            ).load_contract(iteration.attempt_id)
+            IterationController._validate_contract_binding(
+                session,
+                iteration,
+                attempt_contract,
+            )
+        except (AttemptValidationError, IterationControllerError) as exc:
+            raise PrebuiltRunnerError(str(exc)) from exc
 
         proc_dir = execution_rootfs / "proc"
         _validate_directory(proc_dir, "guest /proc mountpoint")
@@ -382,6 +396,10 @@ class PrebuiltRootfsRunner:
                 target_spec = TargetStateSpec.load(self.config.target_spec_path)
             except TargetStateError as exc:
                 raise PrebuiltRunnerError(str(exc)) from exc
+            if target_spec.goal_id != attempt_contract.goal_id:
+                raise PrebuiltRunnerError(
+                    "target-state goal does not match the prepared attempt contract"
+                )
 
         return PreparedRunContext(
             session=session,
@@ -397,6 +415,7 @@ class PrebuiltRootfsRunner:
             run_dir=run_dir,
             claim_path=claim_path,
             execution_plan=execution_plan,
+            attempt_contract=attempt_contract,
             target_spec=target_spec,
         )
 
@@ -469,7 +488,14 @@ class PrebuiltRootfsRunner:
                 artifacts_dir=context.run_dir,
                 goal_reached=goal_reached,
                 goal_reason=goal_reason,
+                guest_exit_code=guest_exit_code,
+                timed_out=guest_exit_code == 124,
             )
+            if completed.attempt_result is None:
+                raise PrebuiltRunnerError(
+                    "completed iteration did not persist an attempt result"
+                )
+            attempt_result_path = self.config.session_dir / completed.attempt_result
             self._update_claim(
                 context,
                 claim,
@@ -477,6 +503,7 @@ class PrebuiltRootfsRunner:
                 guest_exit_code=guest_exit_code,
                 stop_reason=completed.stop_reason,
                 progress=completed.progress,
+                attempt_result=completed.attempt_result,
                 retry_safe=False,
             )
             return PrebuiltRunnerResult(
@@ -487,6 +514,8 @@ class PrebuiltRootfsRunner:
                 stop_reason=completed.stop_reason,
                 progress=completed.progress,
                 claim_path=context.claim_path,
+                attempt_id=context.attempt_contract.attempt_id,
+                attempt_result_path=attempt_result_path,
                 target_reached=(
                     target_evaluation.reached
                     if target_evaluation is not None
@@ -538,14 +567,6 @@ class PrebuiltRootfsRunner:
             raise PrebuiltRunnerError(str(exc)) from exc
 
     def reset_safe_failure(self) -> None:
-        """Remove a failed pre-execution attempt after proving rootfs immutability.
-
-        A retry is allowed only when the claim explicitly says that malware did
-        not start, the adapter marked the failure as retry-safe, the iteration
-        is still prepared, and the execution rootfs still matches its immutable
-        environment snapshot.  Failures after guest start are never reset.
-        """
-
         lock_path = self.config.session_dir / ".session.lock"
         if not lock_path.is_file() or lock_path.is_symlink():
             raise PrebuiltRunnerError("iteration session lock is invalid")
@@ -574,6 +595,8 @@ class PrebuiltRootfsRunner:
                 )
                 claim_path = iteration_dir / "execution_attempt.json"
                 claim = _load_json_object(claim_path, "execution claim")
+                if claim.get("attempt_id") != record.attempt_id:
+                    raise PrebuiltRunnerError("execution claim attempt mismatch")
                 if claim.get("stage") != RunnerStage.FAILED.value:
                     raise PrebuiltRunnerError("execution claim is not failed")
                 if claim.get("malware_started") is not False:
@@ -660,6 +683,16 @@ class PrebuiltRootfsRunner:
                 "schema_version": 1,
                 "session_id": context.session.session_id,
                 "iteration_index": context.iteration.index,
+                "attempt_id": context.attempt_contract.attempt_id,
+                "attempt_contract_sha256": (
+                    context.attempt_contract.contract_sha256
+                ),
+                "environment_manifest_id": (
+                    context.attempt_contract.environment_manifest_id
+                ),
+                "environment_manifest_version": (
+                    context.attempt_contract.environment_manifest_version
+                ),
                 "environment_snapshot_id": (
                     context.iteration.environment_snapshot_id
                 ),
@@ -690,6 +723,17 @@ class PrebuiltRootfsRunner:
                 "generated_at_utc": _utc_now(),
                 "session_id": context.session.session_id,
                 "iteration_index": context.iteration.index,
+                "attempt_id": context.attempt_contract.attempt_id,
+                "attempt_contract": context.iteration.attempt_contract,
+                "attempt_contract_sha256": (
+                    context.attempt_contract.contract_sha256
+                ),
+                "environment_manifest_id": (
+                    context.attempt_contract.environment_manifest_id
+                ),
+                "environment_manifest_version": (
+                    context.attempt_contract.environment_manifest_version
+                ),
                 "environment_snapshot_id": (
                     context.iteration.environment_snapshot_id
                 ),
@@ -1155,12 +1199,18 @@ exit "$status"
         payload = {
             "schema_version": 1,
             "adapter_version": self.ADAPTER_VERSION,
-            "attempt_id": (
-                f"attempt_{context.session.session_id}_"
-                f"{context.iteration.index:04d}"
+            "attempt_id": context.attempt_contract.attempt_id,
+            "attempt_contract_sha256": (
+                context.attempt_contract.contract_sha256
             ),
             "session_id": context.session.session_id,
             "iteration_index": context.iteration.index,
+            "environment_manifest_id": (
+                context.attempt_contract.environment_manifest_id
+            ),
+            "environment_manifest_version": (
+                context.attempt_contract.environment_manifest_version
+            ),
             "environment_snapshot_id": (
                 context.iteration.environment_snapshot_id
             ),

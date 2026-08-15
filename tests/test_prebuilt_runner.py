@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from taintforge_env.attempt import AttemptOutcome, AttemptStore
 from taintforge_env.iteration_controller import (
     IterationController,
+    IterationControllerError,
     SessionState,
 )
 from taintforge_env.prebuilt_runner import (
@@ -19,6 +21,9 @@ from taintforge_env.prebuilt_runner import (
     PrebuiltRunnerError,
 )
 from tests.elf_fixture import write_elf
+
+
+GOAL_ID = "guest_write_reached"
 
 
 class FakeExecutor:
@@ -107,8 +112,10 @@ class FakeExecutor:
                 {
                     "schema_version": 1,
                     "planner_version": 1,
+                    "generated_at_utc": "2026-01-01T00:00:00+00:00",
                     "source_requirements": str(requirements),
                     "source_sha256": source_hash,
+                    "warnings": [],
                     "decisions": [],
                 },
             )
@@ -286,6 +293,9 @@ class PrebuiltRunnerTests(unittest.TestCase):
             session_dir=self.session,
             snapshot_store=self.base / "snapshots",
             seed_rootfs=self.seed,
+            sample_sha256=_sha256_file(self.binary),
+            packed_binary_sha256=_sha256_file(self.binary),
+            goal_id=GOAL_ID,
             max_iterations=3,
         )
         IterationController(self.session).prepare_next()
@@ -338,6 +348,36 @@ class PrebuiltRunnerTests(unittest.TestCase):
             (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
         )
 
+    def test_modified_packed_binary_is_rejected_before_claim(self) -> None:
+        self.binary.write_bytes(self.binary.read_bytes() + b"modified")
+        with self.assertRaisesRegex(
+            PrebuiltRunnerError,
+            "different packed binary",
+        ):
+            self.make_runner().validate()
+        self.assertFalse(
+            (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
+        )
+
+    def test_tampered_environment_manifest_is_rejected_before_claim(self) -> None:
+        manifest_path = (
+            self.session
+            / "manifests"
+            / "environment_manifest_v0000.json"
+        )
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["change_reason"] = "tampered"
+        _write_json(manifest_path, payload)
+
+        with self.assertRaisesRegex(
+            PrebuiltRunnerError,
+            "manifest digest mismatch",
+        ):
+            self.make_runner().validate()
+        self.assertFalse(
+            (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
+        )
+
     def test_qemu_runtime_builds_bind_mounted_execution_plan(self) -> None:
         import shutil
 
@@ -370,6 +410,9 @@ class PrebuiltRunnerTests(unittest.TestCase):
             session_dir=self.session,
             snapshot_store=self.base / "snapshots-arm",
             seed_rootfs=self.seed,
+            sample_sha256=_sha256_file(self.binary),
+            packed_binary_sha256=_sha256_file(self.binary),
+            goal_id=GOAL_ID,
             max_iterations=3,
         )
         IterationController(self.session).prepare_next()
@@ -436,6 +479,11 @@ class PrebuiltRunnerTests(unittest.TestCase):
             result = runner.run_and_complete()
 
         self.assertEqual(result.guest_exit_code, 0)
+        self.assertTrue(result.attempt_result_path.is_file())
+        attempt_result = AttemptStore(self.session / "attempts").load_result(
+            result.attempt_id
+        )
+        self.assertEqual(attempt_result.outcome, AttemptOutcome.EXITED)
         self.assertEqual(result.stop_reason, "no_automatic_repairs")
         manifest = IterationController(self.session).load()
         self.assertEqual(manifest.state, SessionState.COMPLETED)
@@ -447,6 +495,15 @@ class PrebuiltRunnerTests(unittest.TestCase):
             str(self.session / "iterations" / "0000" / "execution" / "rootfs"),
         )
         self.assertEqual(runtime["prebuilt_environment"]["iteration_index"], 0)
+        self.assertEqual(
+            runtime["prebuilt_environment"]["attempt_id"],
+            result.attempt_id,
+        )
+        self.assertTrue(
+            runtime["prebuilt_environment"]["environment_manifest_id"].startswith(
+                "manifest-v0000-"
+            )
+        )
         self.assertTrue(
             (self.session / "iterations" / "0000" / "artifacts" / "repair_plan.json").is_file()
         )
@@ -494,12 +551,45 @@ class PrebuiltRunnerTests(unittest.TestCase):
             (self.session / "iterations" / "0000" / "execution_attempt.json").exists()
         )
 
+    def test_target_goal_must_match_prepared_contract(self) -> None:
+        target = self.base / "different-target.json"
+        _write_json(
+            target,
+            {
+                "schema_version": 1,
+                "goal_id": "different_goal",
+                "description": "different goal",
+                "mode": "all",
+                "rules": [
+                    {
+                        "id": "write",
+                        "type": "event_count",
+                        "source": "syscall",
+                        "where": {"syscall": "write"},
+                        "min_count": 1,
+                    }
+                ],
+            },
+        )
+        with self.assertRaisesRegex(PrebuiltRunnerError, "does not match"):
+            self.make_runner(target_spec=target).validate()
+
     def test_timeout_is_observation_not_runner_failure(self) -> None:
         runner = self.make_runner(FakeExecutor(guest_exit_code=124))
         with patch.object(runner, "_check_host_dependencies", return_value=None):
             result = runner.run_and_complete()
         self.assertTrue(result.timed_out)
         self.assertEqual(result.guest_exit_code, 124)
+        attempt_result = AttemptStore(self.session / "attempts").load_result(
+            result.attempt_id
+        )
+        self.assertEqual(attempt_result.outcome, AttemptOutcome.TIMED_OUT)
+        self.assertIsNotNone(attempt_result.failure_fingerprint)
+        self.assertEqual(result.stop_reason, "execution_timed_out")
+        self.assertEqual(
+            IterationController(self.session).load().state,
+            SessionState.FAILED,
+        )
 
     def test_sandbox_uses_private_namespaces(self) -> None:
         executor = FakeExecutor()
@@ -601,11 +691,49 @@ class PrebuiltRunnerTests(unittest.TestCase):
             {
                 "session_id": IterationController(self.session).load().session_id,
                 "iteration_index": 0,
+                "attempt_id": IterationController(self.session)
+                .load()
+                .iterations[0]
+                .attempt_id,
                 "stage": "executing",
             },
         )
         with self.assertRaisesRegex(Exception, "not ready for completion"):
             IterationController(self.session).complete_iteration(
+                iteration_index=0,
+                artifacts_dir=self.template,
+            )
+
+    def test_claim_contract_binding_is_checked_before_completion(self) -> None:
+        controller = IterationController(self.session)
+        session = controller.load()
+        record = session.iterations[0]
+        contract = AttemptStore(self.session / "attempts").load_contract(
+            record.attempt_id
+        )
+        claim = self.session / record.directory / "execution_attempt.json"
+        _write_json(
+            claim,
+            {
+                "session_id": session.session_id,
+                "iteration_index": record.index,
+                "attempt_id": record.attempt_id,
+                "attempt_contract_sha256": "f" * 64,
+                "environment_manifest_id": record.environment_manifest_id,
+                "environment_manifest_version": (
+                    record.environment_manifest_version
+                ),
+                "environment_snapshot_id": record.environment_snapshot_id,
+                "stage": "completing",
+            },
+        )
+        self.assertNotEqual("f" * 64, contract.contract_sha256)
+
+        with self.assertRaisesRegex(
+            IterationControllerError,
+            "contract digest mismatch",
+        ):
+            controller.complete_iteration(
                 iteration_index=0,
                 artifacts_dir=self.template,
             )
@@ -626,6 +754,10 @@ class PrebuiltRunnerTests(unittest.TestCase):
         _write_json(
             iteration / "execution_attempt.json",
             {
+                "attempt_id": IterationController(self.session)
+                .load()
+                .iterations[0]
+                .attempt_id,
                 "stage": "failed",
                 "malware_started": True,
                 "retry_safe": False,
@@ -647,6 +779,10 @@ class PrebuiltRunnerTests(unittest.TestCase):
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 if __name__ == "__main__":
