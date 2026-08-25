@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from taintforge_env.iteration_controller import (
+    DEFAULT_DISCOVERY_GOAL_ID,
     IterationController,
     SessionState,
 )
@@ -38,9 +39,11 @@ class FakeRunnerFactory:
         *,
         automatic_sequence: list[bool] | None = None,
         fail: bool = False,
+        guest_exit_code: int = 0,
     ) -> None:
         self.automatic_sequence = list(automatic_sequence or [False])
         self.fail = fail
+        self.guest_exit_code = guest_exit_code
         self.calls: list[int] = []
         self.configs: list[PrebuiltRunnerConfig] = []
 
@@ -72,6 +75,8 @@ class FakeRunnerFactory:
                 record = IterationController(config.session_dir).complete_iteration(
                     iteration_index=config.iteration_index,
                     artifacts_dir=artifacts,
+                    guest_exit_code=factory.guest_exit_code,
+                    timed_out=factory.guest_exit_code == 124,
                 )
                 run_dir = (
                     config.session_dir
@@ -83,8 +88,8 @@ class FakeRunnerFactory:
                 return PrebuiltRunnerResult(
                     iteration_index=config.iteration_index,
                     run_dir=run_dir,
-                    guest_exit_code=0,
-                    timed_out=False,
+                    guest_exit_code=factory.guest_exit_code,
+                    timed_out=factory.guest_exit_code == 124,
                     stop_reason=record.stop_reason,
                     progress=record.progress or {},
                     claim_path=(
@@ -92,6 +97,10 @@ class FakeRunnerFactory:
                         / "iterations"
                         / f"{config.iteration_index:04d}"
                         / "execution_attempt.json"
+                    ),
+                    attempt_id=record.attempt_id,
+                    attempt_result_path=(
+                        config.session_dir / str(record.attempt_result)
                     ),
                 )
 
@@ -190,6 +199,16 @@ class SynthesisLoopTests(unittest.TestCase):
         self.assertEqual(factory.calls, [0])
         self.assertTrue(result.report_json.is_file())
         self.assertTrue(result.report_markdown.is_file())
+        report = json.loads(result.report_json.read_text(encoding="utf-8"))
+        self.assertTrue(
+            report["iterations"][0]["environment_manifest_id"].startswith(
+                "manifest-v0000-"
+            )
+        )
+        self.assertTrue(
+            report["iterations"][0]["attempt_id"].startswith("attempt-000-")
+        )
+        self.assertTrue(report["iterations"][0]["attempt_result"])
         self.assertEqual(
             IterationController(self.session).load().state,
             SessionState.COMPLETED,
@@ -240,6 +259,19 @@ class SynthesisLoopTests(unittest.TestCase):
         ).run()
         self.assertEqual(result.outcome, LoopOutcome.COMPLETED)
         self.assertEqual(second_factory.calls, [])
+
+    def test_timeout_returns_intervention_required_terminal_result(self) -> None:
+        result = EnvironmentSynthesisLoop(
+            self.config(),
+            runner_factory=FakeRunnerFactory(guest_exit_code=124),
+        ).run()
+
+        self.assertEqual(result.outcome, LoopOutcome.INTERVENTION_REQUIRED)
+        self.assertEqual(result.stop_reason, "execution_timed_out")
+        self.assertEqual(
+            IterationController(self.session).load().state,
+            SessionState.FAILED,
+        )
 
     def test_initialize_only_binds_target_without_preparing_iteration(self) -> None:
         result = EnvironmentSynthesisLoop(
@@ -298,6 +330,11 @@ class SynthesisLoopTests(unittest.TestCase):
             session_dir=self.session,
             snapshot_store=self.store,
             seed_rootfs=self.seed,
+            sample_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+            packed_binary_sha256=hashlib.sha256(
+                self.binary.read_bytes()
+            ).hexdigest(),
+            goal_id=DEFAULT_DISCOVERY_GOAL_ID,
             max_iterations=4,
         )
         with self.assertRaisesRegex(SynthesisLoopError, "adopt-existing-session"):
@@ -361,6 +398,48 @@ class SynthesisLoopTests(unittest.TestCase):
         self.binary.write_bytes(b"changed")
         with self.assertRaisesRegex(SynthesisLoopError, "host binary was modified"):
             EnvironmentSynthesisLoop.verify_session(self.session)
+
+    def test_verify_detects_session_provenance_binding_tampering(self) -> None:
+        EnvironmentSynthesisLoop(
+            self.config(initialize_only=True),
+            runner_factory=FakeRunnerFactory(),
+        ).run()
+        binding_path = self.session / "synthesis_loop.json"
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding["packed_binary_sha256"] = "f" * 64
+        write_json(binding_path, binding)
+
+        with self.assertRaisesRegex(
+            SynthesisLoopError,
+            "session binding mismatch",
+        ):
+            EnvironmentSynthesisLoop.verify_session(self.session)
+
+    def test_adoption_rejects_mismatched_target_goal(self) -> None:
+        digest = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        IterationController.initialize(
+            session_dir=self.session,
+            snapshot_store=self.store,
+            seed_rootfs=self.seed,
+            sample_sha256=digest,
+            packed_binary_sha256=digest,
+            goal_id="different_goal",
+            max_iterations=4,
+        )
+
+        with self.assertRaisesRegex(
+            SynthesisLoopError,
+            "session goal does not match",
+        ):
+            EnvironmentSynthesisLoop(
+                self.config(
+                    snapshot_store=None,
+                    seed_rootfs=None,
+                    target_spec_path=self.target,
+                    adopt_existing_session=True,
+                ),
+                runner_factory=FakeRunnerFactory(),
+            ).run()
 
     def test_qemu_identity_is_bound_and_verified(self) -> None:
         self.binary = write_elf(

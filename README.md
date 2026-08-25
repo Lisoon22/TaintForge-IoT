@@ -538,6 +538,72 @@ PYTHONPATH=. python scripts/run_sample.py \
   --timeout 30
 ```
 
+## Versioned environment-synthesis session
+
+The synthesis controller now binds every execution to an immutable rootfs
+snapshot, semantic environment manifest, packed-binary digest, and explicit
+attempt contract. Create a new schema-v2 session with:
+
+```bash
+PYTHONPATH=. python scripts/run_synthesis_loop.py run \
+  --session-dir workdir/synthesis_demo/session \
+  --template-run-dir workdir/test_stat \
+  --project-root "$PWD" \
+  --snapshot-store workdir/synthesis_demo/snapshots \
+  --seed-rootfs workdir/test_stat/rootfs \
+  --binary samples/test_stat \
+  --target-spec examples/targets/test_stat_stdout.json \
+  --max-iterations 5 \
+  --max-steps 1 \
+  --network none \
+  --timeout 30
+```
+
+The session writes provenance separately from disposable execution clones.
+For the included `test_stat` sample, the first attempt has this shape (the
+content-derived suffixes change if the sample, seed rootfs, or goal changes):
+
+```text
+workdir/synthesis_demo/session/
+├── session.json
+├── manifests/
+│   └── environment_manifest_v0000.json
+├── attempts/
+│   └── attempt-000-709da64df386/
+│       ├── contract.json
+│       └── result.json
+└── iterations/
+    └── 0000/
+        ├── iteration.json
+        ├── observation.json
+        ├── artifacts/
+        └── execution/rootfs/
+```
+
+`contract.json` is persisted before malware execution. `result.json` is
+persisted only after the observation bundle has been accepted. If that result
+is `repair_required`, the controller applies the allowlisted repair to a clean
+clone, captures a new immutable snapshot, derives
+`environment_manifest_v0001.json`, and only then prepares attempt 1. Malware
+writes from attempt 0 are never promoted into that snapshot.
+
+Timeout and crash results terminate the session as `failed`; the loop reports
+`intervention_required` and the CLI exits with status 2 instead of trying to
+manufacture a repair transition.
+The synthesis reports and event stream include the manifest, attempt contract,
+and attempt result identifiers. The verifier checks the complete linkage
+between session, manifest, snapshot, contract, execution claim, observation,
+repair application, and result:
+
+```bash
+PYTHONPATH=. python scripts/run_synthesis_loop.py verify \
+  --session-dir workdir/synthesis_demo/session
+```
+
+Session schema v2 intentionally does not adopt older unbound controller
+sessions: their sample, goal, and attempt provenance cannot be reconstructed
+reliably after the fact.
+
 ## Tests
 
 Run the Python test suite:
@@ -668,7 +734,9 @@ progress reporting. It does not yet provide:
 - stable dynamic-ELF reconstruction;
 - ARM or MIPS Phase 1 support;
 - production-grade DTA/DSE;
-- automatic application and validation of the passive repair plan.
+- automatic semantic repairs beyond the allowlisted deterministic
+  `create_directory` action;
+- Phase 1-derived OEP/stage transitions in real attempt results.
 
 The next execution milestone is to replace the temporary
 `original static ELF + Phase 1 metadata` bridge with a validated reconstructed
