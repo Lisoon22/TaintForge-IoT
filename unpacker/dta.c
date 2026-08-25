@@ -629,6 +629,10 @@ static bool snapshot_address_mask_has_taint(const RegShadow *pre_regs, uint32_t 
 	return false;
 }
 
+bool dta_address_mask_is_tainted(const RegShadow *pre_regs, uint32_t address_reg_mask) {
+	return snapshot_address_mask_has_taint(pre_regs, address_reg_mask);
+}
+
 uint8_t dta_effective_mem_read_taint(const RegShadow *pre_regs, const InsnMeta *meta, uint8_t mem_taint_mask, uint8_t mem_width) {
 	uint8_t valid_bytes = dta_width_mask(mem_width);
 	uint8_t result = mem_taint_mask & valid_bytes;
@@ -798,7 +802,22 @@ DtaTransferResult dta_apply_mem_read_transfer(RegShadow *rs, const RegShadow *pr
 			}
 			propagate_mem2reg(rs, dst, effective_mem_taint, mem_width, X86_INS_POP, true);
 			return address_tainted ? DTA_TRANSFER_CONSERVATIVE : DTA_TRANSFER_EXACT;
-		case DTA_FAMILY_COMPARE: case DTA_FAMILY_STRING:
+		case DTA_FAMILY_STRING:
+			switch (meta->insn_id) {
+				case X86_INS_LODSB: case X86_INS_LODSW: case X86_INS_LODSD: case X86_INS_LODSQ: {
+					if (meta->string_element_size == 0 || meta->string_element_size != mem_width || dst.reg_id != REG_RAX || dst.byte_offset != 0 || dst.width != mem_width) {
+						return DTA_TRANSFER_NOT_APPLICABLE;
+					}
+					propagate_mem2reg(rs, dst, effective_mem_taint, mem_width, X86_INS_MOV, true);
+					RegSlice source_index = reg_slice_from_x86(X86_REG_ESI, 4);
+					uint8_t source_index_before = snapshot_slice_taint_mask(pre_regs, source_index);
+					write_slice_taint_mask(rs,source_index, prefix_dependency_taint(source_index_before, 4));
+					return address_tainted ? DTA_TRANSFER_CONSERVATIVE : DTA_TRANSFER_EXACT;
+				}
+				default:
+					return DTA_TRANSFER_NOT_APPLICABLE;
+			}
+		case DTA_FAMILY_COMPARE:
 			return DTA_TRANSFER_NOT_APPLICABLE;
 		case DTA_FAMILY_UNSUPPORTED:
 		default:
@@ -882,6 +901,9 @@ DtaTransferResult dta_compute_mem_write_taint(const RegShadow *pre_regs, const I
 				case X86_INS_CALL:
 					*result_taint = 0;
 					return DTA_TRANSFER_EXACT;
+				case X86_INS_PUSHF: case X86_INS_PUSHFD: case X86_INS_PUSHFQ:
+					*result_taint = valid_bytes;
+					return DTA_TRANSFER_CONSERVATIVE;
 				case X86_INS_PUSH:
 					if (meta->has_mem_read) {
 						//push [mem]
@@ -941,25 +963,95 @@ DtaTransferResult dta_compute_mem_write_taint(const RegShadow *pre_regs, const I
 	}
 }
 
-static GHashTable *g_meta_table = NULL;
+static GHashTable *g_meta_by_id = NULL;
+static GHashTable *g_meta_latest_by_pc = NULL;
+static MetaId g_next_meta_id = 1;
+static GMutex g_meta_lock;
+static bool g_meta_lock_initialized = false;
 
 void meta_init(void) {
-	g_meta_table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+	if (g_meta_by_id || g_meta_latest_by_pc) return;
+	g_mutex_init(&g_meta_lock);
+	g_meta_lock_initialized = true;
+	g_meta_by_id = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+	g_meta_latest_by_pc = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+	g_next_meta_id = 1;
 }
 
 void meta_free(void) {
-	if (g_meta_table) {
-		g_hash_table_destroy(g_meta_table);
-		g_meta_table = NULL;
+	if (!g_meta_lock_initialized) return;
+	g_mutex_lock(&g_meta_lock);
+	if (g_meta_latest_by_pc) {
+		g_hash_table_destroy(g_meta_latest_by_pc);
+		g_meta_latest_by_pc = NULL;
 	}
+	if (g_meta_by_id) {
+		g_hash_table_destroy(g_meta_by_id);
+		g_meta_by_id = NULL;
+	}
+	g_next_meta_id = 1;
+	g_mutex_unlock(&g_meta_lock);
+	g_mutex_clear(&g_meta_lock);
+	g_meta_lock_initialized = false;
 }
 
-void meta_store(uint64_t pc, InsnMeta *meta) {
-	g_hash_table_insert(g_meta_table, GUINT_TO_POINTER(pc), meta);
+const InsnMeta *meta_store(uint64_t pc, InsnMeta *meta) {
+	if (!meta) return NULL;
+	if (!g_meta_lock_initialized || meta->size == 0 || meta->size > MAX_INSN_BYTES) {
+		g_free(meta);
+		return NULL;
+	}
+	g_mutex_lock(&g_meta_lock);
+	if (!g_meta_by_id || !g_meta_latest_by_pc) {
+		g_mutex_unlock(&g_meta_lock);
+		g_free(meta);
+		return NULL;
+	}
+	gint64 pc_lookup_key = (gint64)pc;
+	const InsnMeta *latest = g_hash_table_lookup(g_meta_latest_by_pc, &pc_lookup_key);
+	if (latest && latest->size == meta->size && memcmp(latest->instr_bytes,meta->instr_bytes,meta->size)==0) {
+		g_mutex_unlock(&g_meta_lock);
+		g_free(meta);
+		return latest;
+	}
+	if (g_next_meta_id == META_ID_INVALID) {
+		g_mutex_unlock(&g_meta_lock);
+		g_free(meta);
+		return NULL;
+	}
+
+	meta->pc = pc;
+	meta->meta_id = g_next_meta_id++;
+	gint64 *id_key = g_new(gint64, 1);
+	gint64 *pc_key = g_new(gint64, 1);
+	*id_key = (gint64)meta->meta_id;
+	*pc_key = (gint64)pc;
+
+	g_hash_table_insert(g_meta_by_id, id_key, meta);
+	g_hash_table_replace(g_meta_latest_by_pc, pc_key,meta);
+	g_mutex_unlock(&g_meta_lock);
+	return meta;
 }
 
-InsnMeta *meta_lookup(uint64_t pc) {
-	return g_hash_table_lookup(g_meta_table, GUINT_TO_POINTER(pc));
+const InsnMeta *meta_lookup(uint64_t pc) {
+	if (!g_meta_lock_initialized) return NULL;
+
+	gint64 key = (gint64)pc;
+	g_mutex_lock(&g_meta_lock);
+	const InsnMeta *meta = g_meta_latest_by_pc ? g_hash_table_lookup(g_meta_latest_by_pc, &key) : NULL;
+	g_mutex_unlock(&g_meta_lock);
+	return meta;
+}
+
+const InsnMeta *meta_lookup_id(MetaId meta_id) {
+	if (!g_meta_lock_initialized || meta_id == META_ID_INVALID) {
+		return NULL;
+	}
+	gint64 key = (gint64)meta_id;
+	g_mutex_lock(&g_meta_lock);
+	const InsnMeta *meta = g_meta_by_id ? g_hash_table_lookup(g_meta_by_id, &key) : NULL;
+	g_mutex_unlock(&g_meta_lock);
+	return meta;
 }
 
 static bool same_reg_slice(const cs_x86_op *left, const cs_x86_op *right) {
@@ -991,7 +1083,14 @@ static uint32_t x86_mem_address_reg_mask(const cs_x86_op *operand) {
 }
 
 static void append_reg_slice(RegSlice slices[MAX_INSN_REG_SLICES], uint8_t *count, RegSlice slice) {
-	if (!count || !reg_slice_is_valid(slice)) return;
+	if (!count || !reg_slice_is_valid(slice)) {
+		return;
+	}
+	for (uint8_t index = 0; index < *count; index++) {
+		if (reg_slice_equal(slices[index], slice)) {
+			return;
+		}
+	}
 	if (*count >= MAX_INSN_REG_SLICES) return;
 	slices[*count] = slice;
 	(*count)++;
@@ -1009,33 +1108,187 @@ static DtaInsnFamily classify_x86_insn(uint16_t insn_id) {
 			return DTA_FAMILY_COMPARE;
 		case X86_INS_SHL: case X86_INS_SAL: case X86_INS_SHR: case X86_INS_SAR: case X86_INS_ROL: case X86_INS_ROR: case X86_INS_RCL: case X86_INS_RCR: case X86_INS_SHLD: case X86_INS_SHRD:
 			return DTA_FAMILY_SHIFT_ROTATE;
-		case X86_INS_PUSH: case X86_INS_POP: case X86_INS_PUSHAL: case X86_INS_POPAL: case X86_INS_ENTER: case X86_INS_LEAVE: case X86_INS_CALL: case X86_INS_RET:
+		case X86_INS_PUSH: case X86_INS_POP: case X86_INS_PUSHF: case X86_INS_PUSHFD: case X86_INS_PUSHFQ: case X86_INS_PUSHAL: case X86_INS_POPAL: case X86_INS_ENTER: case X86_INS_LEAVE: case X86_INS_CALL: case X86_INS_RET:
 			return DTA_FAMILY_STACK;
-		case X86_INS_MOVSB: case X86_INS_MOVSW: case X86_INS_MOVSD: case X86_INS_MOVSQ: case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD: case X86_INS_STOSQ:
+		case X86_INS_MOVSB: case X86_INS_MOVSW: case X86_INS_MOVSD: case X86_INS_MOVSQ: case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD: case X86_INS_STOSQ: case X86_INS_LODSB: case X86_INS_LODSW: case X86_INS_LODSD: case X86_INS_LODSQ:
 			return DTA_FAMILY_STRING;
 		default:
 			return DTA_FAMILY_UNSUPPORTED;
 	}
 }
 
+static X86ConditionCode x86_condition_code(uint16_t insn_id) {
+	switch (insn_id) {
+		case X86_INS_JO: case X86_INS_CMOVO: case X86_INS_SETO:
+			return X86_CC_O;
+		case X86_INS_JNO: case X86_INS_CMOVNO: case X86_INS_SETNO:
+			return X86_CC_NO;
+		case X86_INS_JB: case X86_INS_CMOVB: case X86_INS_SETB:
+			return X86_CC_B;
+		case X86_INS_JAE: case X86_INS_CMOVAE: case X86_INS_SETAE:
+			return X86_CC_AE;
+		case X86_INS_JE: case X86_INS_CMOVE: case X86_INS_SETE:
+			return X86_CC_E;
+		case X86_INS_JNE: case X86_INS_CMOVNE: case X86_INS_SETNE:
+			return X86_CC_NE;
+		case X86_INS_JBE: case X86_INS_CMOVBE: case X86_INS_SETBE:
+			return X86_CC_BE;
+		case X86_INS_JA: case X86_INS_CMOVA: case X86_INS_SETA:
+			return X86_CC_A;
+		case X86_INS_JS: case X86_INS_CMOVS: case X86_INS_SETS:
+			return X86_CC_S;
+		case X86_INS_JNS: case X86_INS_CMOVNS: case X86_INS_SETNS:
+			return X86_CC_NS;
+		case X86_INS_JP: case X86_INS_CMOVP: case X86_INS_SETP:
+			return X86_CC_P;
+		case X86_INS_JNP: case X86_INS_CMOVNP: case X86_INS_SETNP:
+			return X86_CC_NP;
+		case X86_INS_JL: case X86_INS_CMOVL: case X86_INS_SETL:
+			return X86_CC_L;
+		case X86_INS_JGE: case X86_INS_CMOVGE: case X86_INS_SETGE:
+			return X86_CC_GE;
+		case X86_INS_JLE: case X86_INS_CMOVLE: case X86_INS_SETLE:
+			return X86_CC_LE;
+		case X86_INS_JG: case X86_INS_CMOVG: case X86_INS_SETG:
+			return X86_CC_G;
+		default:
+			return X86_CC_NONE;
+	}
+}
+
+static uint8_t x86_condition_flag_mask(X86ConditionCode condition) {
+	switch (condition) {
+		case X86_CC_O: case X86_CC_NO:
+			return X86_FLAG_OF;
+		case X86_CC_B: case X86_CC_AE:
+			return X86_FLAG_CF;
+		case X86_CC_E: case X86_CC_NE:
+			return X86_FLAG_ZF;
+		case X86_CC_BE: case X86_CC_A:
+			return X86_FLAG_CF | X86_FLAG_ZF;
+		case X86_CC_S: case X86_CC_NS:
+			return X86_FLAG_SF;
+		case X86_CC_P: case X86_CC_NP:
+			return X86_FLAG_PF;
+		case X86_CC_L: case X86_CC_GE:
+			return X86_FLAG_SF | X86_FLAG_OF;
+		case X86_CC_LE: case X86_CC_G:
+			return X86_FLAG_ZF | X86_FLAG_SF | X86_FLAG_OF;
+		case X86_CC_NONE: default:
+			return 0;
+	}
+}
+
+static bool x86_is_conditional_branch(uint16_t insn_id) {
+	switch (insn_id) {
+		case X86_INS_JO: case X86_INS_JNO: case X86_INS_JB: case X86_INS_JAE: case X86_INS_JE: case X86_INS_JNE: case X86_INS_JBE: case X86_INS_JA: case X86_INS_JS: case X86_INS_JNS: case X86_INS_JP: case X86_INS_JNP: case X86_INS_JL: case X86_INS_JGE: case X86_INS_JLE: case X86_INS_JG:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint8_t x86_written_flag_mask(uint16_t insn_id) {
+	switch (insn_id) {
+		case X86_INS_ADD: case X86_INS_ADC: case X86_INS_SUB: case X86_INS_SBB: case X86_INS_CMP: case X86_INS_NEG:
+			return X86_FLAG_TRACKED;
+		case X86_INS_AND: case X86_INS_OR: case X86_INS_XOR: case X86_INS_TEST:
+			return X86_FLAG_TRACKED;
+		case X86_INS_INC: case X86_INS_DEC:
+			return X86_FLAG_PF | X86_FLAG_AF | X86_FLAG_ZF | X86_FLAG_SF | X86_FLAG_OF;
+		case X86_INS_SHL: case X86_INS_SAL: case X86_INS_SHR: case X86_INS_SAR: case X86_INS_SHLD: case X86_INS_SHRD:
+			return X86_FLAG_TRACKED;
+		case X86_INS_ROL: case X86_INS_ROR: case X86_INS_RCL: case X86_INS_RCR:
+			return X86_FLAG_CF | X86_FLAG_OF;
+		case X86_INS_IMUL: case X86_INS_MUL:
+			return X86_FLAG_TRACKED;
+		case X86_INS_DIV: case X86_INS_IDIV:
+			return X86_FLAG_TRACKED;
+		default:
+			return 0;
+	}
+}
+
+static bool x86_is_legacy_prefix(uint8_t byte) {
+	switch (byte) {
+		case 0xf0: case 0xf2: case 0xf3: case 0x2e: case 0x36: case 0x3e: case 0x26: case 0x64: case 0x65: case 0x66: case 0x67:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint8_t x86_string_element_size(const cs_insn *insn) {
+	if (!insn || insn->size == 0) {
+		return 0;
+	}
+	bool operand_size_16 = false;
+	bool rex_w = false;
+	bool allow_rex = insn->id == X86_INS_MOVSQ || insn->id == X86_INS_STOSQ || insn->id == X86_INS_LODSQ;
+	size_t opcode_index = 0;
+	while (opcode_index < insn->size) {
+		uint8_t byte = insn->bytes[opcode_index];
+		if (byte == 0x66) {
+			operand_size_16 = true;
+		}
+		if (allow_rex && (byte & 0xf8U) == 0x48U) {
+			rex_w = true;
+		}
+		if (!x86_is_legacy_prefix(byte) && (!allow_rex || (byte & 0xf0U) != 0x40U)) {
+			break;
+		}
+		opcode_index++;
+	}
+	if (opcode_index >= insn->size) {
+		return 0;
+	}
+	switch (insn->bytes[opcode_index]) {
+		case 0xa4: case 0xaa: case 0xac:
+			return 1;
+		case 0xa5: case 0xab: case 0xad:
+			return rex_w ? 8 : (operand_size_16 ? 2 : 4);
+		default:
+			return 0;
+	}
+}
+
 InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle) {
+	if (!bytes || size == 0) return NULL;
 	//disasm 1 instr and write it into hashtable
 	cs_insn *insn;
 	size_t count = cs_disasm(handle, bytes, size, pc, 1, &insn);
 	if (count == 0) return NULL;
+	if (insn->size == 0 || insn->size > MAX_INSN_BYTES || insn->size > size) {
+		cs_free(insn, count);
+		return NULL;
+	}
 
 	InsnMeta *m = g_new0(InsnMeta, 1);
 	m->pc = pc;
-	m->size = insn->size;
+	m->size = (uint8_t)insn->size;
+	memcpy(m->instr_bytes, bytes, m->size);
 	m->insn_id = insn->id;
 	m->branch_target_reg = REG_INVALID;
 	m->family = classify_x86_insn(insn->id);
+	m->condition_code = x86_condition_code(insn->id);
+	m->flags_read_mask =x86_condition_flag_mask(m->condition_code);
+	m->flags_write_mask = x86_written_flag_mask(insn->id);
+	m->is_conditional_branch = x86_is_conditional_branch(insn->id);
+	m->string_element_size = x86_string_element_size(insn);
+	if (m->family == DTA_FAMILY_STRING && m->string_element_size == 0) {
+		m->family = DTA_FAMILY_UNSUPPORTED;
+	}
 	if (insn->detail) {
 		//lookup on W/R flag
 		cs_x86 *x86 = &insn->detail->x86;
+		for (unsigned prefix_index = 0;prefix_index < (sizeof(x86->prefix) / sizeof(x86->prefix[0])); prefix_index++) {
+			if (x86->prefix[prefix_index] == 0xf2 || x86->prefix[prefix_index] == 0xf3) {
+				m->has_rep_prefix = true;
+			}
+		}
 		//clear taint for xor and sub
 		if ((insn->id == X86_INS_XOR || insn->id == X86_INS_SUB) && x86->op_count == 2 && same_reg_slice(&x86->operands[0],&x86->operands[1])) {
-		m->is_self_zeroing = true;
+			m->is_self_zeroing = true;
 		}
 		for (int i = 0; i < x86->op_count; i++) {
 			cs_x86_op *op = &x86->operands[i];
@@ -1085,12 +1338,18 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 			if (rid >= 0) {
 				m->regs_read_mask |= (1U << rid);
 			}
+			if (insn->detail->regs_read[i] == X86_REG_EFLAGS && insn->id != X86_INS_INC && insn->id != X86_INS_DEC && m->flags_read_mask == 0) {
+				m->flags_read_mask =X86_FLAG_TRACKED;
+			}
 		}
 		//WRITE registers
 		for (int i = 0; i < insn->detail->regs_write_count; i++) {
 			int rid = x86_reg_to_rid(insn->detail->regs_write[i]);
 			if (rid >= 0) {
 				m->regs_written_mask |= (1U << rid);
+			}
+			if (insn->detail->regs_write[i] == X86_REG_EFLAGS && m->flags_write_mask == 0) {
+				m->flags_write_mask = X86_FLAG_TRACKED;
 			}
 		}
 		// implicit mem access
@@ -1105,6 +1364,14 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 					m->mem_addr_reg_mask |= source_address;
 					m->mem_read_addr_reg_mask |= source_address;
 				}
+				break;
+			case X86_INS_PUSHF: case X86_INS_PUSHFD: case X86_INS_PUSHFQ:
+				m->has_mem_write = true;
+				m->mem_addr_reg_mask |= UINT32_C(1) << REG_RSP;
+				m->mem_write_addr_reg_mask |= UINT32_C(1) << REG_RSP;
+				m->regs_read_mask |= UINT32_C(1) << REG_RSP;
+				m->regs_written_mask |= UINT32_C(1) << REG_RSP;
+				m->flags_read_mask |= X86_FLAG_TRACKED;
 				break;
 			case X86_INS_CALL:
 				m->has_mem_write = true;
@@ -1156,15 +1423,49 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 				m->mem_read_addr_reg_mask |= 1U << REG_RBP;
 				break;
 			case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD: case X86_INS_STOSQ:
-				m->has_mem_write = true;
-				m->mem_addr_reg_mask |= 1U << REG_RDI;
-				m->mem_write_addr_reg_mask |= 1U << REG_RDI;
+				if (m->string_element_size != 0) {
+					m->has_mem_write = true;
+					m->mem_addr_reg_mask |= 1U << REG_RDI;
+					m->mem_write_addr_reg_mask |= 1U << REG_RDI;
+				}
+				break;
+			case X86_INS_LODSB: case X86_INS_LODSW: case X86_INS_LODSD: case X86_INS_LODSQ:
+				if (m->string_element_size != 0) {
+					m->has_mem_read = true;
+					m->mem_addr_reg_mask |= UINT32_C(1) << REG_RSI;
+					m->mem_read_addr_reg_mask |= UINT32_C(1) << REG_RSI;
+					x86_reg accumulator = X86_REG_INVALID;
+					switch (m->string_element_size) {
+						case 1:
+							accumulator = X86_REG_AL;
+							break;
+						case 2:
+							accumulator = X86_REG_AX;
+							break;
+						case 4:
+							accumulator = X86_REG_EAX;
+							break;
+						case 8:
+							accumulator = X86_REG_RAX;
+							break;
+						default:
+							break;
+					}
+					RegSlice accumulator_write = reg_slice_from_x86(accumulator,m->string_element_size);
+					append_reg_slice(m->reg_writes, &m->reg_write_count, accumulator_write);
+					m->regs_written_mask |= UINT32_C(1) << REG_RAX;
+					RegSlice source_index = reg_slice_from_x86(X86_REG_ESI, 4);
+					append_reg_slice(m->reg_reads, &m->reg_read_count, source_index);
+					append_reg_slice(m->reg_writes, &m->reg_write_count, source_index);
+					m->regs_read_mask |= UINT32_C(1) << REG_RSI;
+					m->regs_written_mask |= UINT32_C(1) << REG_RSI;
+				}
 				break;
 			default:
 				break;
 		}
 		//movs mem, mem
-		if (insn->id == X86_INS_MOVSB || insn->id == X86_INS_MOVSW || insn->id == X86_INS_MOVSD || insn->id == X86_INS_MOVSQ) {
+		if (m->string_element_size != 0 && (insn->id == X86_INS_MOVSB || insn->id == X86_INS_MOVSW || insn->id == X86_INS_MOVSD || insn->id == X86_INS_MOVSQ)) {
 			m->has_mem_read = true;
 			m->has_mem_write = true;
 			m->mem_addr_reg_mask |= (1U << REG_RSI) | (1U << REG_RDI);

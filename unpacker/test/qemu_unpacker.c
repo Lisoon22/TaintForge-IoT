@@ -54,12 +54,19 @@ typedef struct {
 	uint64_t jump_site;
 	uint32_t generation;
 	uint64_t icount;
-	bool dse_confirmed;
-	uint32_t dse_concretized;
-	uint32_t dse_total;
+	DseVerifyResult dse;
+	bool target_tainted;
 	bool has_prologue;
 	bool jump_from_unmapped;
 } oep_cand_t;
+
+typedef struct {
+	uint64_t pc;
+	MetaId meta_id;
+	const InsnMeta *meta;
+	uint8_t instr_bytes[MAX_INSN_BYTES];
+	uint8_t size;
+} InsnExecCtx;
 
 //got table reconstruct helper
 typedef struct {
@@ -79,11 +86,65 @@ static RegShadow reg_shadow;
 static TraceBuffer *g_trace = NULL;
 static DseAuxRing *g_aux = NULL;
 static __thread InsnAux *g_cur_aux = NULL;
+static GPtrArray *g_insn_exec_contexts = NULL;
+static GMutex g_insn_exec_contexts_lock;
+static bool g_insn_exec_contexts_lock_initialized = false;
 static bool g_taint_seen = false;
 static struct qemu_plugin_register *g_reg_handle[REG_COUNT];
+static struct qemu_plugin_register *g_eflags_handle = NULL;
 static bool g_regs_ready = false;
 static const char *g_reg_name_i386[8] = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"};
 static bool g_reg_read_error_reported[REG_COUNT];
+
+static bool insn_exec_contexts_init(void) {
+	if (g_insn_exec_contexts_lock_initialized) {
+		return g_insn_exec_contexts != NULL;
+	}
+	g_mutex_init(&g_insn_exec_contexts_lock);
+	g_insn_exec_contexts_lock_initialized = true;
+	g_insn_exec_contexts = g_ptr_array_new_with_free_func(g_free);
+	return g_insn_exec_contexts != NULL;
+}
+
+static void insn_exec_contexts_destroy(void) {
+	if (!g_insn_exec_contexts_lock_initialized) return;
+	g_mutex_lock(&g_insn_exec_contexts_lock);
+	GPtrArray *contexts = g_insn_exec_contexts;
+	g_insn_exec_contexts = NULL;
+	g_mutex_unlock(&g_insn_exec_contexts_lock);
+	if (contexts) g_ptr_array_unref(contexts);
+	g_mutex_clear(&g_insn_exec_contexts_lock);
+	g_insn_exec_contexts_lock_initialized = false;
+}
+
+static InsnExecCtx *insn_exec_context_create(uint64_t pc, const uint8_t *bytes, size_t size, const InsnMeta *meta) {
+	InsnExecCtx *ctx =g_new0(InsnExecCtx, 1);
+	ctx->pc = pc;
+	ctx->meta = meta;
+	ctx->meta_id = meta ? meta->meta_id : META_ID_INVALID;
+	if (meta) {
+		ctx->size = meta->size;
+		memcpy(ctx->instr_bytes, meta->instr_bytes, meta->size);
+	} else if (bytes && size != 0) {
+		size_t copy_size = size < MAX_INSN_BYTES ? size : MAX_INSN_BYTES;
+		ctx->size = (uint8_t)copy_size;
+		memcpy(ctx->instr_bytes, bytes, copy_size);
+	}
+	if (!g_insn_exec_contexts_lock_initialized) {
+		g_free(ctx);
+		return NULL;
+	}
+	g_mutex_lock(&g_insn_exec_contexts_lock);
+	if (!g_insn_exec_contexts) {
+		g_mutex_unlock(&g_insn_exec_contexts_lock);
+		g_free(ctx);
+		return NULL;
+	}
+	g_ptr_array_add(g_insn_exec_contexts,ctx);
+	g_mutex_unlock(&g_insn_exec_contexts_lock);
+	return ctx;
+}
+
 //auxv read for threshold and determine precise page size
 #ifndef AT_NULL
 #define AT_NULL 0 //vector end
@@ -122,6 +183,7 @@ static GHashTable *unmapped_pages = NULL; //for munmaped pages
 
 //addtional info for last indirect jump
 static __thread uint64_t prev_jump_site = 0;
+static __thread uint64_t prev_jump_seq_id = 0;
 static __thread int prev_target_reg = REG_INVALID;
 static __thread uint64_t prev_mem_taddr = 0;
 static __thread bool prev_jump_pending = false;
@@ -507,20 +569,30 @@ static void dse_init_reg_handles(void) {
 		return;
 	}
 	memset(g_reg_handle, 0, sizeof(g_reg_handle));
+	g_eflags_handle = NULL;
 	int found = 0;
 	for (guint i = 0; i < regs->len; i++) {
-		qemu_plugin_reg_descriptor *d = &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-		for (int r = 0; r < 8; r++)
-			if (d->name && g_ascii_strcasecmp(d->name, g_reg_name_i386[r]) == 0) {
-				if (!g_reg_handle[r]) found++;
-				g_reg_handle[r] = d->handle;
-				fprintf(stderr, "[REG] QEMU reg: %s\n", d->name ? d->name : "(null)");
+		qemu_plugin_reg_descriptor *descriptor = &g_array_index(regs, qemu_plugin_reg_descriptor,i);
+		if (descriptor->name && (g_ascii_strcasecmp(descriptor->name, "eflags") == 0 || g_ascii_strcasecmp(descriptor->name, "rflags") == 0)) {
+			g_eflags_handle = descriptor->handle;
+			fprintf(stderr, "[REG] QEMU reg: %s\n", descriptor->name);
+		}
+		for (int reg = 0; reg < 8; reg++) {
+			if (!descriptor->name || g_ascii_strcasecmp(descriptor->name, g_reg_name_i386[reg]) != 0) {
+				continue;
 			}
+			if (!g_reg_handle[reg]) found++;
+			g_reg_handle[reg] = descriptor->handle;
+			fprintf(stderr, "[REG] QEMU reg: %s\n",descriptor->name);
+		}
 	}
 	g_array_free(regs, TRUE);
-	g_regs_ready = (found == 8);
+	g_regs_ready = found == 8;
 	if (!g_regs_ready) {
 		fprintf(stderr, "[REG] incomplete i386 register set: found %d/8\n", found);
+	}
+	if (!g_eflags_handle) {
+		fprintf(stderr, "[REG] eflags/rflags register is unavailable; path-sensitive DSE will remain incomplete\n");
 	}
 }
 
@@ -549,6 +621,44 @@ static bool dse_read_reg(int rid, uint64_t *out) {
 	for (size_t i = 0; i < n; i++) v |= (uint64_t)buf->data[i] << (8 * i);
 	*out = v & 0xFFFFFFFFULL;
 	return true;
+}
+
+static bool dse_read_eflags(uint32_t *out) {
+	if (!out || !g_eflags_handle) return false;
+	static __thread GByteArray *buf = NULL;
+	static bool error_reported = false;
+	if (!buf) buf = g_byte_array_new();
+	g_byte_array_set_size(buf, 0);
+	int rc = qemu_plugin_read_register(g_eflags_handle, buf);
+	if (rc <= 0 || buf->len == 0) {
+		if (!error_reported) {
+			fprintf(stderr, "[REG] read failed for eflags: rc=%d len=%u\n", rc, buf->len);
+			error_reported = true;
+		}
+		return false;
+	}
+	uint32_t value = 0;
+	size_t count = buf->len < 4 ? buf->len : 4;
+	for (size_t i = 0; i < count; i++) {
+		value |= (uint32_t)buf->data[i] << (8U * i);
+	}
+	*out = value;
+	return true;
+}
+
+static uint32_t dse_read_register_snapshot(uint64_t values[REG_COUNT]) {
+	if (!values) return 0;
+	memset(values, 0, sizeof(uint64_t) * REG_COUNT);
+	if (!g_regs_ready) dse_init_reg_handles();
+	uint32_t valid_mask = 0;
+	for (int rid = 0; rid < REG_COUNT; rid++) {
+		uint64_t value = 0;
+		if (dse_read_reg(rid, &value)) {
+			values[rid] = value;
+			valid_mask |= UINT32_C(1) << rid;
+		}
+	}
+	return valid_mask;
 }
 
 static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_t *out_addr, uint64_t *out_val) {
@@ -812,21 +922,88 @@ static void apply_memory_store_taint(uint64_t vaddr, uint32_t size, const InsnMe
 	g_dta_mem_transfer.last_read_valid = false;
 }
 
+static void dse_aux_note_mem_access(uint32_t *total, bool *range_valid, bool *range_unknown, uint64_t *range_min, uint64_t *range_max, uint64_t address, uint32_t size){
+	if (!total || !range_valid || !range_unknown ||
+		!range_min || !range_max) {
+		return;
+	}
+	if (*total != UINT32_MAX) {
+		(*total)++;
+	}
+	if (size == 0 || address > UINT64_MAX - ((uint64_t)size - 1U)) {
+		*range_unknown = true;
+		return;
+	}
+	uint64_t end = address + (uint64_t)size - 1U;
+	if (!*range_valid) {
+		*range_valid = true;
+		*range_min = address;
+		*range_max = end;
+		return;
+	}
+	if (address < *range_min) *range_min = address;
+	if (end > *range_max) *range_max = end;
+}
+
+static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size, uint64_t *out_value) {
+	if (!out_value || size == 0 || size > sizeof(*out_value)) {
+		return false;
+	}
+	qemu_plugin_mem_value observed = qemu_plugin_mem_get_value(info);
+	switch (observed.type) {
+		case QEMU_PLUGIN_MEM_VALUE_U8:
+			if (size != 1U) return false;
+			*out_value = observed.data.u8;
+			return true;
+		case QEMU_PLUGIN_MEM_VALUE_U16:
+			if (size != 2U) return false;
+			*out_value = observed.data.u16;
+			return true;
+		case QEMU_PLUGIN_MEM_VALUE_U32:
+			if (size != 4U) return false;
+			*out_value = observed.data.u32;
+			return true;
+		case QEMU_PLUGIN_MEM_VALUE_U64:
+			if (size != 8U) return false;
+			*out_value = observed.data.u64;
+			return true;
+		case QEMU_PLUGIN_MEM_VALUE_U128: default:
+			return false;
+	}
+}
+
 static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
-	(void)vcpu; (void)ud;
+	(void)vcpu;
+	const InsnExecCtx *exec_ctx =(const InsnExecCtx*)ud;
+	const InsnMeta *meta = exec_ctx ? exec_ctx->meta : NULL;
+	if (exec_ctx && exec_ctx->pc != g_current_ip) meta = NULL;
 	uint32_t sz = 1u << qemu_plugin_mem_size_shift(info);
 	if (qemu_plugin_mem_is_store(info)) {
+		uint64_t stored_value = 0;
+		bool stored_value_valid = dse_mem_access_value_u64(info, sz, &stored_value);
 		if (g_cur_aux) {
-			g_cur_aux->has_mem_write  = true;
-			g_cur_aux->mem_write_addr = vaddr;
+			dse_aux_capture_string_write(g_cur_aux, vaddr, sz);
+			dse_aux_note_mem_access(&g_cur_aux->mem_write_total, &g_cur_aux->mem_write_range_valid, &g_cur_aux->mem_write_range_unknown, &g_cur_aux->mem_write_min_addr, &g_cur_aux->mem_write_max_addr, vaddr, sz);
+			if (!g_cur_aux->has_mem_write) {
+				g_cur_aux->mem_write_addr = vaddr;
+				g_cur_aux->mem_write_size = sz <= MAX_REG_BYTES ? (uint8_t)sz : 0;
+			}
+			g_cur_aux->has_mem_write = true;
+			if (sz == 0 || sz > MAX_REG_BYTES || g_cur_aux->mem_write_count >= DSE_MAX_MEM_ACCESSES) {
+				g_cur_aux->mem_write_overflow = true;
+			} else {
+				DseMemWrite *write = &g_cur_aux->mem_writes[g_cur_aux->mem_write_count++];
+				write->addr = vaddr;
+				write->value = stored_value;
+				write->size = (uint8_t)sz;
+				write->value_valid = stored_value_valid;
+			}
 		}
-		InsnMeta *meta = meta_lookup(g_current_ip);
-		apply_memory_store_taint(vaddr, sz,meta);
+		apply_memory_store_taint(vaddr, sz, meta);
 		return;
 	}
 	//taint byte by byte
 	//mem2reg propagate
-	InsnMeta *meta = meta_lookup(g_current_ip);
 	bool context_valid = g_dta_mem_transfer.active && g_dta_mem_transfer.pc == g_current_ip;
 	uint8_t mem_width = (uint8_t)(sz < MAX_REG_BYTES ? sz : MAX_REG_BYTES);
 	uint8_t raw_tmask = shadow_load_taint_mask(vaddr, sz);
@@ -834,6 +1011,7 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
 	if (meta && context_valid) {
 		tmask = dta_effective_mem_read_taint(&g_dta_mem_transfer.pre_regs, meta, raw_tmask, mem_width);
 	}
+	bool address_tainted = meta && context_valid && dta_address_mask_is_tainted(&g_dta_mem_transfer.pre_regs, meta->mem_read_addr_reg_mask);
 	if (context_valid) {
 		g_dta_mem_transfer.last_read_valid = true;
 		g_dta_mem_transfer.last_read_size = sz;
@@ -844,7 +1022,6 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
 			uint32_t old_esp =(uint32_t)g_cur_aux->reg_vals[REG_RSP];
 			uint32_t offset =(uint32_t)vaddr - old_esp;
 			x86_reg destination = X86_REG_INVALID;
-
 			switch (offset) {
 				case 0:
 					destination = X86_REG_EDI;
@@ -901,25 +1078,28 @@ static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t v
 		}
 	}
 	if (g_cur_aux) {
-		GByteArray *arr = g_byte_array_new();
+		dse_aux_note_mem_access(&g_cur_aux->mem_read_total, &g_cur_aux->mem_read_range_valid, &g_cur_aux->mem_read_range_unknown, &g_cur_aux->mem_read_min_addr, &g_cur_aux->mem_read_max_addr, vaddr, sz);
 		uint64_t value = 0;
-		if (qemu_plugin_read_memory_vaddr(vaddr,arr,sz)) {
-			for (uint32_t i = 0;i < sz && i < arr->len && i < 8;i++) {
-				value |= (uint64_t)arr->data[i] << (8 * i);
-			}
+		bool value_valid = dse_mem_access_value_u64(info, sz, &value);
+		if (!g_cur_aux->has_mem_read) {
+			g_cur_aux->mem_read_addr = vaddr;
+			g_cur_aux->mem_read_val = value;
+			g_cur_aux->mem_read_taint = raw_tmask;
+			g_cur_aux->mem_read_effective_taint = tmask;
+			g_cur_aux->mem_read_address_tainted = address_tainted;
 		}
-		g_byte_array_free(arr, TRUE);
+		(void)dse_aux_capture_string_read(g_aux, g_cur_aux, vaddr, value, value_valid, raw_tmask,sz);
 		g_cur_aux->has_mem_read = true;
-		g_cur_aux->mem_read_addr = vaddr;
-		g_cur_aux->mem_read_val = value;
-		g_cur_aux->mem_read_taint = tmask;
-		if (g_cur_aux->mem_read_count < 8) {
-			DseMemRead *read = &g_cur_aux->mem_reads[g_cur_aux->mem_read_count];
+		if (sz == 0 || sz > MAX_REG_BYTES || g_cur_aux->mem_read_count >= DSE_MAX_MEM_ACCESSES) {
+			g_cur_aux->mem_read_overflow = true;
+		} else {
+			DseMemRead *read = &g_cur_aux->mem_reads[g_cur_aux->mem_read_count++];
 			read->addr = vaddr;
 			read->value = value;
-			read->taint = tmask;
+			read->taint = raw_tmask;
+			read->effective_taint = tmask;
+			read->address_tainted = address_tainted;
 			read->size = (uint8_t)sz;
-			g_cur_aux->mem_read_count++;
 		}
 	}
 }
@@ -1200,21 +1380,21 @@ static bool cand_in_main_image(const oep_cand_t *c) {
 
 //part of the concrete to total to determine the most accurate OEP
 static double cand_dse_ratio(const oep_cand_t *c) {
-	if (!c || c->dse_total == 0) return 1.0;
-	uint32_t failed = c->dse_concretized;
-	if (failed > c->dse_total) {
-		failed = c->dse_total;
+	if (!c || c->dse.lifted_total == 0) return 1.0;
+	uint32_t failed = c->dse.concretized;
+	if (failed > c->dse.lifted_total) {
+		failed = c->dse.lifted_total;
 	}
-	return (double)failed / (double)c->dse_total;
+	return (double)failed / (double)c->dse.lifted_total;
 }
 //check overall measurements
-static double cand_dse_strength(const oep_cand_t *c)
-{
-	if (!c || !c->dse_confirmed || c->dse_total == 0) return 0.0;
+static double cand_dse_strength(const oep_cand_t *c) {
+	if (!c || c->dse.verdict != DSE_VERDICT_CONFIRMED || c->dse.evidence != DSE_EVIDENCE_UNIQUE_ON_SLICE || c->dse.lifted_total == 0) {
+		return 0.0;
+	}
 	//lifting coverage
 	double quality = 1.0 - cand_dse_ratio(c);
-	uint32_t depth_total =c->dse_total;
-
+	uint32_t depth_total =c->dse.lifted_total;
 	if (depth_total > MAX_SLICE) {
 		depth_total = MAX_SLICE;
 	}
@@ -1230,9 +1410,9 @@ static bool cand_stronger(const oep_cand_t *a, const oep_cand_t *b) {
 	if (strength_a != strength_b) {
 		return strength_a > strength_b;
 	}
-	if (a->dse_confirmed && b->dse_confirmed) {
-		if (a->dse_total != b->dse_total) {
-			return a->dse_total > b->dse_total;
+	if (a->dse.verdict == DSE_VERDICT_CONFIRMED && b->dse.verdict == DSE_VERDICT_CONFIRMED) {
+		if (a->dse.lifted_total != b->dse.lifted_total) {
+			return a->dse.lifted_total > b->dse.lifted_total;
 		}
 		double ratio_a = cand_dse_ratio(a);
 		double ratio_b = cand_dse_ratio(b);
@@ -1950,9 +2130,9 @@ static void build_oep_scoring(oep_cand_t *chosen) {
 	g_oep_scoring = g_string_new(NULL);
 	g_string_append(g_oep_scoring, "  \"oep_candidates\": [\n");
 
-	for (guint i = 0;i < top_count; i++) {
+	for (guint i = 0; i < top_count; i++) {
 		oep_cand_t *candidate = candidates[i];
-		g_string_append_printf(g_oep_scoring,"    {\"addr\": \"0x%lx\", \"score\": %.4f, \"confidence\": %.4f, \"dse_confirmed\": %s, \"concretized\": %u, \"total\": %u, \"generation\": %u}%s\n",(unsigned long) candidate->addr, cand_score(candidate), cand_confidence(candidate), candidate->dse_confirmed ? "true" : "false", candidate->dse_concretized, candidate->dse_total, candidate->generation, (i + 1) < top_count ? "," : "");
+		g_string_append_printf(g_oep_scoring, "    {\"addr\": \"0x%lx\", \"score\": %.4f, \"confidence\": %.4f, \"dse_verdict\": \"%s\", \"dse_evidence\": \"%s\", \"dse_reason\": \"%s\", \"candidate_query\": \"%s\", \"alternative_query\": \"%s\", \"target_symbolic\": %s, \"target_tainted\": %s, \"slice_complete\": %s, \"slice_len\": %u, \"concretized\": %u, \"total\": %u, \"aux_miss\": %u, \"unsupported\": %u, \"meta_missing\": %u, \"address_constraints\": %u, \"address_failures\": %u, \"generation\": %u}%s\n", (unsigned long)candidate->addr, cand_score(candidate), cand_confidence(candidate), dse_verdict_name(candidate->dse.verdict), dse_evidence_name(candidate->dse.evidence), dse_verify_reason_name(candidate->dse.reason), dse_solver_status_name(candidate->dse.candidate_query), dse_solver_status_name(candidate->dse.alternative_query), candidate->dse.target_symbolic ? "true" : "false", candidate->target_tainted ? "true" : "false", candidate->dse.slice_complete ? "true" : "false", candidate->dse.slice_len, candidate->dse.concretized, candidate->dse.lifted_total, candidate->dse.aux_miss, candidate->dse.unsupported, candidate->dse.meta_missing, candidate->dse.address_constraints, candidate->dse.address_failures, candidate->generation, i + 1 < top_count ? "," : "");
 	}
 
 	g_string_append(g_oep_scoring,"  ],\n");
@@ -2032,12 +2212,17 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 
 	//capstone handle
 	cs_close(&cs_handle);
+	insn_exec_contexts_destroy();
 	meta_free();
 
 	//tracer
+	dse_lift_attach(NULL, NULL, NULL);
+	g_cur_aux = NULL;
+	dse_aux_destroy(g_aux);
+	g_aux = NULL;
 	trace_buffer_destroy(g_trace);
 	g_trace = NULL;
-	
+
 	//oeps
 	if (saved_reg) {
 		g_string_free(saved_reg, TRUE);
@@ -2073,7 +2258,24 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
 }
 
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
-	uint64_t vaddr = (uint64_t)(uintptr_t) udata;
+	const InsnExecCtx *exec_ctx = (const InsnExecCtx *)udata;
+	if (!exec_ctx) return;
+	uint64_t vaddr = exec_ctx->pc;
+	const InsnMeta *meta = exec_ctx->meta;
+	uint64_t current_reg_vals[REG_COUNT] = {0};
+	uint32_t current_reg_value_valid_mask = 0;
+	uint32_t current_eflags = 0;
+	bool current_eflags_valid = false;
+	bool need_dse_snapshot = g_cur_aux != NULL || (g_trace != NULL && g_aux != NULL && g_taint_seen);
+	if (need_dse_snapshot) {
+		current_reg_value_valid_mask = dse_read_register_snapshot(current_reg_vals);
+		if (dse_read_eflags(&current_eflags)) {
+			current_eflags_valid = true;
+		}
+	}
+	if (g_cur_aux) {
+		dse_aux_finalize(g_cur_aux, vaddr, current_reg_vals, current_reg_value_valid_mask);
+	}
 	g_cur_aux = NULL;
 	g_current_ip = vaddr;
 	g_dta_mem_transfer.active = true;
@@ -2083,7 +2285,6 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	g_dta_mem_transfer.last_read_size = 0;
 	g_dta_mem_transfer.last_read_taint = 0;
 	g_icount++;
-
 	if (!g_auxv_done && g_icount >= g_auxv_next_retry) {
 		if (!g_regs_ready) {
 			dse_init_reg_handles();
@@ -2096,58 +2297,49 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			g_auxv_next_retry = g_icount > UINT64_MAX - delay ? UINT64_MAX : g_icount + delay;
 		}
 	}
-
-	InsnMeta *meta = meta_lookup(vaddr);
-	if (!meta){
+	uint64_t current_trace_seq_id = 0;
+	if (g_trace) {
+		TraceEntry entry = {0};
+		entry.pc = vaddr;
+		entry.meta_id = exec_ctx->meta_id;
+		entry.size = exec_ctx->size;
+		memcpy(entry.instr_bytes,exec_ctx->instr_bytes, exec_ctx->size);
+		const TraceEntry *stored_entry = trace_append(g_trace, &entry);
+		if (stored_entry) {
+			current_trace_seq_id = stored_entry->seq_id;
+		}
+		if (stored_entry && g_aux && g_taint_seen) {
+			InsnAux aux;
+			memset(&aux, 0, sizeof(aux));
+			memcpy(aux.reg_vals, current_reg_vals, sizeof(aux.reg_vals));
+			aux.reg_value_valid_mask = current_reg_value_valid_mask;
+			aux.eflags_valid = current_eflags_valid;
+			aux.eflags_before = current_eflags;
+			for (int r = 0; r < REG_COUNT; r++) {
+				uint8_t taint_mask = 0;
+				for (int b = 0; b < 4; b++) {
+					if (reg_shadow.bytes[r][b]) {
+						taint_mask |= (uint8_t)(1U << b);
+					}
+				}
+				aux.reg_taint[r] = taint_mask;
+			}
+			g_cur_aux = dse_aux_record(g_aux, g_trace, stored_entry, &aux);
+			if (g_cur_aux) dse_aux_prepare_string(g_cur_aux, meta);
+		} else {
+			g_cur_aux = NULL;
+		}
+	}
+	if (!meta) {
 		prev_jump_pending = false;
 		prev_jump_site = 0;
-		prev_target_reg =REG_INVALID;
+		prev_jump_seq_id = 0;
+		prev_target_reg = REG_INVALID;
 		prev_mem_taddr = 0;
 		prev_mem_target_value = 0;
 		prev_mem_target_valid = false;
 		prev_target_tainted = false;
 		return;
-	}
-
-	//tracer
-	if (g_trace) {
-		TraceEntry ent = {0};
-		ent.pc = vaddr;
-		ent.size = meta->size;
-		uint8_t need;
-		if (meta->size > 15) {
-			need = 15;
-		} else {
-			need = meta->size;
-		}
-		GByteArray *ib = g_byte_array_new();
-		if (qemu_plugin_read_memory_vaddr(vaddr, ib, need)) {
-			memcpy(ent.instr_bytes, ib->data, ib->len > 15 ? 15 : ib->len);
-		}
-		g_byte_array_free(ib, TRUE);
-		if (g_aux && g_taint_seen) {
-			if (!g_regs_ready) dse_init_reg_handles();
-			InsnAux aux;
-			memset(&aux, 0, sizeof(aux));
-			aux.valid = true;
-			aux.pc = vaddr;
-			for (int r = 0; r < REG_COUNT; r++) {
-				uint64_t rv = 0;
-				dse_read_reg(r, &rv);
-				aux.reg_vals[r] = rv;
-				uint8_t m = 0;
-				for (int b = 0; b < 4; b++) {
-					if (reg_shadow.bytes[r][b]) m |= (1u << b);
-				}
-				aux.reg_taint[r] = m;
-			}
-			uint32_t idx = g_trace->head_pointer & (g_aux->capacity - 1);
-			dse_aux_record(g_aux, g_trace, &aux);
-			g_cur_aux = &g_aux->entries[idx];
-		} else {
-			g_cur_aux = NULL;
-		}
-		trace_append(g_trace, &ent);
 	}
 	//detect mov to upacked code
 	bool now_unpacked = insn_is_unpacked(vaddr, meta->size);
@@ -2166,40 +2358,84 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	if (cur_pg) cur_pg->exec_seen = true;
 
 	if (new_layer) {
-		oep_cand_t *c = g_new0(oep_cand_t, 1);
-		c->addr = vaddr;
-		c->has_prologue =cand_has_prologue(vaddr);
+		oep_cand_t *candidate = g_new0(oep_cand_t, 1);
+		candidate->addr = vaddr;
+		candidate->has_prologue = cand_has_prologue(vaddr);
 		if (prev_jump_matches) {
-			c->jump_site = prev_jump_site;
+			candidate->jump_site = prev_jump_site;
 		} else {
-			c->jump_site= 0;
+			candidate->jump_site = 0;
 		}
-		c->jump_from_unmapped = jump_site_is_unpacker(c->jump_site);
+		candidate->jump_from_unmapped = jump_site_is_unpacker(candidate->jump_site);
 		if (g_layer_dirty) {
 			g_layer++;
 			g_layer_dirty = false;
 			g_layer_has_cand = false;
 		}
-		c->generation = g_layer;
-		c->icount = g_icount;
-		//dse confirming
+		candidate->generation = g_layer;
+		candidate->icount = g_icount;
+		candidate->target_tainted =prev_target_tainted;
+		candidate->dse.verdict = DSE_VERDICT_UNKNOWN;
+		candidate->dse.evidence = DSE_EVIDENCE_NONE;
+		candidate->dse.reason = DSE_REASON_TARGET_UNAVAILABLE;
+		candidate->dse.candidate_query = DSE_SOLVER_NOT_RUN;
+		candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
+		
 		if (prev_jump_matches) {
-			if (prev_target_reg >= 0) {
-				c->dse_confirmed = dse_verify_oep_candidate(g_trace, prev_jump_site, prev_target_reg, vaddr,g_shadow, cs_handle);
+			if (prev_target_reg >= 0 && prev_target_reg < REG_COUNT) {
+				candidate->dse = dse_verify_oep_candidate(g_trace, g_aux,prev_jump_seq_id, prev_target_reg, vaddr, g_shadow, cs_handle);
 			} else if (prev_mem_target_valid) {
-				c->dse_confirmed = dse_verify_oep_candidate_mem(g_trace, g_aux, prev_jump_site, prev_mem_taddr, vaddr, g_shadow, cs_handle);
+				candidate->dse = dse_verify_oep_candidate_mem(g_trace, g_aux,prev_jump_seq_id, prev_mem_taddr, vaddr, g_shadow, cs_handle);
 			}
 		}
-		c->dse_concretized = dse_lift_concretized_count();
-		c->dse_total =dse_lift_total_count();
-		fprintf(stderr, "[OEP-CAND gen=%u] 0x%lx jmp@0x%lx) target_taint=%s dse=%s (concretized %u/%u; aux_miss %u, unsup %u)\n", c->generation, (unsigned long)c->addr, (unsigned long)c->jump_site, prev_target_tainted ? "yes" : "no", c->dse_confirmed ? "CONFIRMED" : "unconfirmed", dse_lift_concretized_count(), dse_lift_total_count(), dse_lift_aux_miss_count(), dse_lift_unsupported_count());
-		//proceed to next layer
-		oep_cands = g_list_append(oep_cands, c);
+		fprintf(
+	stderr,
+	"[OEP-CAND gen=%u] 0x%lx jmp@0x%lx "
+	"target_taint=%s dse=%s evidence=%s reason=%s "
+	"candidate=%s alternative=%s "
+	"(slice %u; concretized %u/%u; aux_miss %u, "
+	"unsup %u, meta_miss %u, addr_eq %u, addr_fail %u, "
+	"roots reg=%u mem=%u addr=%u)\n",
+	candidate->generation,
+	(unsigned long)candidate->addr,
+	(unsigned long)candidate->jump_site,
+	candidate->target_tainted ? "yes" : "no",
+	dse_verdict_name(candidate->dse.verdict),
+	dse_evidence_name(candidate->dse.evidence),
+	dse_verify_reason_name(candidate->dse.reason),
+	dse_solver_status_name(
+		candidate->dse.candidate_query),
+	dse_solver_status_name(
+		candidate->dse.alternative_query),
+	candidate->dse.slice_len,
+	candidate->dse.concretized,
+	candidate->dse.lifted_total,
+	candidate->dse.aux_miss,
+	candidate->dse.unsupported,
+	candidate->dse.meta_missing,
+	candidate->dse.address_constraints,
+	candidate->dse.address_failures,
+	candidate->dse.boundary_reg_bytes,
+	candidate->dse.boundary_mem_bytes,
+	candidate->dse.address_root_bytes);
+		fprintf(
+	stderr,
+	"[DSE-MEM] expr_nodes=%u/%u "
+	"z3_cache=%u/%u resource_limit=%s\n",
+	candidate->dse.expr_nodes_created,
+	DSE_MAX_EXPR_NODES,
+	candidate->dse.z3_cache_nodes,
+	DSE_MAX_Z3_CACHE_NODES,
+	candidate->dse.resource_limit_hit
+		? "yes"
+		: "no");
+		oep_cands = g_list_append(oep_cands, candidate);
 		g_layer_has_cand = true;
 		g_last_cand_icount = g_icount;
 	}
 	prev_jump_pending = false;
 	prev_jump_site = 0;
+	prev_jump_seq_id = 0;
 	prev_target_reg = REG_INVALID;
 	prev_mem_taddr = 0;
 	prev_mem_target_value = 0;
@@ -2240,6 +2476,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			}
 			if (target_resolved) {
 				prev_jump_site = vaddr;
+				prev_jump_seq_id = current_trace_seq_id;
 				prev_jump_pending = true;
 				prev_target_reg = meta->branch_target_reg;
 				prev_target_tainted = target_tainted;
@@ -2638,24 +2875,27 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 	}
 }
 
-static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb) {
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb){
+	(void)id;
 	size_t n_insns = qemu_plugin_tb_n_insns(tb);
 	for (size_t i = 0; i < n_insns; i++) {
 		struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
 		uint64_t vaddr = qemu_plugin_insn_vaddr(insn);
 		size_t size = qemu_plugin_insn_size(insn);
 		uint8_t *bytes = g_malloc(size);
-		size_t copied = qemu_plugin_insn_data(insn, (char*)bytes, size);
-
-		//capstone
-		InsnMeta *meta = meta_decode(bytes, copied, vaddr, cs_handle);
-		if (meta) meta_store(vaddr, meta);
+		size_t copied = qemu_plugin_insn_data(insn,(char *)bytes, size);
+		InsnMeta *decoded = meta_decode(bytes, copied, vaddr, cs_handle);
+		const InsnMeta *meta = decoded ? meta_store(vaddr, decoded) : NULL;
+		InsnExecCtx *exec_ctx = insn_exec_context_create(vaddr, bytes,copied, meta);
 		g_free(bytes);
+		if (!exec_ctx) {
+			fprintf(stderr, "[TRACE] failed to create instruction context at 0x%lx\n", (unsigned long)vaddr);
+			continue;
+		}
 
-		//callbacks
-		qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec, QEMU_PLUGIN_CB_R_REGS, (gpointer)(uintptr_t)vaddr);
-		qemu_plugin_register_vcpu_mem_cb(insn, on_mem_write, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_W, NULL);
-		qemu_plugin_register_vcpu_mem_cb(insn, dse_on_mem, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, NULL);
+		qemu_plugin_register_vcpu_insn_exec_cb(insn, vcpu_insn_exec, QEMU_PLUGIN_CB_R_REGS,exec_ctx);
+		qemu_plugin_register_vcpu_mem_cb(insn, on_mem_write, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_W, exec_ctx);
+		qemu_plugin_register_vcpu_mem_cb(insn, dse_on_mem, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, exec_ctx);
 	}
 }
 
@@ -2782,6 +3022,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	}
 	cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
 	meta_init();
+
+	if (!insn_exec_contexts_init()) {
+		fprintf(stderr, "[PLUGIN] instruction context storage init failed\n");
+		meta_free();
+		cs_close(&cs_handle);
+		shadow_destroy(g_shadow);
+		g_shadow = NULL;
+		return -1;
+	}
 
 	//needed hashtables
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);

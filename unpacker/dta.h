@@ -8,6 +8,9 @@
 
 #define MAX_REG_BYTES 8
 #define MAX_INSN_REG_SLICES 8
+#define MAX_INSN_BYTES 15U
+typedef uint64_t MetaId;
+#define META_ID_INVALID ((MetaId)0)
 
 typedef struct ShadowMemory ShadowMemory;
 typedef enum {
@@ -39,8 +42,41 @@ typedef enum {
 	DTA_TRANSFER_EXACT,
 	DTA_TRANSFER_CONSERVATIVE
 } DtaTransferResult;
+
+enum {
+	X86_FLAG_CF = 1U << 0,
+	X86_FLAG_PF = 1U << 1,
+	X86_FLAG_AF = 1U << 2,
+	X86_FLAG_ZF = 1U << 3,
+	X86_FLAG_SF = 1U << 4,
+	X86_FLAG_OF = 1U << 5,
+	X86_FLAG_TRACKED = X86_FLAG_CF | X86_FLAG_PF | X86_FLAG_AF | X86_FLAG_ZF | X86_FLAG_SF | X86_FLAG_OF
+};
+
+typedef enum {
+	X86_CC_NONE = 0,
+	X86_CC_O,
+	X86_CC_NO,
+	X86_CC_B,
+	X86_CC_AE,
+	X86_CC_E,
+	X86_CC_NE,
+	X86_CC_BE,
+	X86_CC_A,
+	X86_CC_S,
+	X86_CC_NS,
+	X86_CC_P,
+	X86_CC_NP,
+	X86_CC_L,
+	X86_CC_GE,
+	X86_CC_LE,
+	X86_CC_G
+} X86ConditionCode;
+
 typedef struct {
+	MetaId meta_id;
 	uint64_t pc;
+	uint8_t instr_bytes[MAX_INSN_BYTES];
 	uint8_t size;
 	bool has_mem_read;
 	bool has_mem_write;
@@ -61,6 +97,13 @@ typedef struct {
 
 	bool has_imm_operand;
 	bool is_self_zeroing;
+	
+	uint8_t flags_read_mask;
+	uint8_t flags_write_mask;
+	X86ConditionCode condition_code;
+	bool is_conditional_branch;
+	bool has_rep_prefix;
+	uint8_t string_element_size;
 } InsnMeta;
 
 ShadowMemory *shadow_create(uint8_t guest_bits);
@@ -103,10 +146,12 @@ DtaTransferResult dta_apply_reg_transfer(RegShadow *rs, const InsnMeta *meta);
 DtaTransferResult dta_compute_mem_write_taint(const RegShadow *pre_regs, const InsnMeta *meta, uint8_t old_mem_taint, bool source_mem_valid, uint8_t source_mem_taint, uint8_t width, uint8_t *result_taint);
 DtaTransferResult dta_apply_mem_read_transfer(RegShadow *rs, const RegShadow *pre_regs, const InsnMeta *meta, uint8_t mem_taint_mask, uint8_t mem_width);
 uint8_t dta_effective_mem_read_taint(const RegShadow *pre_regs, const InsnMeta *meta, uint8_t mem_taint_mask, uint8_t mem_width);
+bool dta_address_mask_is_tainted(const RegShadow *pre_regs, uint32_t address_reg_mask);
 
 void meta_init(void);
 void meta_free(void);
 InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle);
-void meta_store(uint64_t pc, InsnMeta *m);
-InsnMeta *meta_lookup(uint64_t pc);
+const InsnMeta *meta_store(uint64_t pc, InsnMeta *m);
+const InsnMeta *meta_lookup(uint64_t pc);
+const InsnMeta *meta_lookup_id(MetaId meta_id);
 #endif

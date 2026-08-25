@@ -1,11 +1,11 @@
 {
-  "oep": "0x804ade0",
+  "oep": "0x8099790",
   "arch": "x86",
-  "oep_confidence": 0.8986,
+  "oep_confidence": 0.3000,
   "oep_candidates": [
-    {"addr": "0x804ade0", "score": 0.8986, "confidence": 0.8986, "dse_confirmed": true, "concretized": 1, "total": 512, "generation": 0},
-    {"addr": "0x8099790", "score": 0.4232, "confidence": 0.4232, "dse_confirmed": true, "concretized": 0, "total": 2, "generation": 1},
-    {"addr": "0x806af50", "score": 0.4232, "confidence": 0.4232, "dse_confirmed": true, "concretized": 0, "total": 2, "generation": 2}
+    {"addr": "0x8099790", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 139, "concretized": 0, "total": 139, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 140, "address_failures": 0, "generation": 1},
+    {"addr": "0x806af50", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 403, "concretized": 0, "total": 403, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 404, "address_failures": 0, "generation": 2},
+    {"addr": "0x80a0440", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 151, "concretized": 0, "total": 151, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 152, "address_failures": 0, "generation": 3}
   ],
   "base": "0x8048000",
   "regions": [
