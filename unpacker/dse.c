@@ -50,14 +50,6 @@ typedef struct {
 	uint8_t kind;
 } DseRootOriginKey;
 
-typedef struct {
-	uint64_t source;
-	uint64_t origin_version;
-	uint32_t width;
-	uint16_t byte_offset;
-	uint8_t kind;
-} DseRootOriginKey;
-
 typedef struct DseSlicePlan {
 	uint64_t seq_id[MAX_SLICE];
 	uint8_t data_reg_live_after[MAX_SLICE][REG_COUNT];

@@ -3,12 +3,17 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <glib.h>
 #include <capstone/capstone.h>
+
+#include "provenance.h"
 
 #define MAX_REG_BYTES 8
 #define MAX_INSN_REG_SLICES 8
 #define MAX_INSN_BYTES 15U
+#define DTA_SHADOW_PAGE_SIZE 4096U
+
 typedef uint64_t MetaId;
 #define META_ID_INVALID ((MetaId)0)
 
@@ -40,7 +45,8 @@ typedef enum {
 typedef enum {
 	DTA_TRANSFER_NOT_APPLICABLE = 0,
 	DTA_TRANSFER_EXACT,
-	DTA_TRANSFER_CONSERVATIVE
+	DTA_TRANSFER_CONSERVATIVE,
+	DTA_TRANSFER_INCOMPLETE
 } DtaTransferResult;
 
 enum {
@@ -102,19 +108,29 @@ typedef struct {
 	uint8_t flags_write_mask;
 	X86ConditionCode condition_code;
 	bool is_conditional_branch;
+	bool direct_target_valid;
+	uint64_t direct_target;
 	bool has_rep_prefix;
 	uint8_t string_element_size;
 } InsnMeta;
 
 ShadowMemory *shadow_create(uint8_t guest_bits);
+ShadowMemory *shadow_create_with_registry(uint8_t guest_bits, ProvRegistry *registry);
 void shadow_destroy(ShadowMemory *sm);
-
+ProvRegistry *shadow_registry(ShadowMemory *sm);
+//for now, saved as safe API
 void shadow_taint_byte(ShadowMemory *sm, uint64_t addr, uint64_t ip);
 bool shadow_taint_range(ShadowMemory *sm, uint64_t addr, uint64_t size, uint64_t ip);
 void shadow_untaint_byte(ShadowMemory *sm, uint64_t addr);
 void shadow_untaint_range(ShadowMemory *sm, uint64_t addr, uint64_t size);
 bool shadow_is_tainted(ShadowMemory *sm, uint64_t addr);
 bool shadow_page_has_taint(ShadowMemory *sm, uint64_t addr);
+
+ProvLabelId shadow_load_label(ShadowMemory *sm, uint64_t addr);
+bool shadow_load_labels(ShadowMemory *sm, uint64_t addr, ProvLabelId *out_labels, uint32_t count);
+bool shadow_store_label(ShadowMemory *sm, uint64_t addr, ProvLabelId label_id);
+bool shadow_store_labels(ShadowMemory *sm, uint64_t addr, const ProvLabelId *labels, uint32_t count);
+bool shadow_fill_label(ShadowMemory *sm, uint64_t addr, uint64_t size, ProvLabelId label_id);
 
 int x86_reg_to_rid(unsigned cs_reg);
 
@@ -127,25 +143,89 @@ RegSlice meta_first_reg_read(const InsnMeta *meta);
 RegSlice meta_first_reg_write(const InsnMeta *meta);
 
 typedef struct {
-	bool     bytes[REG_COUNT][MAX_REG_BYTES];
+	ProvRegistry *registry;
+	ProvLabelId bytes[REG_COUNT][MAX_REG_BYTES];
 	uint64_t src_ip[REG_COUNT];
 } RegShadow;
 
+bool reg_shadow_init(RegShadow *rs, ProvRegistry *registry);
+void reg_shadow_reset(RegShadow *rs);
+
 void reg_taint_set(RegShadow *rs, RegId rid, uint8_t byte_mask, uint64_t ip);
 void reg_taint_clear(RegShadow *rs, RegId rid, uint8_t byte_mask);
-bool reg_is_tainted(RegShadow *rs, RegId rid, uint8_t byte_mask);
+bool reg_is_tainted(const RegShadow *rs, RegId rid, uint8_t byte_mask);
 void reg_slice_taint_set(RegShadow *rs, RegSlice slice, uint64_t ip);
 void reg_slice_taint_clear(RegShadow *rs, RegSlice slice);
 bool reg_slice_is_tainted(const RegShadow *rs, RegSlice slice);
 
+typedef enum {
+	DTA_FLAG_SLOT_CF = 0,
+	DTA_FLAG_SLOT_PF,
+	DTA_FLAG_SLOT_AF,
+	DTA_FLAG_SLOT_ZF,
+	DTA_FLAG_SLOT_SF,
+	DTA_FLAG_SLOT_OF,
+	DTA_FLAG_SLOT_COUNT
+} DtaFlagSlot;
+
+typedef struct {
+	ProvLabelId labels[DTA_FLAG_SLOT_COUNT];
+	uint8_t valid_mask;
+} DtaFlagShadow;
+
+typedef struct {
+	bool active;
+	uint64_t seq_id;
+	MetaId meta_id;
+	uint64_t pc;
+	uint64_t fallthrough;
+	bool direct_target_valid;
+	uint64_t direct_target;
+	X86ConditionCode condition_code;
+	ProvLabelId condition_label;
+} DtaPendingBranch;
+
+typedef struct {
+	uint32_t vcpu_index;
+	ProvRegistry *registry;
+	RegShadow regs;
+	DtaFlagShadow flags;
+	DtaPendingBranch pending_branch;
+} DtaVcpuState;
+
+bool dta_vcpu_state_init(DtaVcpuState *state, uint32_t vcpu_index, ProvRegistry *registry);
+void dta_vcpu_state_reset(DtaVcpuState *state);
+
+ProvLabelId dta_flag_get_label(const DtaVcpuState *state, DtaFlagSlot flag);
+bool dta_flag_set_label(DtaVcpuState *state, DtaFlagSlot flag, ProvLabelId label_id);
+bool dta_flag_set_mask(DtaVcpuState *state, uint8_t flag_mask, ProvLabelId label_id);
+ProvLabelId dta_flag_join_mask(const DtaVcpuState *state, uint8_t flag_mask);
+bool dta_flag_mask_is_tainted(const DtaVcpuState *state, uint8_t flag_mask);
+DtaTransferResult dta_apply_flag_transfer(DtaVcpuState *state, const RegShadow *pre_regs, const InsnMeta *meta, const ProvLabelId *memory_labels, uint8_t memory_label_count);
+
+void dta_pending_branch_clear(DtaVcpuState *state);
+bool dta_pending_branch_begin(DtaVcpuState *state,uint64_t seq_id, MetaId meta_id, uint64_t pc, uint64_t fallthrough, bool direct_target_valid, uint64_t direct_target, X86ConditionCode condition_code, ProvLabelId condition_label);
+
+ProvLabelId reg_label_get(const RegShadow *rs, RegId rid, uint8_t byte_index);
+bool reg_label_set(RegShadow *rs, RegId rid, uint8_t byte_mask, ProvLabelId label_id, uint64_t ip);
+//Slice writes implement x86, AL/AH/AX preserve untouched bytes
+bool reg_slice_set_label(RegShadow *rs, RegSlice slice, ProvLabelId label_id, uint64_t ip);
+bool reg_slice_load_labels(const RegShadow *rs, RegSlice slice, ProvLabelId *out_labels);
+bool reg_slice_store_labels(RegShadow *rs, RegSlice slice, const ProvLabelId *labels, uint8_t count, uint64_t ip);
+
 void propagate_reg2reg(RegShadow *rs, RegSlice dst, RegSlice src, uint16_t insn_id);
 void propagate_mem2reg(RegShadow *rs, RegSlice dst, uint8_t mem_taint_mask, uint8_t mem_width, uint16_t insn_id, bool overwrite);
+void propagate_mem_labels2reg(RegShadow *rs, RegSlice dst, const ProvLabelId *mem_labels, uint8_t mem_width, uint16_t insn_id, bool overwrite);
 void reg_propagate_clear(RegShadow *rs, RegId dst);
 
 DtaTransferResult dta_apply_reg_transfer(RegShadow *rs, const InsnMeta *meta);
 DtaTransferResult dta_compute_mem_write_taint(const RegShadow *pre_regs, const InsnMeta *meta, uint8_t old_mem_taint, bool source_mem_valid, uint8_t source_mem_taint, uint8_t width, uint8_t *result_taint);
 DtaTransferResult dta_apply_mem_read_transfer(RegShadow *rs, const RegShadow *pre_regs, const InsnMeta *meta, uint8_t mem_taint_mask, uint8_t mem_width);
 uint8_t dta_effective_mem_read_taint(const RegShadow *pre_regs, const InsnMeta *meta, uint8_t mem_taint_mask, uint8_t mem_width);
+DtaTransferResult dta_apply_mem_read_labels(RegShadow *rs, const RegShadow *pre_regs, const InsnMeta *meta, const ProvLabelId *mem_labels, uint8_t mem_width);
+DtaTransferResult dta_compute_mem_write_labels(const RegShadow *pre_regs, const InsnMeta *meta, const ProvLabelId *old_mem_labels, bool source_mem_valid, const ProvLabelId *source_mem_labels, uint8_t width, ProvLabelId *result_labels);
+bool dta_effective_mem_read_labels(const RegShadow *pre_regs, const InsnMeta *meta, const ProvLabelId *mem_labels, uint8_t mem_width, ProvLabelId *out_labels);
+
 bool dta_address_mask_is_tainted(const RegShadow *pre_regs, uint32_t address_reg_mask);
 
 void meta_init(void);

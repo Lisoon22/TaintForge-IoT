@@ -4,10 +4,12 @@
 #include <ctype.h>
 #include <qemu-plugin.h>
 #include <math.h>
-#include "dta.h"
 #include <capstone/capstone.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <inttypes.h>
+
+#include "dta.h"
 #include "trace.h"
 #include "dse.h"
 
@@ -77,14 +79,20 @@ typedef struct {
 } resolved_import_t;
 
 static GHashTable *pages = NULL;
+static ProvRegistry *g_prov_registry = NULL;
+static ProvFdTable *g_prov_fd_table = NULL;
 static ShadowMemory *g_shadow = NULL;
 static bool oep_found = false;
 static uint64_t oep_addr = 0;
-static __thread uint64_t g_current_ip = 0;
 static csh cs_handle;
-static RegShadow reg_shadow;
 static TraceBuffer *g_trace = NULL;
 static DseAuxRing *g_aux = NULL;
+static BranchEventBuffer *g_branch_events = NULL;
+static uint64_t g_analysis_scope_id = UINT64_C(1);
+static uint64_t g_next_resource_object_id = UINT64_C(1);
+static char *g_main_image_path = NULL;
+static ProvResourceId g_main_image_resource_id = PROV_RESOURCE_ID_INVALID;
+static uint64_t g_main_image_object_id = 0;
 static __thread InsnAux *g_cur_aux = NULL;
 static GPtrArray *g_insn_exec_contexts = NULL;
 static GMutex g_insn_exec_contexts_lock;
@@ -209,12 +217,184 @@ static __thread bool g_dta_test_last_indirect_tainted;
 typedef struct {
 	uint64_t pc;
 	bool active;
+	const InsnMeta *meta;
 	RegShadow pre_regs;
+	bool pre_esp_valid;
+	uint32_t pre_esp;
 	bool last_read_valid;
 	uint32_t last_read_size;
-	uint8_t last_read_taint;
+	ProvLabelId last_read_labels[MAX_REG_BYTES];
+	bool flags_pending;
+	bool flags_applied;
 } dta_mem_transfer_t;
-static __thread dta_mem_transfer_t g_dta_mem_transfer;
+
+typedef struct {
+	DtaVcpuState dta;
+	dta_mem_transfer_t mem_transfer;
+	uint64_t current_ip;
+} PluginVcpuState;
+
+static GPtrArray *g_vcpu_states = NULL;
+static GMutex g_vcpu_states_lock;
+static bool g_vcpu_states_lock_initialized = false;
+static __thread unsigned int g_tls_vcpu_index = G_MAXUINT;
+static __thread PluginVcpuState *g_tls_vcpu_state = NULL;
+
+static bool plugin_vcpu_states_init(void) {
+	if (g_vcpu_states_lock_initialized) {
+		return g_vcpu_states != NULL;
+	}
+	g_mutex_init(&g_vcpu_states_lock);
+	g_vcpu_states_lock_initialized = true;
+	g_vcpu_states = g_ptr_array_new_with_free_func(g_free);
+	if (!g_vcpu_states) {
+		g_mutex_clear(&g_vcpu_states_lock);
+		g_vcpu_states_lock_initialized = false;
+		return false;
+	}
+	return true;
+}
+
+static PluginVcpuState *plugin_vcpu_state_get(unsigned int vcpu_index) {
+	if (g_tls_vcpu_state && g_tls_vcpu_index == vcpu_index) {
+		return g_tls_vcpu_state;
+	}
+	if (!g_vcpu_states_lock_initialized || !g_vcpu_states || !g_prov_registry || vcpu_index == G_MAXUINT) {
+		return NULL;
+	}
+	g_mutex_lock(&g_vcpu_states_lock);
+	if (vcpu_index >= g_vcpu_states->len) {
+		g_ptr_array_set_size(g_vcpu_states, vcpu_index + 1U);
+	}
+	PluginVcpuState *state = g_ptr_array_index(g_vcpu_states, vcpu_index);
+	if (!state) {
+		state = g_try_new0(PluginVcpuState, 1);
+		if (!state || !dta_vcpu_state_init(&state->dta, vcpu_index, g_prov_registry)) {
+			g_free(state);
+			g_mutex_unlock(&g_vcpu_states_lock);
+			return NULL;
+		}
+		g_ptr_array_index(g_vcpu_states, vcpu_index) = state;
+	}
+	g_mutex_unlock(&g_vcpu_states_lock);
+	g_tls_vcpu_index = vcpu_index;
+	g_tls_vcpu_state = state;
+	return state;
+}
+
+static void plugin_vcpu_states_destroy(void) {
+	if (!g_vcpu_states_lock_initialized) {
+		return;
+	}
+	g_mutex_lock(&g_vcpu_states_lock);
+	GPtrArray *states = g_vcpu_states;
+	g_vcpu_states = NULL;
+	g_mutex_unlock(&g_vcpu_states_lock);
+	if (states) g_ptr_array_unref(states);
+	g_mutex_clear(&g_vcpu_states_lock);
+	g_vcpu_states_lock_initialized = false;
+	g_tls_vcpu_index = G_MAXUINT;
+	g_tls_vcpu_state = NULL;
+}
+
+static void provenance_runtime_destroy(void) {
+	plugin_vcpu_states_destroy();
+	if (g_prov_fd_table) {
+		prov_fd_table_destroy(g_prov_fd_table);
+		g_prov_fd_table = NULL;
+	}
+	if (g_shadow) {
+		shadow_destroy(g_shadow);
+		g_shadow = NULL;
+	}
+	if (g_prov_registry) {
+		prov_registry_destroy(g_prov_registry);
+		g_prov_registry = NULL;
+	}
+	g_main_image_resource_id = PROV_RESOURCE_ID_INVALID;
+	g_main_image_object_id = 0;
+}
+
+static bool provenance_runtime_init(uint8_t guest_bits) {
+	if (g_prov_registry || g_prov_fd_table || g_shadow) {
+		return false;
+	}
+	g_prov_registry = prov_registry_create(NULL);
+	if (!g_prov_registry) return false;
+	g_shadow = shadow_create_with_registry(guest_bits, g_prov_registry);
+	if (!g_shadow) {
+		prov_registry_destroy(g_prov_registry);
+		g_prov_registry = NULL;
+		return false;
+	}
+	g_prov_fd_table = prov_fd_table_create(g_prov_registry);
+	if (!g_prov_fd_table) {
+		shadow_destroy(g_shadow);
+		g_shadow = NULL;
+		prov_registry_destroy(g_prov_registry);
+		g_prov_registry = NULL;
+		return false;
+	}
+	if (!plugin_vcpu_states_init()) {
+		prov_fd_table_destroy(g_prov_fd_table);
+		g_prov_fd_table = NULL;
+		shadow_destroy(g_shadow);
+		g_shadow = NULL;
+		prov_registry_destroy(g_prov_registry);
+		g_prov_registry = NULL;
+		return false;
+	}
+	return true;
+}
+
+static bool main_image_path_init(void) {
+	if (g_main_image_path) {
+		return true;
+	}
+	const char *reported_path = qemu_plugin_path_to_binary();
+	if (!reported_path || reported_path[0] == '\0') {
+		if (reported_path) {
+			g_free((gpointer)reported_path);
+		}
+		return false;
+	}
+	char *canonical_path = g_canonicalize_filename(reported_path, NULL);
+	g_free((gpointer)reported_path);
+	if (!canonical_path || canonical_path[0] == '\0') {
+		g_free(canonical_path);
+		return false;
+	}
+	g_main_image_path = canonical_path;
+	return true;
+}
+
+static bool main_image_resource_init(void) {
+	if (g_main_image_resource_id != PROV_RESOURCE_ID_INVALID) {
+		return true;
+	}
+	if (!g_prov_registry || !g_main_image_path || g_main_image_path[0] == '\0') {
+		return false;
+	}
+	if (g_main_image_object_id == 0) {
+		if (g_next_resource_object_id == 0) {
+			fprintf(stderr, "[PROV] resource object-id space exhausted\n");
+			return false;
+		}
+		g_main_image_object_id = g_next_resource_object_id++;
+	}
+	ProvResourceKey key = {
+		.kind = PROV_RESOURCE_FILE,
+		.scope_id = g_analysis_scope_id,
+		.object_id = g_main_image_object_id,
+		.semantic_version = 0
+	};
+	g_main_image_resource_id = prov_resource_intern(g_prov_registry, &key, g_main_image_path, PROV_RESOURCE_ROLE_MAIN_IMAGE);
+	if (g_main_image_resource_id == PROV_RESOURCE_ID_INVALID) {
+		return false;
+	}
+	fprintf(stderr, "[PROV] main image resource=%u path=%s\n", g_main_image_resource_id, g_main_image_path);
+	return true;
+}
 
 typedef struct {
 	bool active;
@@ -241,6 +421,10 @@ typedef struct {
 	uint32_t iov_count;
 	uint64_t requested_size;
 	pending_iov_t iov[MAX_PENDING_IOV];
+	bool source_identity_valid;
+	ProvResourceId resource_id;
+	uint64_t source_offset;
+	bool advances_ofd;
 } pending_input_t;
 static __thread pending_input_t g_pending_input;
 
@@ -297,6 +481,8 @@ typedef struct {
 	char *path;
 	bool write;
 	bool taint_source;
+	ProvResourceId resource_id;
+	uint64_t resource_object_id;
 } file_dep_t;
 typedef struct {
 	char *path;
@@ -322,7 +508,25 @@ static GHashTable *file_fd = NULL;
 static __thread char *pending_open_path = NULL;
 static __thread bool pending_open_is_lib = false;
 static __thread bool pending_open_write = false;
+static __thread uint32_t pending_open_flags = 0;
 
+typedef enum {
+	PENDING_FD_NONE = 0,
+	PENDING_FD_DUP,
+	PENDING_FD_CLOSE,
+	PENDING_FD_LSEEK,
+	PENDING_FD_LLSEEK
+} pending_fd_kind_t;
+
+typedef struct {
+	bool active;
+	int64_t syscall_num;
+	pending_fd_kind_t kind;
+	int32_t fd;
+	uint64_t result_address;
+} pending_fd_operation_t;
+
+static __thread pending_fd_operation_t g_pending_fd;
 static GList *resolved_imports = NULL;
 static GHashTable *resolved_imports_by_slot = NULL; //got slot thing
 //all sorts of taint like from file, network, etc.
@@ -341,13 +545,187 @@ static bool fd_is_taint_source(int32_t fd) {
 	return true;
 }
 
+static bool shadow_fill_incomplete(uint64_t address, uint64_t size, uint64_t reasons);
+
+static ProvLabelId dta_incomplete_unknown_label(uint64_t reasons);
+
+static const char *branch_outcome_name(BranchOutcome outcome) {
+	switch (outcome) {
+		case BRANCH_OUTCOME_TAKEN:
+			return "taken";
+		case BRANCH_OUTCOME_NOT_TAKEN:
+			return "not-taken";
+		case BRANCH_OUTCOME_UNKNOWN: default:
+			return "unknown";
+	}
+}
+
+static bool guest_pc_equal(uint64_t left, uint64_t right) {
+	if (is_i386) {
+		return (uint32_t)left == (uint32_t)right;
+	}
+	return left == right;
+}
+
+static void log_branch_root_set(uint64_t event_id, const char *channel, ProvRootSetId set_id) {
+	ProvRootSetView set;
+	if (!prov_root_set_get(g_prov_registry, set_id, &set)) {
+		return;
+	}
+	for (uint32_t index = 0; index < set.count; index++) {
+		ProvRootKey root;
+		if (!prov_root_get(g_prov_registry, set.roots[index], &root)) {
+			continue;
+		}
+		if (root.kind == PROV_ROOT_RESOURCE_BYTE) {
+			ProvResourceView resource;
+			const char *name = "<unknown>";
+			if (root.source_id <= UINT32_MAX &&
+			    prov_resource_get(g_prov_registry, (ProvResourceId)root.source_id, &resource) &&
+			    resource.display_name) {
+				name = resource.display_name;
+			}
+			fprintf(
+				stderr,
+				"[BRANCH-ROOT] event=%" PRIu64
+				" channel=%s root=%u"
+				" resource=%" PRIu64
+				" path=%s offset=%" PRIu64 "\n",
+				event_id, channel, set.roots[index],
+				root.source_id, name, root.offset);
+		} else {
+			fprintf(
+				stderr,
+				"[BRANCH-ROOT] event=%" PRIu64
+				" channel=%s root=%u"
+				" kind=%u source=%" PRIu64
+				" discriminator=%u"
+				" offset=%" PRIu64
+				" instance=%" PRIu64 "\n",
+				event_id, channel,
+				set.roots[index], (unsigned)root.kind, root.source_id,
+				root.discriminator, root.offset, root.semantic_instance);
+		}
+	}
+}
+
+static void log_branch_event(const BranchEvent *event) {
+	if (!event || !g_prov_registry) {
+		return;
+	}
+	ProvLabelView label;
+	if (!prov_label_get(g_prov_registry, event->condition_label, &label)) {
+		fprintf(
+			stderr,
+			"[BRANCH-PROV] event=%" PRIu64
+			" invalid-label=%u\n",
+			event->event_id, event->condition_label);
+		return;
+	}
+	fprintf(
+		stderr,
+		"[BRANCH-PROV] event=%" PRIu64
+		" seq=%" PRIu64
+		" vcpu=%u pc=0x%" PRIx64
+		" next=0x%" PRIx64
+		" outcome=%s cc=%u label=%u"
+		" complete=0x%02x reasons=0x%" PRIx64 "\n",
+		event->event_id, event->branch_seq_id,
+		event->vcpu_index, event->pc, event->observed_next_pc,
+		branch_outcome_name(event->outcome), (unsigned)event->condition_code,
+		event->condition_label, label.complete_mask, label.incomplete_reasons);
+	log_branch_root_set(event->event_id, "data", label.data_roots);
+	log_branch_root_set(event->event_id, "address", label.address_roots);
+}
+
+static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observed_next_pc) {
+	if (!vcpu_state || !vcpu_state->dta.pending_branch.active) {
+		return;
+	}
+	DtaPendingBranch pending =vcpu_state->dta.pending_branch;
+	dta_pending_branch_clear(&vcpu_state->dta);
+	if (!g_branch_events) return;
+	BranchEvent event;
+	memset(&event, 0, sizeof(event));
+	event.branch_seq_id = pending.seq_id;
+	event.vcpu_index = vcpu_state->dta.vcpu_index;
+	event.meta_id = pending.meta_id;
+	event.pc = pending.pc;
+	event.fallthrough = pending.fallthrough;
+	event.direct_target_valid = pending.direct_target_valid;
+	event.direct_target = pending.direct_target;
+	event.observed_next_pc = observed_next_pc;
+	event.condition_code = pending.condition_code;
+	event.condition_label = pending.condition_label;
+	event.outcome = BRANCH_OUTCOME_UNKNOWN;
+	bool is_fallthrough = guest_pc_equal(observed_next_pc, pending.fallthrough);
+	bool is_target = pending.direct_target_valid && guest_pc_equal(observed_next_pc, pending.direct_target);
+	if (is_fallthrough && !is_target) {
+		event.outcome = BRANCH_OUTCOME_NOT_TAKEN;
+	} else if (is_target && !is_fallthrough) {
+		event.outcome = BRANCH_OUTCOME_TAKEN;
+	}
+
+	const BranchEvent *stored = branch_event_append(g_branch_events, &event);
+	if (stored) {
+		log_branch_event(stored);
+	}
+}
+
+static void begin_pending_branch(PluginVcpuState *vcpu_state, const InsnMeta *meta, uint64_t trace_seq_id) {
+	if (!vcpu_state || !meta || !meta->is_conditional_branch || trace_seq_id == 0) {
+		return;
+	}
+	ProvLabelId condition_label = dta_flag_join_mask(&vcpu_state->dta, meta->flags_read_mask);
+	if (condition_label == PROV_LABEL_ID_INVALID) {
+		condition_label = dta_incomplete_unknown_label(PROV_INCOMPLETE_UNDEFINED_FLAG);
+	}
+	if (condition_label == PROV_LABEL_ID_INVALID) {
+		return;
+	}
+	uint64_t fallthrough = meta->pc + meta->size;
+	uint64_t direct_target = meta->direct_target;
+	if (is_i386) {
+		fallthrough = (uint32_t)fallthrough;
+		direct_target = (uint32_t)direct_target;
+	}
+	(void)dta_pending_branch_begin(&vcpu_state->dta, trace_seq_id, meta->meta_id, meta->pc, fallthrough, meta->direct_target_valid, direct_target, meta->condition_code, condition_label);
+}
+
+static void finalize_missing_memory_flag_transfer(PluginVcpuState *vcpu_state) {
+	if (!vcpu_state) return;
+	dta_mem_transfer_t *transfer = &vcpu_state->mem_transfer;
+	if (!transfer->active || !transfer->flags_pending || transfer->flags_applied || !transfer->meta) {
+		return;
+	}
+	(void)dta_apply_flag_transfer(&vcpu_state->dta, &transfer->pre_regs, transfer->meta, NULL, 0);
+	transfer->flags_applied = true;
+	g_taint_seen = true;
+}
+
+static void pending_input_attach_ofd(bool explicit_offset_valid, uint64_t explicit_offset) {
+	if (!g_pending_input.active || !g_prov_fd_table) {
+		return;
+	}
+	ProvOpenFileDescriptionView ofd;
+	if (!prov_fd_table_lookup(g_prov_fd_table, g_pending_input.fd, &ofd)) {
+		return;
+	}
+	if (ofd.resource_id == PROV_RESOURCE_ID_INVALID) {
+		return;
+	}
+	g_pending_input.source_identity_valid = true;
+	g_pending_input.resource_id = ofd.resource_id;
+	g_pending_input.source_offset = explicit_offset_valid ? explicit_offset : ofd.current_offset;
+	g_pending_input.advances_ofd = !explicit_offset_valid;
+}
+
 static void pending_input_reset(void) {
 	memset(&g_pending_input, 0, sizeof(g_pending_input));
 }
 
-static void pending_input_capture_linear(int64_t syscall_num, int32_t fd, uint64_t buffer, uint64_t size, bool force_taint) {
+static void pending_input_capture_linear(int64_t syscall_num, int32_t fd, uint64_t buffer, uint64_t size, bool force_taint, bool explicit_offset_valid, uint64_t explicit_offset) {
 	if (size == 0) return;
-
 	g_pending_input.active = true;
 	g_pending_input.syscall_num = syscall_num;
 	g_pending_input.fd = fd;
@@ -356,6 +734,7 @@ static void pending_input_capture_linear(int64_t syscall_num, int32_t fd, uint64
 	g_pending_input.requested_size = size;
 	g_pending_input.iov[0].base = buffer;
 	g_pending_input.iov[0].size = size;
+	pending_input_attach_ofd(explicit_offset_valid, explicit_offset);
 }
 
 static bool pending_input_capture_iov(int64_t syscall_num, int32_t fd, uint64_t iov_addr, int64_t iov_count, bool force_taint) {
@@ -403,13 +782,42 @@ static bool pending_input_capture_iov(int64_t syscall_num, int32_t fd, uint64_t 
 	g_pending_input.taint_source = force_taint || fd_is_taint_source(fd);
 	g_pending_input.iov_count = (uint32_t)iov_count;
 	g_pending_input.requested_size = requested_size;
+	pending_input_attach_ofd(false, 0);
+	return true;
+}
+
+static bool seed_resource_byte_labels(uint64_t guest_address, uint64_t size, ProvResourceId resource_id, uint64_t resource_offset) {
+	if (!g_shadow || !g_prov_registry || resource_id == PROV_RESOURCE_ID_INVALID) {
+		return false;
+	}
+	if (size == 0) return true;
+	if (size - 1U > UINT64_MAX - guest_address || size - 1U > UINT64_MAX - resource_offset) {
+		(void)shadow_fill_incomplete(guest_address, size, PROV_INCOMPLETE_SOURCE_IDENTITY);
+		return false;
+	}
+
+	for (uint64_t byte = 0; byte < size; byte++) {
+		ProvRootKey root_key = {
+			.kind = PROV_ROOT_RESOURCE_BYTE,
+			.source_id = resource_id,
+			.discriminator = 0,
+			.offset = resource_offset + byte,
+			.semantic_instance = 0
+		};
+		ProvRootId root_id = prov_root_intern(g_prov_registry, &root_key);
+		ProvLabelId label_id = root_id == PROV_ROOT_ID_INVALID ? PROV_LABEL_ID_INVALID : prov_label_from_root(g_prov_registry, root_id, PROV_CHANNEL_DATA);
+		if (label_id == PROV_LABEL_ID_INVALID ||
+		    !shadow_store_label(g_shadow, guest_address + byte, label_id)) {
+			uint64_t remaining = size - byte;
+			(void)shadow_fill_incomplete(guest_address + byte, remaining, PROV_INCOMPLETE_SOURCE_IDENTITY);
+			return false;
+		}
+	}
 	return true;
 }
 
 static void apply_pending_input(int64_t syscall_num, int64_t syscall_ret) {
-	if (!g_pending_input.active) {
-		return;
-	}
+	if (!g_pending_input.active) return;
 	if (g_pending_input.syscall_num != syscall_num) {
 		fprintf(stderr, "[DTA] pending input mismatch: expected=%ld actual=%ld\n", (long)g_pending_input.syscall_num, (long)syscall_num);
 		pending_input_reset();
@@ -419,33 +827,55 @@ static void apply_pending_input(int64_t syscall_num, int64_t syscall_ret) {
 		pending_input_reset();
 		return;
 	}
-	uint64_t remaining = (uint64_t)syscall_ret;
-	if (remaining > g_pending_input.requested_size) {
-		remaining = g_pending_input.requested_size;
+	uint64_t completed = (uint64_t)syscall_ret;
+	if (completed > g_pending_input.requested_size) {
+		completed = g_pending_input.requested_size;
 	}
-	bool seeded_any = false;
-	for (uint32_t i = 0; i < g_pending_input.iov_count && remaining > 0; i++) {
-		uint64_t chunk = g_pending_input.iov[i].size;
+	uint64_t remaining = completed;
+	uint64_t source_displacement = 0;
+	bool produced_taint = false;
+	for (uint32_t index = 0; index <g_pending_input.iov_count && remaining != 0; index++) {
+		uint64_t chunk = g_pending_input.iov[index].size;
 		if (chunk > remaining) {
 			chunk = remaining;
 		}
-		if (chunk == 0) {
-			continue;
-		}
-		uint64_t base = g_pending_input.iov[i].base;
-
-		if (g_pending_input.taint_source) {
-			if (!shadow_taint_range(g_shadow, base,chunk,0)) {
-				fprintf(stderr, "[DTA] failed to taint input range addr=0x%lx size=0x%lx\n", (unsigned long)base, (unsigned long)chunk);
-			} else {
-				seeded_any = true;
+		if (chunk == 0) continue;
+		uint64_t destination = g_pending_input.iov[index].base;
+		if (!g_pending_input.taint_source) {
+			shadow_untaint_range(g_shadow, destination, chunk);
+		} else if (
+			g_pending_input.source_identity_valid && source_displacement <= (UINT64_MAX - g_pending_input.source_offset)) {
+			uint64_t offset = g_pending_input.source_offset + source_displacement;
+			if (!seed_resource_byte_labels(destination, chunk, g_pending_input.resource_id, offset)) {
+				fprintf(
+					stderr,
+					"[PROV] partial file-byte "
+					"seeding: fd=%d "
+					"addr=0x%" PRIx64
+					" size=0x%" PRIx64 "\n", g_pending_input.fd, destination, chunk);
 			}
+			produced_taint = true;
 		} else {
-			shadow_untaint_range(g_shadow, base, chunk);
+			if (!shadow_fill_incomplete(destination, chunk, PROV_INCOMPLETE_SOURCE_IDENTITY)) {
+				fprintf(
+					stderr,
+					"[PROV] failed to store "
+					"incomplete source label: "
+					"addr=0x%" PRIx64
+					" size=0x%" PRIx64 "\n", destination, chunk);
+			}
+			produced_taint = true;
 		}
+		source_displacement += chunk;
 		remaining -= chunk;
 	}
-	if (seeded_any) {
+
+	if (g_pending_input.source_identity_valid && g_pending_input.advances_ofd && completed != 0 && !prov_fd_table_advance(g_prov_fd_table, g_pending_input.fd, completed)) {
+		fprintf(stderr,
+			"[PROV] failed to advance OFD: "
+			"fd=%d bytes=%" PRIu64 "\n", g_pending_input.fd, completed);
+	}
+	if (produced_taint) {
 		g_taint_seen = true;
 	}
 	pending_input_reset();
@@ -597,8 +1027,14 @@ static void dse_init_reg_handles(void) {
 }
 
 static void dse_vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index) {
-	(void)id; (void)vcpu_index;
-	if (!g_regs_ready) dse_init_reg_handles();
+	(void)id;
+	if (!plugin_vcpu_state_get(vcpu_index)) {
+		fprintf(stderr, "[DTA] failed to initialize vCPU state: vcpu=%u\n", vcpu_index);
+		return;
+	}
+	if (!g_regs_ready) {
+		dse_init_reg_handles();
+	}
 }
 
 static bool dse_read_reg(int rid, uint64_t *out) {
@@ -720,15 +1156,14 @@ static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_
 		value |= (uint64_t)arr->data[i] << (8 * i);
 	}
 	g_byte_array_free(arr, TRUE);
-
 	*out_addr = taddr;
 	*out_val = value;
 	return true;
 }
+
 static uint8_t shadow_load_taint_mask(uint64_t vaddr, uint32_t size) {
 	uint8_t result = 0;
 	uint32_t width = size < MAX_REG_BYTES ? size : MAX_REG_BYTES;
-
 	for (uint32_t byte = 0; byte < width; byte++) {
 		if (shadow_is_tainted(g_shadow, vaddr + byte)) {
 			result |= (uint8_t)(1U << byte);
@@ -737,114 +1172,195 @@ static uint8_t shadow_load_taint_mask(uint64_t vaddr, uint32_t size) {
 	return result;
 }
 
-static uint8_t dta_test_register_mask(RegId reg, uint8_t width)
-{
+static bool plugin_label_may_be_tainted(ProvLabelId label) {
+	if (!g_prov_registry) {
+		return true;
+	}
+	if (!prov_label_is_valid(g_prov_registry, label)) {
+		return true;
+	}
+	return prov_label_may_be_tainted(g_prov_registry, label);
+}
+
+static uint8_t label_array_taint_mask(const ProvLabelId *labels, uint32_t count) {
+	if (count > MAX_REG_BYTES) {
+		count = MAX_REG_BYTES;
+	}
+	if (!labels) {
+		if (count >= MAX_REG_BYTES) {
+			return UINT8_MAX;
+		}
+		return (uint8_t)((UINT32_C(1) << count) - 1U);
+	}
 	uint8_t result = 0;
-
-	if (reg < 0 || reg >= REG_COUNT) {
-		return 0;
-	}
-
-	if (width > MAX_REG_BYTES) {
-		width = MAX_REG_BYTES;
-	}
-
-	for (uint8_t byte = 0; byte < width; byte++) {
-		if (reg_shadow.bytes[reg][byte]) {
-			result |= (uint8_t)(1U << byte);
+	for (uint32_t byte = 0; byte < count; byte++) {
+		if (plugin_label_may_be_tainted(labels[byte])) {
+			result |= (uint8_t)(UINT32_C(1) << byte);
 		}
 	}
-
 	return result;
 }
 
-static bool dta_test_handle_marker(int64_t syscall_num,
-				   uint64_t a1,
-				   uint64_t a2,
-				   uint64_t a3,
-				   uint64_t a5,
-				   uint64_t a6)
-{
-	if (!is_i386 ||
-	    syscall_num != 20 || /* i386 getpid */
-	    (uint32_t)a1 != DTA_TEST_MAGIC) {
+static bool label_array_has_taint(const ProvLabelId *labels, uint32_t count) {
+	if (count > MAX_REG_BYTES) {
+		count = MAX_REG_BYTES;
+	}
+	if (!labels) {
+		return count != 0;
+	}
+	for (uint32_t byte = 0; byte < count; byte++) {
+		if (plugin_label_may_be_tainted(labels[byte])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static ProvLabelId dta_incomplete_unknown_label(uint64_t reasons) {
+	if (!g_prov_registry) {
+		return PROV_LABEL_ID_INVALID;
+	}
+	ProvLabelId unknown = prov_label_unknown(g_prov_registry);
+	if (unknown == PROV_LABEL_ID_INVALID) {
+		return PROV_LABEL_ID_INVALID;
+	}
+	return prov_label_mark_incomplete(g_prov_registry, unknown, PROV_COMPLETE_ALL, reasons);
+}
+
+static ProvLabelId plugin_label_mark_incomplete(ProvLabelId label, uint64_t reasons) {
+	ProvLabelId result = PROV_LABEL_ID_INVALID;
+	if (g_prov_registry && prov_label_is_valid(g_prov_registry, label)) {
+		result = prov_label_mark_incomplete(g_prov_registry, label, PROV_COMPLETE_ALL, reasons);
+	}
+	if (result == PROV_LABEL_ID_INVALID) {
+		result = dta_incomplete_unknown_label(reasons);
+	}
+	return result;
+}
+
+static bool mark_popal_destinations_incomplete(RegShadow *regs, uint64_t ip, uint64_t reasons) {
+	static const unsigned destinations[] = {
+		X86_REG_EDI,
+		X86_REG_ESI,
+		X86_REG_EBP,
+		X86_REG_EBX,
+		X86_REG_EDX,
+		X86_REG_ECX,
+		X86_REG_EAX
+	};
+	if (!regs) return false;
+	bool success = true;
+	for (size_t index = 0; index < (sizeof(destinations) / sizeof(destinations[0])); index++) {
+		RegSlice destination = reg_slice_from_x86(destinations[index], 4);
+		if (!reg_slice_is_valid(destination)) {
+			success = false;
+			continue;
+		}
+		ProvLabelId labels[4];
+		if (reg_slice_load_labels(regs, destination, labels)) {
+			for (uint8_t byte = 0; byte < 4; byte++) {
+				labels[byte] = plugin_label_mark_incomplete(labels[byte], reasons);
+			}
+		} else {
+			ProvLabelId fallback = dta_incomplete_unknown_label(reasons);
+			for (uint8_t byte = 0; byte < 4; byte++) {
+				labels[byte] = fallback;
+			}
+		}
+		bool labels_valid = true;
+		for (uint8_t byte = 0; byte < 4; byte++) {
+			if (labels[byte] == PROV_LABEL_ID_INVALID) {
+				labels_valid = false;
+				break;
+			}
+		}
+		if (!labels_valid || !reg_slice_store_labels(regs, destination, labels, 4, ip)) {
+			success = false;
+		}
+	}
+	return success;
+}
+
+static bool shadow_fill_incomplete(uint64_t address, uint64_t size, uint64_t reasons) {
+	ProvLabelId label = dta_incomplete_unknown_label(reasons);
+	if (label == PROV_LABEL_ID_INVALID) {
 		return false;
 	}
+	return shadow_fill_label(g_shadow, address, size, label);
+}
 
+static uint8_t dta_test_register_mask(RegId reg, uint8_t width) {
+	if (!g_tls_vcpu_state || reg < 0 || reg >= REG_COUNT) {
+		return 0;
+	}
+	if (width > MAX_REG_BYTES) {
+		width = MAX_REG_BYTES;
+	}
+	const RegShadow *regs = &g_tls_vcpu_state->dta.regs;
+	uint8_t result = 0;
+	for (uint8_t byte = 0; byte < width; byte++) {
+		if (plugin_label_may_be_tainted(regs->bytes[reg][byte])) {
+			result |= (uint8_t)(UINT32_C(1) << byte);
+		}
+	}
+	return result;
+}
+
+static bool dta_test_handle_marker(int64_t syscall_num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a5, uint64_t a6) {
+	if (!is_i386 || syscall_num != 20 || (uint32_t)a1 != DTA_TEST_MAGIC) {
+		return false;
+	}
 	uint32_t test_id = (uint32_t)a2;
 	uint32_t control = (uint32_t)a3;
 	uint32_t mem_spec = (uint32_t)a6;
-
 	uint8_t expected_reg = (uint8_t)(control & 0xffU);
-	uint8_t expected_sink =
-		(uint8_t)((control >> 8) & 0xffU);
-
+	uint8_t expected_sink = (uint8_t)((control >> 8) & 0xffU);
 	uint64_t mem_addr = (uint64_t)(uint32_t)a5;
 	uint8_t expected_mem = (uint8_t)(mem_spec & 0xffU);
-	uint8_t mem_width =
-		(uint8_t)((mem_spec >> 8) & 0xffU);
-
-	uint8_t actual_reg =
-		dta_test_register_mask(REG_RSI, 4);
-
+	uint8_t mem_width = (uint8_t)((mem_spec >> 8) & 0xffU);
+	uint8_t actual_reg = dta_test_register_mask(REG_RSI, 4);
 	uint8_t actual_mem = 0;
 	bool memory_ok;
 
 	if (mem_width == 0) {
 		memory_ok = true;
 	} else if (mem_width <= MAX_REG_BYTES && g_shadow) {
-		actual_mem =
-			shadow_load_taint_mask(mem_addr, mem_width);
+		actual_mem = shadow_load_taint_mask(mem_addr, mem_width);
 		memory_ok = actual_mem == expected_mem;
 	} else {
 		memory_ok = false;
 	}
-
 	bool sink_ok = false;
 	const char *expected_sink_name = "invalid";
 	const char *actual_sink_name = "none";
-
 	if (g_dta_test_last_indirect_valid) {
-		actual_sink_name =
-			g_dta_test_last_indirect_tainted
-				? "tainted"
-				: "clean";
+		actual_sink_name = g_dta_test_last_indirect_tainted ? "tainted" : "clean";
 	}
-
 	switch ((dta_test_sink_t)expected_sink) {
 	case DTA_TEST_SINK_SKIP:
 		expected_sink_name = "skip";
 		sink_ok = true;
 		break;
-
 	case DTA_TEST_SINK_CLEAN:
 		expected_sink_name = "clean";
 		sink_ok =
-			g_dta_test_last_indirect_valid &&
-			!g_dta_test_last_indirect_tainted;
+			g_dta_test_last_indirect_valid && !g_dta_test_last_indirect_tainted;
 		break;
-
 	case DTA_TEST_SINK_TAINTED:
 		expected_sink_name = "tainted";
 		sink_ok =
-			g_dta_test_last_indirect_valid &&
-			g_dta_test_last_indirect_tainted;
+			g_dta_test_last_indirect_valid && g_dta_test_last_indirect_tainted;
 		break;
-
 	default:
 		sink_ok = false;
 		break;
 	}
-
 	bool register_ok = actual_reg == expected_reg;
 	bool passed = register_ok && memory_ok && sink_ok;
-
 	g_dta_test_total++;
-
 	if (!passed) {
 		g_dta_test_failed++;
 	}
-
 	fprintf(stderr,
 		"[DTA-TEST %s] id=%u "
 		"reg(actual=0x%02x expected=0x%02x) "
@@ -861,65 +1377,63 @@ static bool dta_test_handle_marker(int64_t syscall_num,
 		expected_mem,
 		actual_sink_name,
 		expected_sink_name);
-
-	/*
-	 * Следующий marker не должен случайно использовать результат
-	 * предыдущего indirect branch.
-	 */
 	g_dta_test_last_indirect_valid = false;
 	g_dta_test_last_indirect_tainted = false;
-
 	return true;
 }
 
-
-static void shadow_store_taint_mask(uint64_t vaddr, uint32_t size, uint8_t taint_mask) {
-	for (uint32_t byte = 0; byte < size; byte++) {
-		bool tainted = byte < MAX_REG_BYTES && (taint_mask & (uint8_t)(1U << byte)) != 0;
-		if (tainted) {
-			shadow_taint_byte(g_shadow, vaddr + byte, g_current_ip);
-			g_taint_seen = true;
-		} else {
-			shadow_untaint_byte(g_shadow, vaddr + byte);
-		}
+static void apply_memory_store_labels(PluginVcpuState *vcpu_state, uint64_t vaddr, uint32_t size, const InsnMeta *meta) {
+	if (!g_shadow || !g_prov_registry || size == 0) {
+		return;
 	}
-}
-
-static void apply_memory_store_taint(uint64_t vaddr, uint32_t size, const InsnMeta *meta) {
-	if (!g_shadow || size == 0) return;
-	if (size > MAX_REG_BYTES) {
-		if (!shadow_taint_range(g_shadow, vaddr, size, g_current_ip)) {
-			fprintf(stderr, "[DTA] failed to taint wide store addr=0x%lx size=%u\n", (unsigned long)vaddr, size);
+	dta_mem_transfer_t *transfer = vcpu_state ? &vcpu_state->mem_transfer : NULL;
+	bool context_valid = vcpu_state && transfer->active && transfer->pc == vcpu_state->current_ip;
+	if (!vcpu_state || !meta || !context_valid || size > MAX_REG_BYTES) {
+		if (!shadow_fill_incomplete(vaddr, size, PROV_INCOMPLETE_UNSUPPORTED_INSTRUCTION)) {
+			fprintf(stderr, "[DTA] failed to store incomplete label addr=0x%lx size=%u\n", (unsigned long)vaddr, size);
 		} else {
 			g_taint_seen = true;
 		}
-		g_dta_mem_transfer.last_read_valid = false;
+		if (transfer) {
+			transfer->last_read_valid = false;
+		}
 		return;
 	}
-	bool context_valid = g_dta_mem_transfer.active && g_dta_mem_transfer.pc == g_current_ip;
-	if (!meta || !context_valid) {
-		uint8_t full_mask = size == MAX_REG_BYTES ? UINT8_MAX : (uint8_t)((1U << size) - 1U);
-		shadow_store_taint_mask(vaddr, size, full_mask);
-		g_dta_mem_transfer.last_read_valid = false;
+	ProvLabelId old_memory[MAX_REG_BYTES];
+	ProvLabelId effective_old_memory[MAX_REG_BYTES];
+	ProvLabelId result_labels[MAX_REG_BYTES];
+	if (!shadow_load_labels(g_shadow, vaddr, old_memory, size)) {
+		(void)shadow_fill_incomplete(vaddr, size, PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+		transfer->last_read_valid = false;
+		g_taint_seen = true;
 		return;
 	}
-	uint8_t old_mem_taint = shadow_load_taint_mask(vaddr, size);
-	uint8_t effective_old_mem_taint = old_mem_taint;
-	if (meta->has_mem_read) {
-		effective_old_mem_taint = dta_effective_mem_read_taint( &g_dta_mem_transfer.pre_regs, meta, old_mem_taint, (uint8_t)size);
+	memcpy(effective_old_memory, old_memory, size * sizeof(*old_memory));
+	if (meta->has_mem_read && !dta_effective_mem_read_labels(&transfer->pre_regs, meta, old_memory, (uint8_t)size, effective_old_memory)) {
+		(void)shadow_fill_incomplete(vaddr, size, PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+		transfer->last_read_valid = false;
+		g_taint_seen = true;
+		return;
 	}
-	bool source_mem_valid = g_dta_mem_transfer.last_read_valid && g_dta_mem_transfer.last_read_size == size;
-	uint8_t source_mem_taint = source_mem_valid ? g_dta_mem_transfer.last_read_taint : 0;
-	uint8_t result_taint = 0;
-	DtaTransferResult result = dta_compute_mem_write_taint(&g_dta_mem_transfer.pre_regs, meta, effective_old_mem_taint, source_mem_valid, source_mem_taint, (uint8_t)size, &result_taint);
+	bool source_memory_valid = transfer->last_read_valid && transfer->last_read_size == size;
+	const ProvLabelId *source_memory = source_memory_valid ? transfer->last_read_labels : NULL;
+	DtaTransferResult result = dta_compute_mem_write_labels(&transfer->pre_regs, meta, effective_old_memory, source_memory_valid, source_memory, (uint8_t)size, result_labels);
 	if (result == DTA_TRANSFER_NOT_APPLICABLE) {
-		result_taint = size == MAX_REG_BYTES ? UINT8_MAX : (uint8_t)((1U << size) - 1U);
+		ProvLabelId fallback =dta_incomplete_unknown_label(PROV_INCOMPLETE_UNSUPPORTED_INSTRUCTION);
+		for (uint32_t byte = 0; byte < size; byte++) {
+			result_labels[byte] = fallback;
+		}
 	}
+
 	if (meta->insn_id == X86_INS_XCHG) {
-		(void)dta_apply_mem_read_transfer( &reg_shadow,&g_dta_mem_transfer.pre_regs, meta, old_mem_taint, (uint8_t)size);
+		(void)dta_apply_mem_read_labels(&vcpu_state->dta.regs, &transfer->pre_regs, meta, old_memory, (uint8_t)size);
 	}
-	shadow_store_taint_mask(vaddr, size, result_taint);
-	g_dta_mem_transfer.last_read_valid = false;
+	if (!shadow_store_labels(g_shadow, vaddr, result_labels, size)) {
+		fprintf(stderr, "[DTA] failed to store memory labels addr=0x%lx size=%u\n", (unsigned long)vaddr, size);
+	} else if (label_array_has_taint(result_labels, size)) {
+		g_taint_seen = true;
+	}
+	transfer->last_read_valid = false;
 }
 
 static void dse_aux_note_mem_access(uint32_t *total, bool *range_valid, bool *range_unknown, uint64_t *range_min, uint64_t *range_max, uint64_t address, uint32_t size){
@@ -973,133 +1487,195 @@ static bool dse_mem_access_value_u64(qemu_plugin_meminfo_t info, uint32_t size, 
 }
 
 static void dse_on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void *ud) {
-	(void)vcpu;
-	const InsnExecCtx *exec_ctx =(const InsnExecCtx*)ud;
+	PluginVcpuState *vcpu_state = plugin_vcpu_state_get(vcpu);
+	if (!vcpu_state) return;
+	RegShadow *regs = &vcpu_state->dta.regs;
+	dta_mem_transfer_t *transfer = &vcpu_state->mem_transfer;
+	const InsnExecCtx *exec_ctx = (const InsnExecCtx *)ud;
 	const InsnMeta *meta = exec_ctx ? exec_ctx->meta : NULL;
-	if (exec_ctx && exec_ctx->pc != g_current_ip) meta = NULL;
-	uint32_t sz = 1u << qemu_plugin_mem_size_shift(info);
+	if (exec_ctx && exec_ctx->pc != vcpu_state->current_ip) {
+		meta = NULL;
+	}
+	uint32_t size = 1U << qemu_plugin_mem_size_shift(info);
 	if (qemu_plugin_mem_is_store(info)) {
 		uint64_t stored_value = 0;
-		bool stored_value_valid = dse_mem_access_value_u64(info, sz, &stored_value);
+		bool stored_value_valid = dse_mem_access_value_u64(info, size, &stored_value);
 		if (g_cur_aux) {
-			dse_aux_capture_string_write(g_cur_aux, vaddr, sz);
-			dse_aux_note_mem_access(&g_cur_aux->mem_write_total, &g_cur_aux->mem_write_range_valid, &g_cur_aux->mem_write_range_unknown, &g_cur_aux->mem_write_min_addr, &g_cur_aux->mem_write_max_addr, vaddr, sz);
+			dse_aux_capture_string_write(g_cur_aux, vaddr, size);
+			dse_aux_note_mem_access(&g_cur_aux->mem_write_total, &g_cur_aux->mem_write_range_valid, &g_cur_aux->mem_write_range_unknown, &g_cur_aux->mem_write_min_addr, &g_cur_aux->mem_write_max_addr, vaddr, size);
 			if (!g_cur_aux->has_mem_write) {
 				g_cur_aux->mem_write_addr = vaddr;
-				g_cur_aux->mem_write_size = sz <= MAX_REG_BYTES ? (uint8_t)sz : 0;
+				g_cur_aux->mem_write_size = size <= MAX_REG_BYTES ? (uint8_t)size : 0;
 			}
 			g_cur_aux->has_mem_write = true;
-			if (sz == 0 || sz > MAX_REG_BYTES || g_cur_aux->mem_write_count >= DSE_MAX_MEM_ACCESSES) {
+			if (size == 0 || size > MAX_REG_BYTES || g_cur_aux->mem_write_count >=DSE_MAX_MEM_ACCESSES) {
 				g_cur_aux->mem_write_overflow = true;
 			} else {
 				DseMemWrite *write = &g_cur_aux->mem_writes[g_cur_aux->mem_write_count++];
 				write->addr = vaddr;
 				write->value = stored_value;
-				write->size = (uint8_t)sz;
+				write->size = (uint8_t)size;
 				write->value_valid = stored_value_valid;
 			}
 		}
-		apply_memory_store_taint(vaddr, sz, meta);
+		apply_memory_store_labels(vcpu_state, vaddr, size, meta);
 		return;
 	}
-	//taint byte by byte
-	//mem2reg propagate
-	bool context_valid = g_dta_mem_transfer.active && g_dta_mem_transfer.pc == g_current_ip;
-	uint8_t mem_width = (uint8_t)(sz < MAX_REG_BYTES ? sz : MAX_REG_BYTES);
-	uint8_t raw_tmask = shadow_load_taint_mask(vaddr, sz);
-	uint8_t tmask = raw_tmask;
-	if (meta && context_valid) {
-		tmask = dta_effective_mem_read_taint(&g_dta_mem_transfer.pre_regs, meta, raw_tmask, mem_width);
+
+	bool context_valid = transfer->active && transfer->pc == vcpu_state->current_ip;
+	uint8_t memory_width = (uint8_t)(size < MAX_REG_BYTES ? size : MAX_REG_BYTES);
+	ProvLabelId raw_labels[MAX_REG_BYTES];
+	ProvLabelId effective_labels[MAX_REG_BYTES];
+	bool raw_labels_valid =
+		size <= MAX_REG_BYTES && shadow_load_labels(g_shadow, vaddr, raw_labels, size);
+	bool effective_labels_valid = raw_labels_valid;
+
+	if (raw_labels_valid) {
+		memcpy(effective_labels, raw_labels, size * sizeof(*raw_labels));
+		if (meta && context_valid &&
+		    !dta_effective_mem_read_labels(&transfer->pre_regs, meta, raw_labels, memory_width, effective_labels)) {
+			effective_labels_valid = false;
+		}
 	}
-	bool address_tainted = meta && context_valid && dta_address_mask_is_tainted(&g_dta_mem_transfer.pre_regs, meta->mem_read_addr_reg_mask);
+	if (meta && context_valid && transfer->flags_pending && !transfer->flags_applied) {
+		const ProvLabelId *flag_memory_labels = effective_labels_valid ? effective_labels : NULL;
+		uint8_t flag_memory_width = effective_labels_valid ? memory_width : 0;
+		(void)dta_apply_flag_transfer(&vcpu_state->dta, &transfer->pre_regs, meta, flag_memory_labels, flag_memory_width);
+		transfer->flags_applied = true;
+		if (dta_flag_mask_is_tainted(&vcpu_state->dta, meta->flags_write_mask)) {
+			g_taint_seen = true;
+		}
+	}
+
+	uint8_t raw_taint = raw_labels_valid ? label_array_taint_mask(raw_labels, memory_width) : shadow_load_taint_mask(vaddr, size);
+	uint8_t effective_taint = effective_labels_valid ? label_array_taint_mask(effective_labels, memory_width) : raw_taint;
+	bool address_tainted = meta && context_valid && dta_address_mask_is_tainted(&transfer->pre_regs, meta->mem_read_addr_reg_mask);
 	if (context_valid) {
-		g_dta_mem_transfer.last_read_valid = true;
-		g_dta_mem_transfer.last_read_size = sz;
-		g_dta_mem_transfer.last_read_taint = tmask;
+		transfer->last_read_valid = effective_labels_valid;
+		transfer->last_read_size = size;
+		if (effective_labels_valid) {
+			memcpy(transfer->last_read_labels, effective_labels, size * sizeof(*effective_labels));
+		}
 	}
+
 	if (meta && meta->insn_id == X86_INS_POPAL) {
-		if (g_cur_aux && sz == 4) {
-			uint32_t old_esp =(uint32_t)g_cur_aux->reg_vals[REG_RSP];
-			uint32_t offset =(uint32_t)vaddr - old_esp;
-			x86_reg destination = X86_REG_INVALID;
+		bool handled = false;
+		uint64_t failure_reason = PROV_INCOMPLETE_NONE;
+		if (!context_valid) {
+			failure_reason = PROV_INCOMPLETE_UNKNOWN;
+		} else if (!transfer->pre_esp_valid) {
+			failure_reason = PROV_INCOMPLETE_IMPLICIT_OPERAND;
+		} else if (size != 4 || !effective_labels_valid) {
+			failure_reason = PROV_INCOMPLETE_UNRESOLVED_MEMORY;
+		} else {
+			uint32_t offset = (uint32_t)vaddr - transfer->pre_esp;
+			unsigned destination_reg = X86_REG_INVALID;
 			switch (offset) {
 				case 0:
-					destination = X86_REG_EDI;
+					destination_reg = X86_REG_EDI;
 					break;
 				case 4:
-					destination = X86_REG_ESI;
+					destination_reg = X86_REG_ESI;
 					break;
 				case 8:
-					destination = X86_REG_EBP;
+					destination_reg = X86_REG_EBP;
+					break;
+				case 12:
+					handled = true;
 					break;
 				case 16:
-					destination = X86_REG_EBX;
+					destination_reg = X86_REG_EBX;
 					break;
 				case 20:
-					destination = X86_REG_EDX;
+					destination_reg = X86_REG_EDX;
 					break;
 				case 24:
-					destination = X86_REG_ECX;
+					destination_reg = X86_REG_ECX;
 					break;
 				case 28:
-					destination = X86_REG_EAX;
+					destination_reg = X86_REG_EAX;
 					break;
 				default:
+					failure_reason = PROV_INCOMPLETE_UNKNOWN;
 					break;
 			}
-			if (destination != X86_REG_INVALID) {
-				int rid =x86_reg_to_rid(destination);
-				if (rid >= 0 && rid < REG_COUNT) {
-					for (uint32_t i = 0; i < 4; i++) {
-						reg_shadow.bytes[rid][i] = (tmask >> i) & 1u;
-					}
+			if (destination_reg != X86_REG_INVALID) {
+				RegSlice destination = reg_slice_from_x86(destination_reg, 4);
+				if (reg_slice_is_valid(destination) && reg_slice_store_labels(regs, destination, effective_labels, 4, vcpu_state->current_ip)) {
+					handled = true;
+				} else {
+					failure_reason = PROV_INCOMPLETE_UNKNOWN;
 				}
 			}
 		}
-	} else if (meta && meta->insn_id == X86_INS_LEAVE) {
-		uint8_t old_ebp_taint[4];
-		for (uint32_t i = 0; i < 4; i++) {
-			old_ebp_taint[i] =reg_shadow.bytes[REG_RBP][i];
+		if (!handled) {
+			if (failure_reason == PROV_INCOMPLETE_NONE) {
+				failure_reason = PROV_INCOMPLETE_UNKNOWN;
+			}
+			bool fallback_stored = mark_popal_destinations_incomplete(regs, vcpu_state->current_ip, failure_reason);
+			g_taint_seen = true;
+			if (!fallback_stored) {
+				fprintf(stderr, "[DTA] failed to mark POPAL destinations incomplete pc=0x%lx addr=0x%lx\n", (unsigned long) vcpu_state->current_ip, (unsigned long)vaddr);
+			}
 		}
-		for (uint32_t i = 0; i < 4; i++) {
-			reg_shadow.bytes[REG_RSP][i] = old_ebp_taint[i];
+	} else if (meta && meta->insn_id == X86_INS_LEAVE) {	
+		RegSlice ebp_slice = reg_slice_from_x86(X86_REG_EBP, 4);
+		RegSlice esp_slice = reg_slice_from_x86(X86_REG_ESP, 4);
+		ProvLabelId old_ebp_labels[4];
+		bool leave_valid = size == 4 && effective_labels_valid && reg_slice_is_valid(ebp_slice) && reg_slice_is_valid(esp_slice) && 
+			reg_slice_load_labels(&transfer->pre_regs, ebp_slice, old_ebp_labels);
+		if (leave_valid) {
+			(void)reg_slice_store_labels(regs, esp_slice, old_ebp_labels, 4, vcpu_state->current_ip);
+			(void)reg_slice_store_labels(regs, ebp_slice, effective_labels, 4, vcpu_state->current_ip);
+		} else {
+			ProvLabelId incomplete= dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+			if (reg_slice_is_valid(esp_slice)) {
+				(void)reg_slice_set_label(regs, esp_slice, incomplete, vcpu_state->current_ip);
+			}
+			if (reg_slice_is_valid(ebp_slice)) {
+				(void)reg_slice_set_label(regs, ebp_slice, incomplete, vcpu_state->current_ip);
+			}
 		}
-		uint32_t popped_bytes = sz < 4 ? sz : 4;
-		for (uint32_t i = 0; i < popped_bytes;i++) {
-			reg_shadow.bytes[REG_RBP][i] = (tmask >> i) & 1u;
+	} else if (meta && context_valid && raw_labels_valid) {
+		DtaTransferResult result = dta_apply_mem_read_labels(regs, &transfer->pre_regs, meta, raw_labels, memory_width);
+		if (result == DTA_TRANSFER_NOT_APPLICABLE) {
+			RegSlice destination = meta_first_reg_write(meta);
+			if (reg_slice_is_valid(destination) && meta->family != DTA_FAMILY_COMPARE) {
+				ProvLabelId incomplete = dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+				(void)reg_slice_set_label(regs, destination, incomplete, vcpu_state->current_ip);
+			}
 		}
-	} else if (meta && context_valid) {
-		(void)dta_apply_mem_read_transfer(&reg_shadow, &g_dta_mem_transfer.pre_regs, meta,raw_tmask, mem_width);
 	} else if (meta) {
-		RegSlice dst = meta_first_reg_write(meta);
-		if (reg_slice_is_valid(dst)) {
-			reg_slice_taint_set(&reg_shadow, dst, g_current_ip);
-
+		RegSlice destination = meta_first_reg_write(meta);
+		if (reg_slice_is_valid(destination)) {
+			ProvLabelId incomplete = dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+			(void)reg_slice_set_label(regs, destination, incomplete, vcpu_state->current_ip);
 		}
 	}
+
 	if (g_cur_aux) {
-		dse_aux_note_mem_access(&g_cur_aux->mem_read_total, &g_cur_aux->mem_read_range_valid, &g_cur_aux->mem_read_range_unknown, &g_cur_aux->mem_read_min_addr, &g_cur_aux->mem_read_max_addr, vaddr, sz);
+		dse_aux_note_mem_access(&g_cur_aux->mem_read_total, &g_cur_aux->mem_read_range_valid, &g_cur_aux->mem_read_range_unknown, &g_cur_aux->mem_read_min_addr, &g_cur_aux->mem_read_max_addr, vaddr, size);
 		uint64_t value = 0;
-		bool value_valid = dse_mem_access_value_u64(info, sz, &value);
+		bool value_valid = dse_mem_access_value_u64(info, size, &value);
 		if (!g_cur_aux->has_mem_read) {
 			g_cur_aux->mem_read_addr = vaddr;
 			g_cur_aux->mem_read_val = value;
-			g_cur_aux->mem_read_taint = raw_tmask;
-			g_cur_aux->mem_read_effective_taint = tmask;
+			g_cur_aux->mem_read_taint = raw_taint;
+			g_cur_aux->mem_read_effective_taint = effective_taint;
 			g_cur_aux->mem_read_address_tainted = address_tainted;
 		}
-		(void)dse_aux_capture_string_read(g_aux, g_cur_aux, vaddr, value, value_valid, raw_tmask,sz);
+		(void)dse_aux_capture_string_read(g_aux, g_cur_aux, vaddr, value, value_valid, raw_taint, size);
 		g_cur_aux->has_mem_read = true;
-		if (sz == 0 || sz > MAX_REG_BYTES || g_cur_aux->mem_read_count >= DSE_MAX_MEM_ACCESSES) {
+		if (size == 0 || size > MAX_REG_BYTES || g_cur_aux->mem_read_count >= DSE_MAX_MEM_ACCESSES) {
 			g_cur_aux->mem_read_overflow = true;
 		} else {
 			DseMemRead *read = &g_cur_aux->mem_reads[g_cur_aux->mem_read_count++];
 			read->addr = vaddr;
 			read->value = value;
-			read->taint = raw_tmask;
-			read->effective_taint = tmask;
+			read->taint = raw_taint;
+			read->effective_taint = effective_taint;
 			read->address_tainted = address_tainted;
-			read->size = (uint8_t)sz;
+			read->size = (uint8_t)size;
 		}
 	}
 }
@@ -1276,38 +1852,82 @@ static void apply_pending_munmap(const pending_mmap_t *pending) {
 	fprintf(stderr, "[SYSCALL] munmap(0x%lx, 0x%lx)\n", (unsigned long)addr, (unsigned long)size);
 }
 
-static file_dep_t *add_file_dep(const char *path, bool is_lib) {
-	for (GList *l = file_deps; l; l = l->next) {
-		file_dep_t *f = (file_dep_t *)l->data;
-		if (f->path && strcmp(f->path, path) == 0) {
-			if (is_lib) {
-				f->taint_source = false;
-			}
-			return f;
-		}
+static ProvResourceId ensure_file_resource(file_dep_t *file, uint32_t roles) {
+	if (!file || !file->path || !g_prov_registry) {
+		return PROV_RESOURCE_ID_INVALID;
 	}
-	file_dep_t *f = g_new0(file_dep_t, 1);
-	f->path = g_strdup(path);
-	f->write = false;
-	//external - taint source, lib - clear
-	f->taint_source = !is_lib;
-	file_deps = g_list_append(file_deps, f);
-	if (is_lib && !strstr(path, ".cache")) {
-		for (GList *l = lib_deps; l; l = l->next) {
-			lib_mapping_t *lm = (lib_mapping_t *)l->data;
-			if (lm->path && strcmp(lm->path, path) == 0) {
-				return f;
-			}
-		}
-		lib_mapping_t *lm = g_new0(lib_mapping_t, 1);
-		lm->path = g_strdup(path);
-		lm->base = 0;
-		lm->size = 0;
-		lib_deps = g_list_append(lib_deps, lm);
+	bool is_main_image = g_main_image_path && g_main_image_object_id != 0 && strcmp(file->path, g_main_image_path) == 0;
+	if (is_main_image) {
+		file->resource_object_id = g_main_image_object_id;
+		roles |= PROV_RESOURCE_ROLE_MAIN_IMAGE;
 	}
-
-	return f;
+	if (file->resource_object_id == 0) {
+		if (g_next_resource_object_id == 0) {
+			fprintf(stderr, "[PROV] file object-id space exhausted\n");
+			return PROV_RESOURCE_ID_INVALID;
+		}
+		file->resource_object_id = g_next_resource_object_id++;
+	}
+	ProvResourceKey key = {
+		.kind = PROV_RESOURCE_FILE,
+		.scope_id = g_analysis_scope_id,
+		.object_id = file->resource_object_id,
+		.semantic_version = 0
+	};
+	ProvResourceId resource_id = prov_resource_intern(g_prov_registry, &key, file->path, roles);
+	if (resource_id != PROV_RESOURCE_ID_INVALID) {
+		file->resource_id = resource_id;
+	}
+	return resource_id;
 }
+
+static file_dep_t *add_file_dep(const char *path, bool is_lib) {
+	if (!path || !*path) {
+		return NULL;
+	}
+	uint32_t roles = is_lib ? PROV_RESOURCE_ROLE_LIBRARY_IMAGE : PROV_RESOURCE_ROLE_FUZZ_INPUT;
+	for (GList *node = file_deps; node;node = node->next) {
+		file_dep_t *file = node->data;
+		if (!file->path || strcmp(file->path, path) != 0) {
+			continue;
+		}
+		if (is_lib) file->taint_source = false;
+		(void)ensure_file_resource(file, roles);
+		return file;
+	}
+	file_dep_t *file = g_try_new0(file_dep_t, 1);
+	if (!file) return NULL;
+	file->path = g_strdup(path);
+	if (!file->path) {
+		g_free(file);
+		return NULL;
+	}
+	file->write = false;
+	file->taint_source = !is_lib;
+	file->resource_id = PROV_RESOURCE_ID_INVALID;
+	(void)ensure_file_resource(file, roles);
+
+	file_deps = g_list_append(file_deps, file);
+	if (is_lib && !strstr(path, ".cache")) {
+		for (GList *node = lib_deps; node;node = node->next) {
+			lib_mapping_t *mapping = node->data;
+			if (mapping->path && strcmp(mapping->path, path) == 0) {
+				return file;
+			}
+		}
+		lib_mapping_t *mapping = g_try_new0(lib_mapping_t, 1);
+		if (mapping) {
+			mapping->path = g_strdup(path);
+			if (mapping->path) {
+				lib_deps = g_list_append(lib_deps, mapping);
+			} else {
+				g_free(mapping);
+			}
+		}
+	}
+	return file;
+}
+
 //mark write
 static void mark_written(uint64_t vaddr, uint32_t size) {
 	while (size > 0) {
@@ -1574,43 +2194,60 @@ static bool window_from_phdrs(uint64_t phdr_va, uint64_t ent, uint64_t num, uint
 //init taint
 static bool seed_main_file_taint(uint64_t phdr_va, uint64_t ent, uint64_t num, uint64_t base_adjust) {
 	if (g_initial_taint_seeded) return true;
-	if (!g_shadow || !phdr_va || !num || num > 512) {
+	if (!g_shadow || !g_prov_registry || !phdr_va ||
+	    !num || num > 512) {
 		return false;
 	}
-	bool w64 = (guest_ptr_bytes() == 8);
+	if (!main_image_resource_init()) {
+		fprintf(stderr, "[PROV] main image resource is unavailable\n");
+		return false;
+	}
+
+	bool w64 = guest_ptr_bytes() == 8;
+	uint64_t off_offset = w64 ? 8 : 4;
 	uint64_t off_vaddr = w64 ? 16 : 8;
 	uint64_t off_filesz = w64 ? 32 : 16;
 	uint64_t off_memsz = w64 ? 40 : 20;
 	uint64_t min_ent = w64 ? 56 : 32;
-	uint32_t fld = w64 ? 8 : 4;
-	if (ent < min_ent) {
-		return false;
-	}
+	uint32_t field_size = w64 ? 8 : 4;
+
+	if (ent < min_ent) return false;
+
 	typedef struct {
-		uint64_t start;
+		uint64_t runtime_address;
 		uint64_t size;
-	} initial_taint_range_t;
-	initial_taint_range_t ranges[512];
+		uint64_t file_offset;
+	} MainImageLoadRange;
+	MainImageLoadRange ranges[512];
 	uint32_t range_count = 0;
 	uint64_t total = 0;
-	for (uint64_t i = 0; i < num; i++) {
-		if (i > (UINT64_MAX - phdr_va) / ent) {
+
+	for (uint64_t index = 0; index < num; index++) {
+		if (index > (UINT64_MAX - phdr_va) / ent) {
 			return false;
 		}
-		uint64_t ph = phdr_va + i * ent;
+		uint64_t phdr = phdr_va + index * ent;
 		uint64_t p_type = 0;
+		uint64_t p_offset = 0;
 		uint64_t p_vaddr = 0;
 		uint64_t p_filesz = 0;
 		uint64_t p_memsz = 0;
-		if (!guest_read_uint(ph, 4, &p_type)) {
+		if (!guest_read_uint(phdr, 4, &p_type)) {
 			return false;
 		}
-		if (p_type != 1) { // PT_LOAD
-			continue;
-		}
-		if (ph > UINT64_MAX - off_memsz || !guest_read_uint(ph + off_vaddr, fld, &p_vaddr) || !guest_read_uint(ph + off_filesz, fld, &p_filesz) || !guest_read_uint(ph + off_memsz, fld, &p_memsz)) {
+		if (p_type != 1) continue;
+		if (phdr > UINT64_MAX - off_memsz ||
+		    !guest_read_uint(
+			    phdr + off_offset, field_size, &p_offset) ||
+		    !guest_read_uint(
+			    phdr + off_vaddr, field_size, &p_vaddr) ||
+		    !guest_read_uint(
+			    phdr + off_filesz, field_size, &p_filesz) ||
+		    !guest_read_uint(
+			    phdr + off_memsz, field_size, &p_memsz)) {
 			return false;
 		}
+
 		if (p_filesz == 0 || p_memsz == 0) {
 			continue;
 		}
@@ -1620,42 +2257,77 @@ static bool seed_main_file_taint(uint64_t phdr_va, uint64_t ent, uint64_t num, u
 		if (p_vaddr > UINT64_MAX - base_adjust) {
 			return false;
 		}
-		uint64_t start = p_vaddr + base_adjust;
+		uint64_t runtime_address = p_vaddr + base_adjust;
 		if (!w64) {
-			const uint64_t guest_limit = 1ULL << 32;
-			if (start >= guest_limit) {
+			const uint64_t guest_limit = UINT64_C(1) << 32;
+			if (runtime_address >= guest_limit) {
 				continue;
 			}
-			if (p_filesz > guest_limit - start) {
-				p_filesz = guest_limit - start;
+			if (p_filesz > (guest_limit - runtime_address)) {
+				p_filesz = guest_limit - runtime_address;
 			}
 		}
 		if (p_filesz == 0) continue;
-		if (p_filesz > MAX_INITIAL_TAINT_BYTES - total) {
-			fprintf(stderr, "[DTA] initial taint exceeds limit 0x%lx\n", (unsigned long) MAX_INITIAL_TAINT_BYTES);
+		if (p_filesz - 1U > UINT64_MAX - p_offset) {
 			return false;
 		}
-		ranges[range_count].start = start;
+
+		if (p_filesz > MAX_INITIAL_TAINT_BYTES - total) {
+			fprintf(
+				stderr,
+				"[PROV] initial main-image seed "
+				"exceeds limit 0x%" PRIx64 "\n",
+				(uint64_t)MAX_INITIAL_TAINT_BYTES);
+			return false;
+		}
+
+		ranges[range_count].runtime_address = runtime_address;
 		ranges[range_count].size = p_filesz;
+		ranges[range_count].file_offset = p_offset;
 		range_count++;
 		total += p_filesz;
 	}
 	if (range_count == 0 || total == 0) {
 		return false;
 	}
-	for (uint32_t i = 0; i < range_count; i++) {
-		if (!shadow_taint_range(g_shadow, ranges[i].start, ranges[i].size, 0)) {
-			fprintf(stderr, "[DTA] failed to seed PT_LOAD range addr=0x%lx size=0x%lx\n", (unsigned long)ranges[i].start, (unsigned long)ranges[i].size);
+	for (uint32_t index = 0; index<range_count; index++) {
+		if (!seed_resource_byte_labels(ranges[index].runtime_address, ranges[index].size, g_main_image_resource_id, ranges[index].file_offset)) {
+			fprintf(
+				stderr,
+				"[PROV] failed to seed main PT_LOAD "
+				"addr=0x%" PRIx64
+				" size=0x%" PRIx64
+				" file_offset=0x%" PRIx64 "\n",
+				ranges[index].runtime_address,
+				ranges[index].size,
+				ranges[index].file_offset);
 			return false;
 		}
 	}
 	g_initial_taint_seeded = true;
 	g_taint_seen = true;
-	fprintf(stderr, "[DTA] seeded %lu file-backed bytes from main ELF\n", (unsigned long)total);
+	fprintf(
+		stderr,
+		"[PROV] seeded %" PRIu64
+		" source-aware bytes from main ELF "
+		"resource=%u path=%s\n",
+		total,
+		g_main_image_resource_id,
+		g_main_image_path);
 	return true;
 }
 //read auxv
 static bool read_auxv_from_stack(void) {
+	if (!main_image_path_init()) {
+		fprintf(stderr,
+			"[AUXV] fail: cannot resolve main executable path\n");
+		return false;
+	}
+	if (!main_image_resource_init()) {
+		fprintf(stderr,
+			"[AUXV] fail: cannot initialize main image resource\n");
+		return false;
+	}
 	uint32_t pb = guest_ptr_bytes();
 	uint64_t sp = 0;
 	if (g_initial_sp_valid) {
@@ -2216,6 +2888,10 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	meta_free();
 
 	//tracer
+	if (g_branch_events) {
+		branch_event_buffer_destroy(g_branch_events);
+		g_branch_events = NULL;
+	}
 	dse_lift_attach(NULL, NULL, NULL);
 	g_cur_aux = NULL;
 	dse_aux_destroy(g_aux);
@@ -2237,6 +2913,8 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 		g_hash_table_destroy(resolved_imports_by_slot);
 		resolved_imports_by_slot = NULL;
 	}
+	provenance_runtime_destroy();
+	g_clear_pointer(&g_main_image_path, g_free);
 }
 
 static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
@@ -2260,8 +2938,17 @@ static bool insn_is_unpacked(uint64_t vaddr, size_t size) {
 static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	const InsnExecCtx *exec_ctx = (const InsnExecCtx *)udata;
 	if (!exec_ctx) return;
+	PluginVcpuState *vcpu_state = plugin_vcpu_state_get(cpu_index);
+	if (!vcpu_state) {
+		fprintf(stderr, "[DTA] missing vCPU state: vcpu=%u\n", cpu_index);
+		return;
+	}
+	RegShadow *regs = &vcpu_state->dta.regs;
+	dta_mem_transfer_t *transfer = &vcpu_state->mem_transfer;
 	uint64_t vaddr = exec_ctx->pc;
 	const InsnMeta *meta = exec_ctx->meta;
+	finalize_missing_memory_flag_transfer(vcpu_state);
+	finalize_pending_branch(vcpu_state, vaddr);
 	uint64_t current_reg_vals[REG_COUNT] = {0};
 	uint32_t current_reg_value_valid_mask = 0;
 	uint32_t current_eflags = 0;
@@ -2277,13 +2964,33 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		dse_aux_finalize(g_cur_aux, vaddr, current_reg_vals, current_reg_value_valid_mask);
 	}
 	g_cur_aux = NULL;
-	g_current_ip = vaddr;
-	g_dta_mem_transfer.active = true;
-	g_dta_mem_transfer.pc = vaddr;
-	g_dta_mem_transfer.pre_regs = reg_shadow;
-	g_dta_mem_transfer.last_read_valid = false;
-	g_dta_mem_transfer.last_read_size = 0;
-	g_dta_mem_transfer.last_read_taint = 0;
+	vcpu_state->current_ip = vaddr;
+	transfer->active = true;
+	transfer->pc = vaddr;
+	transfer->pre_regs = *regs;
+	transfer->pre_esp_valid = false;
+	transfer->pre_esp = 0;
+	transfer->meta = meta;
+	transfer->flags_pending = meta && meta->flags_write_mask != 0 && meta->has_mem_read;
+	transfer->flags_applied = false;
+	if (meta && meta->insn_id == X86_INS_POPAL) {
+		uint32_t rsp_bit = UINT32_C(1) << REG_RSP;
+		if (current_reg_value_valid_mask & rsp_bit) {
+			transfer->pre_esp = (uint32_t)current_reg_vals[REG_RSP];
+			transfer->pre_esp_valid = true;
+		} else {
+			uint64_t pre_esp = 0;
+			if (dse_read_reg(REG_RSP, &pre_esp)) {
+				transfer->pre_esp = (uint32_t)pre_esp;
+				transfer->pre_esp_valid = true;
+			}
+		}
+	}
+	transfer->last_read_valid = false;
+	transfer->last_read_size = 0;
+	for (uint8_t byte = 0; byte < MAX_REG_BYTES; byte++) {
+		transfer->last_read_labels[byte] = PROV_LABEL_CLEAN;
+	}
 	g_icount++;
 	if (!g_auxv_done && g_icount >= g_auxv_next_retry) {
 		if (!g_regs_ready) {
@@ -2315,14 +3022,14 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			aux.reg_value_valid_mask = current_reg_value_valid_mask;
 			aux.eflags_valid = current_eflags_valid;
 			aux.eflags_before = current_eflags;
-			for (int r = 0; r < REG_COUNT; r++) {
+			for (int reg = 0; reg < REG_COUNT; reg++) {
 				uint8_t taint_mask = 0;
-				for (int b = 0; b < 4; b++) {
-					if (reg_shadow.bytes[r][b]) {
-						taint_mask |= (uint8_t)(1U << b);
+				for (uint8_t byte = 0; byte < 4; byte++) {
+					if (plugin_label_may_be_tainted(regs->bytes[reg][byte])) {
+						taint_mask |= (uint8_t)(UINT32_C(1) << byte);
 					}
 				}
-				aux.reg_taint[r] = taint_mask;
+				aux.reg_taint[reg] = taint_mask;
 			}
 			g_cur_aux = dse_aux_record(g_aux, g_trace, stored_entry, &aux);
 			if (g_cur_aux) dse_aux_prepare_string(g_cur_aux, meta);
@@ -2451,7 +3158,13 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			do_dump(oep_addr);
 		}
 	}
-	(void)dta_apply_reg_transfer(&reg_shadow, meta);
+	if (meta->flags_write_mask != 0 && !meta->has_mem_read) {
+		(void)dta_apply_flag_transfer(&vcpu_state->dta, &transfer->pre_regs, meta, NULL, 0);
+		if (dta_flag_mask_is_tainted(&vcpu_state->dta, meta->flags_write_mask)) {
+			g_taint_seen = true;
+		}
+	}
+	(void)dta_apply_reg_transfer(regs, meta);
 	bool track_indirect = meta->is_indirect_branch && !oep_found;
 	if (track_indirect) { //indirect check
 			bool target_resolved = false;
@@ -2462,16 +3175,17 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 			//jmp/call reg
 			if (meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) {
 				target_resolved = true;
-				target_tainted = reg_is_tainted(&reg_shadow, meta->branch_target_reg, 0x0F);
+				target_tainted = reg_is_tainted(regs, meta->branch_target_reg, 0x0F);
 			//jmp/call [mem] or ret
 			} else if (meta->branch_target_reg == REG_INVALID) {
 				if (dse_resolve_mem_target(vaddr, meta, &taddr, &tval)) {
 					target_resolved = true;
 					mem_target_valid = true;
 					//check target mem
-					uint8_t target_taint = shadow_load_taint_mask(taddr, 4);
-					target_taint = dta_effective_mem_read_taint(&g_dta_mem_transfer.pre_regs, meta, target_taint, 4);
-					target_tainted = target_taint != 0;
+					ProvLabelId raw_target_labels[4];
+					ProvLabelId effective_target_labels[4];
+					bool target_labels_valid = shadow_load_labels(g_shadow, taddr, raw_target_labels, 4) && dta_effective_mem_read_labels(&transfer->pre_regs, meta, raw_target_labels, 4, effective_target_labels);
+					target_tainted = !target_labels_valid || label_array_has_taint(effective_target_labels, 4);
 				}
 			}
 			if (target_resolved) {
@@ -2496,6 +3210,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		uint64_t slot = 0, val = 0;
 		if (dse_resolve_mem_target(vaddr, meta, &slot, &val)) record_resolved_import(slot, val);
 	}
+	begin_pending_branch(vcpu_state, meta, current_trace_seq_id);
 }
 
 //for network
@@ -2503,35 +3218,109 @@ static int pending_socketcall_subcall = -1;
 static int pending_socket_domain = -1;
 static int pending_socket_type = -1;
 
-//for dup fd check
-static int pending_dup_fd = -1;
+static void pending_open_reset(void) {
+	g_free(pending_open_path);
+	pending_open_path = NULL;
+	pending_open_is_lib = false;
+	pending_open_write = false;
+	pending_open_flags = 0;
+}
+
+static void pending_fd_reset(void) {
+	memset(&g_pending_fd, 0, sizeof(g_pending_fd));
+}
+
+static void pending_fd_capture(int64_t syscall_num, pending_fd_kind_t kind, int32_t fd, uint64_t result_address) {
+	g_pending_fd.active = true;
+	g_pending_fd.syscall_num = syscall_num;
+	g_pending_fd.kind = kind;
+	g_pending_fd.fd = fd;
+	g_pending_fd.result_address = result_address;
+}
+
+static void apply_pending_fd_success(int64_t syscall_num, int64_t syscall_ret) {
+	pending_fd_operation_t operation = g_pending_fd;
+	pending_fd_reset();
+	if (!operation.active) return;
+	if (operation.syscall_num != syscall_num) {
+		fprintf(stderr, "[PROV] pending fd mismatch: expected=%ld actual=%ld\n", (long)operation.syscall_num, (long)syscall_num);
+		return;
+	}
+
+	switch (operation.kind) {
+		case PENDING_FD_DUP: {
+			int32_t new_fd = (int32_t)(uint32_t)syscall_ret;
+			file_dep_t *file = file_fd ? g_hash_table_lookup(file_fd,GINT_TO_POINTER(operation.fd)) : NULL;
+			if (file) {
+				g_hash_table_insert(file_fd, GINT_TO_POINTER(new_fd), file);
+			}
+			if (g_prov_fd_table && !prov_fd_table_dup(g_prov_fd_table,operation.fd, new_fd, NULL) && file) {
+				fprintf(stderr, "[PROV] failed to duplicate OFD: %d -> %d\n", operation.fd, new_fd);
+			}
+			break;
+		}
+		case PENDING_FD_CLOSE:
+			if (file_fd) {
+				g_hash_table_remove(file_fd, GINT_TO_POINTER(operation.fd));
+			}
+			if (g_prov_fd_table) {
+				(void)prov_fd_table_close(g_prov_fd_table,operation.fd);
+			}
+			break;
+		case PENDING_FD_LSEEK: {
+			uint64_t new_offset = is_i386 ? (uint64_t)(uint32_t)syscall_ret : (uint64_t)syscall_ret;
+			if (g_prov_fd_table) {
+				(void)prov_fd_table_set_offset(g_prov_fd_table, operation.fd, new_offset);
+			}
+			break;
+		}
+		case PENDING_FD_LLSEEK: {
+			uint64_t new_offset = 0;
+			if (!guest_read_uint(operation.result_address,8, &new_offset)) {
+				fprintf(stderr, "[PROV] failed to read _llseek result at 0x%" PRIx64 "\n", operation.result_address);
+				break;
+			}
+			if (g_prov_fd_table) {
+				(void)prov_fd_table_set_offset(g_prov_fd_table, operation.fd, new_offset);
+			}
+			break;
+		}
+		case PENDING_FD_NONE: default:
+			break;
+	}
+}
 
 static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
 	pending_input_reset();
+	pending_open_reset();
+	pending_fd_reset();
 	//x86
 	if (is_i386 && num == 3) { // read
-		pending_input_capture_linear( num, (int32_t)(uint32_t)a1, (uint32_t)a2, (uint32_t)a3, false);
+		pending_input_capture_linear(num, (int32_t)(uint32_t)a1, (uint64_t)(uint32_t)a2, (uint64_t)(uint32_t)a3,
+				false, false, 0);
 	} else if (is_i386 && num == 180) { // pread64
-	pending_input_capture_linear(num, (int32_t)(uint32_t)a1, (uint32_t)a2, (uint32_t)a3,false);
+		uint64_t explicit_offset = (uint64_t)(uint32_t)a4 | ((uint64_t)(uint32_t)a5 << 32);
+		pending_input_capture_linear(num, (int32_t)(uint32_t)a1, (uint64_t)(uint32_t)a2, (uint64_t)(uint32_t)a3,
+				false, true, explicit_offset);
 	} else if (is_i386 && num == 145) { // readv
-		pending_input_capture_iov( num, (int32_t)(uint32_t)a1, (uint32_t)a2, (int32_t)(uint32_t)a3, false);
-	} else if (num == 5) {  //open
-		char *path = read_guest_string(a1);
+		(void)pending_input_capture_iov(num, (int32_t)(uint32_t)a1, (uint64_t)(uint32_t)a2, (int32_t)(uint32_t)a3, false);
+	} else if (is_i386 && num == 5) { //open
+		char *path = read_guest_string((uint32_t)a1);
 		if (path && *path && is_valid_path(path)) {
-			pending_open_is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
-			pending_open_write = ((int)a2 & (1 | 2)) != 0; // w | r
-			pending_open_path = g_strdup(path);
-			g_free(path);
+			pending_open_path = path;
+			pending_open_is_lib = (g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache");
+			pending_open_flags = (uint32_t)a2;
+			pending_open_write = (pending_open_flags & 3U) != 0;
 		} else {
 			g_free(path);
 		}
-	} else if (num == 295) {  //openat
-		char *path = read_guest_string(a2);
+	} else if (is_i386 && num == 295) { // openat
+		char *path = read_guest_string((uint32_t)a2);
 		if (path && *path && is_valid_path(path)) {
-			pending_open_is_lib = ((g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache"));
-			pending_open_write = ((int)a3 & (1 | 2)) != 0; // w | r
-			pending_open_path = g_strdup(path);
-			g_free(path);
+			pending_open_path = path;
+			pending_open_is_lib = (g_str_has_suffix(path, ".so") || strstr(path, ".so.")) && !g_str_has_suffix(path, ".cache");
+			pending_open_flags = (uint32_t)a3;
+			pending_open_write = (pending_open_flags & 3U) != 0;
 		} else {
 			g_free(path);
 		}
@@ -2541,20 +3330,16 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			file_dep_t *f = (file_dep_t*)val;
 			f->write = true;
 		}
-	} else if ((is_i386 && num == 41) || (!is_i386 && num == 32)) {  // dup
-		pending_dup_fd = (int)a1;
-	} else if ((is_i386 && num == 63) || (!is_i386 && num == 33)) {  // dup2
-		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
-		if (val) {
-			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)a2), val);
-		}
-	} else if ((is_i386 && num == 330) || (!is_i386 && num == 292)) {  // dup3
-		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER((int)a1));
-		if (val) {
-			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)a2), val);
-		}
-	} else if (num == 6) {  // close
-		g_hash_table_remove(file_fd, GINT_TO_POINTER((int)a1));
+	} else if (is_i386 && num == 41) { // dup
+		pending_fd_capture(num, PENDING_FD_DUP,(int32_t)(uint32_t)a1, 0);
+	} else if (is_i386 && (num == 63 || num == 330)) { // dup2 &dup3
+		pending_fd_capture(num, PENDING_FD_DUP, (int32_t)(uint32_t)a1, 0);
+	} else if (is_i386 && num == 6) { // close
+		pending_fd_capture(num, PENDING_FD_CLOSE, (int32_t)(uint32_t)a1,0);
+	} else if (is_i386 && num == 19) { // lseek
+		pending_fd_capture(num, PENDING_FD_LSEEK, (int32_t)(uint32_t)a1, 0);
+	} else if (is_i386 && num == 140) { // _llseek
+		pending_fd_capture(num, PENDING_FD_LLSEEK, (int32_t)(uint32_t)a1, (uint64_t)(uint32_t)a4);
 	} else if (num == 33) {  // access
 		char *path = read_guest_string(a1);
 		if (path && *path && is_valid_path(path)) {
@@ -2681,7 +3466,8 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 				}
 			case 10: { // recv
 					int fd = (int)args[0];
-					pending_input_capture_linear(num,fd, args[1],args[2], true);
+					pending_input_capture_linear(num, fd, (uint64_t)args[1], (uint64_t)args[2],
+							true, false, 0);
 					net_dep_t *event = g_new0(net_dep_t, 1);
 					event->fd = fd;
 					g_strlcpy(event->op, "recv", sizeof(event->op));
@@ -2714,7 +3500,8 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 				 }
 			case 12: { // recvfrom
 					 int fd = (int)args[0];
-					 pending_input_capture_linear(num, fd, args[1], args[2], true);
+					 pending_input_capture_linear(num, fd, (uint64_t)args[1], (uint64_t)args[2],
+							 true, false, 0);
 					 net_dep_t *event = g_new0(net_dep_t, 1);
 					 event->fd = fd;
 					 g_strlcpy(event->op, "recv", sizeof(event->op));
@@ -2824,7 +3611,9 @@ static void vpcu_syscall(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num
 			fprintf(stderr, "[NET] sendto fd=%d (no addr)\n", (int)a1);
 		}
 	} else if ((is_i386 && num == 371) || (!is_i386 && num == 45)) {  // recvfrom
-		pending_input_capture_linear(num, (int32_t)(uint32_t)a1,is_i386 ? (uint32_t)a2 : a2, is_i386 ? (uint32_t)a3 : a3,true);
+		pending_input_capture_linear(num, (int32_t)(uint32_t)a1,
+				is_i386 ? (uint64_t)(uint32_t)a2 : a2, is_i386 ? (uint64_t)(uint32_t)a3 : a3,
+				true, false, 0);
 		net_dep_t *event = g_new0(net_dep_t, 1);
 		event->fd = (int)a1;
 		g_strlcpy(event->op,"recv", sizeof(event->op));
@@ -2900,52 +3689,60 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb){
 }
 
 static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t num, int64_t ret) {
+	(void)id;
+	(void)vcpu_idx;
 	const bool syscall_failed = syscall_ret_is_error(ret);
-	apply_pending_input(num, ret);
-
+	if (syscall_failed) {
+		pending_input_reset();
+	} else {
+		apply_pending_input(num, ret);
+	}
 	if (g_pending_mmap.active) {
 		pending_mmap_t pending = g_pending_mmap;
 		memset(&g_pending_mmap, 0, sizeof(g_pending_mmap));
 		if (pending.syscall_num != num) {
-			fprintf(stderr, "[SYSCALL] pending operation mismatch: expected=%ld actual=%ld\n", (long)pending.syscall_num, (long)num);
+			fprintf(stderr,
+				"[SYSCALL] pending operation "
+				"mismatch: expected=%ld actual=%ld\n", (long)pending.syscall_num, (long)num);
 		} else if (syscall_failed) {
-			fprintf(stderr, "[SYSCALL] memory operation failed: num=%ld ret=%ld\n", (long)num, (long)ret);
-		} else if (pending.syscall_num == 90 || pending.syscall_num == 192) { //mmap
-			uint64_t mapped_addr = is_i386 ? (uint64_t)(uint32_t)ret: (uint64_t)ret;
-			apply_pending_mmap(&pending, mapped_addr);
-		} else if (pending.syscall_num == 125 || pending.syscall_num == 380) { //mprotect
+			fprintf(stderr,
+				"[SYSCALL] memory operation "
+				"failed: num=%ld ret=%ld\n", (long)num, (long)ret);
+		} else if (pending.syscall_num == 90 || pending.syscall_num == 192) {
+			uint64_t mapped_address = is_i386 ? (uint64_t)(uint32_t)ret : (uint64_t)ret;
+			apply_pending_mmap(&pending, mapped_address);
+		} else if (pending.syscall_num == 125 || pending.syscall_num == 380) {
 			apply_pending_mprotect(&pending);
-		} else if (pending.syscall_num == 91) { //munmap
+		} else if (pending.syscall_num == 91) {
 			apply_pending_munmap(&pending);
 		}
 	}
-
 	if (syscall_failed) {
 		pending_socketcall_subcall = -1;
 		pending_socket_domain = -1;
-		pending_dup_fd = -1;
-		g_free(pending_open_path);
-		pending_open_path = NULL;
+		pending_socket_type = -1;
+		pending_fd_reset();
+		pending_open_reset();
 		return;
 	}
-
 	if (pending_open_path) {
-		file_dep_t *f = add_file_dep(pending_open_path, pending_open_is_lib);
-		f->write |= pending_open_write;
-		g_hash_table_insert(file_fd, GINT_TO_POINTER((int)ret), f);
-		g_free(pending_open_path);
-		pending_open_path = NULL;
-	}
-
-	if (pending_dup_fd >= 0) { //dup
-		gpointer val = g_hash_table_lookup(file_fd, GINT_TO_POINTER(pending_dup_fd));
-		if (val) {
-			g_hash_table_insert(file_fd, GINT_TO_POINTER((int)ret), val);
+		int32_t fd = (int32_t)(uint32_t)ret;
+		file_dep_t *file = add_file_dep(pending_open_path, pending_open_is_lib);
+		if (file) {
+			file->write |= pending_open_write;
+			g_hash_table_insert(file_fd, GINT_TO_POINTER(fd), file);
+			if (file->resource_id != PROV_RESOURCE_ID_INVALID) {
+				if (!prov_fd_table_bind_new(g_prov_fd_table, fd, file->resource_id, 0, pending_open_flags, NULL)) {
+					fprintf(stderr,
+						"[PROV] failed to bind "
+						"fd=%d resource=%u\n", fd, file->resource_id);
+				}
+			}
 		}
-		pending_dup_fd = -1;
-		return;
+		pending_open_reset();
 	}
-
+	apply_pending_fd_success(num, ret);
+	
 	if ((is_i386 && num == 359) || (!is_i386 && num == 41)) {  // socket
 		if (pending_socket_domain != -1) {
 			net_dep_t *n = g_new0(net_dep_t, 1);
@@ -2983,14 +3780,79 @@ static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx, int64_t
 	}
 }
 
+static void plugin_install_cleanup(bool capstone_initialized, bool metadata_initialized) {
+	dse_lift_attach(NULL, NULL, NULL);
+	g_cur_aux = NULL;
+	if (g_aux) {
+		dse_aux_destroy(g_aux);
+		g_aux = NULL;
+	}
+	if (g_trace) {
+		trace_buffer_destroy(g_trace);
+		g_trace = NULL;
+	}
+	if (g_branch_events) {
+		branch_event_buffer_destroy(g_branch_events);
+		g_branch_events = NULL;
+	}
+	if (resolved_imports_by_slot) {
+		g_hash_table_destroy(resolved_imports_by_slot);
+		resolved_imports_by_slot = NULL;
+	}
+	if (unmapped_pages) {
+		g_hash_table_destroy(unmapped_pages);
+		unmapped_pages = NULL;
+	}
+	if (g_sockets) {
+		g_hash_table_destroy(g_sockets);
+		g_sockets = NULL;
+	}
+	if (file_fd) {
+		g_hash_table_destroy(file_fd);
+		file_fd = NULL;
+	}
+	if (pages) {
+		g_hash_table_destroy(pages);
+		pages = NULL;
+	}
+	insn_exec_contexts_destroy();
+	if (metadata_initialized) {
+		meta_free();
+	}
+	if (capstone_initialized) {
+		cs_close(&cs_handle);
+	}
+	provenance_runtime_destroy();
+	g_clear_pointer(&g_main_image_path, g_free);
+}
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_install(
-    qemu_plugin_id_t id,
-    const qemu_info_t *info,
-    int argc, char **argv)
+	qemu_plugin_id_t id,
+	const qemu_info_t *info,
+	int argc,
+	char **argv)
 {
+	bool capstone_initialized = false;
+	bool metadata_initialized = false;
+	(void)argc;
+	(void)argv;
+	if (!info || !info->target_name) {
+		fprintf(stderr, "[PLUGIN] missing target information\n");
+		return -1;
+	}
+
+	g_analysis_scope_id = (uint64_t)id;
+	if (g_analysis_scope_id == 0) {
+		g_analysis_scope_id = UINT64_C(1);
+	}
+	g_next_resource_object_id = UINT64_C(1);
+	g_main_image_resource_id = PROV_RESOURCE_ID_INVALID;
+	g_main_image_object_id = 0;
+	g_clear_pointer(&g_main_image_path, g_free);
+
 	const char *target = info->target_name;
-	
-	//arch choose
+	current_arch = ARCH_UNKNOWN;
+	is_i386 = false;
 	if (strstr(target, "i386")) {
 		current_arch = ARCH_X86_32;
 		is_i386 = true;
@@ -2999,70 +3861,69 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	} else if (strstr(target, "mips")) {
 		current_arch = ARCH_MIPS;
 	} else {
-		fprintf(stderr, "[PLUGIN] ERROR:%s", target);
+		fprintf(stderr, "[PLUGIN] unsupported architecture: %s\n", target);
 		return -1;
 	}
+
 	fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
-
-	//dse
-	//qemu_plugin_register_vcpu_init_cb(id, dse_vcpu_init);
-
-	//shadow mem init
-	g_shadow = shadow_create(32);
-	if (!g_shadow) {
-		return -1;
+	if (!provenance_runtime_init(32)) {
+		fprintf(stderr, "[PLUGIN] provenance runtime init failed\n");
+		goto fail;
 	}
-	
-	//register taint handler
-	memset(&reg_shadow, 0, sizeof(reg_shadow));
-	//capstone initialization
 	if (cs_open(CS_ARCH_X86, CS_MODE_32, &cs_handle) != CS_ERR_OK) {
 		fprintf(stderr, "[PLUGIN] Capstone init failed\n");
-		return -1;
+		goto fail;
 	}
-	cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON);
-	meta_init();
+	capstone_initialized = true;
+	if (cs_option(cs_handle, CS_OPT_DETAIL, CS_OPT_ON) != CS_ERR_OK) {
+		fprintf(stderr, "[PLUGIN] failed to enable Capstone detail mode\n");
+		goto fail;
+	}
 
+	meta_init();
+	metadata_initialized = true;
 	if (!insn_exec_contexts_init()) {
 		fprintf(stderr, "[PLUGIN] instruction context storage init failed\n");
-		meta_free();
-		cs_close(&cs_handle);
-		shadow_destroy(g_shadow);
-		g_shadow = NULL;
-		return -1;
+		goto fail;
 	}
 
-	//needed hashtables
 	pages = g_hash_table_new(g_direct_hash, g_direct_equal);
 	file_fd = g_hash_table_new(g_direct_hash, g_direct_equal);
 	g_sockets = g_hash_table_new(g_direct_hash, g_direct_equal);
-	//munmaped pages
 	unmapped_pages = g_hash_table_new(g_direct_hash, g_direct_equal);
-
-	//got
 	resolved_imports_by_slot = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-	//callback funcs
-	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
-	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
-	qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
-	
-	//tracer
+	if (!pages || !file_fd || !g_sockets || !unmapped_pages || !resolved_imports_by_slot) {
+		fprintf(stderr, "[PLUGIN] hash table init failed\n");
+		goto fail;
+	}
 	g_trace = trace_buffer_create(256 * 1024);
 	if (!g_trace) {
 		fprintf(stderr, "[PLUGIN] Trace buffer init failed\n");
-	return -1;
+		goto fail;
+	}
+	g_branch_events = branch_event_buffer_create(64U * 1024U);
+	if (!g_branch_events) {
+		fprintf(stderr, "[PLUGIN] branch event buffer init failed\n");
+		goto fail;
 	}
 	g_aux = dse_aux_create(256 * 1024);
 	if (!g_aux) {
 		fprintf(stderr, "[PLUGIN] aux ring init failed\n");
-		return -1;
+		goto fail;
 	}
-
 	dse_lift_attach(g_trace, g_aux, &dse_arch_x86);
 
-	//exit
 	qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
+	qemu_plugin_register_vcpu_init_cb(id, dse_vcpu_init);
+	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+	qemu_plugin_register_vcpu_syscall_cb(id, vpcu_syscall);
+	qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
 
 	return 0;
+
+fail:
+	plugin_install_cleanup(capstone_initialized, metadata_initialized);
+	
+	return -1;
 }

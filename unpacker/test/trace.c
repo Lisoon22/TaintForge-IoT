@@ -64,3 +64,53 @@ void trace_reset(TraceBuffer *tb) {
 	tb->head_pointer = 0;
 	tb->counter = 0;
 }
+
+BranchEventBuffer *branch_event_buffer_create(uint32_t capacity) {
+	if (capacity == 0 || (capacity & (capacity - 1U)) != 0) {
+		return NULL;
+	}
+	BranchEventBuffer *buffer = calloc(1, sizeof(*buffer));
+	if (!buffer) return NULL;
+	buffer->events = calloc(capacity, sizeof(*buffer->events));
+	if (!buffer->events) {
+		free(buffer);
+		return NULL;
+	}
+	buffer->capacity = capacity;
+	buffer->next_event_id = 1;
+	return buffer;
+}
+
+void branch_event_buffer_destroy(BranchEventBuffer *buffer) {
+	if (!buffer) return;
+	free(buffer->events);
+	free(buffer);
+}
+
+const BranchEvent *branch_event_append(BranchEventBuffer *buffer, const BranchEvent *event) {
+	if (!buffer || !event || buffer->next_event_id == 0) {
+		return NULL;
+	}
+	uint32_t index =buffer->head_pointer & (buffer->capacity - 1U);
+	buffer->events[index] = *event;
+	buffer->events[index].event_id = buffer->next_event_id++;
+	buffer->head_pointer++;
+	if (buffer->counter < buffer->capacity) {
+		buffer->counter++;
+	}
+	return &buffer->events[index];
+}
+
+const BranchEvent *branch_event_get_last(const BranchEventBuffer *buffer, uint32_t back_index) {
+	if (!buffer || back_index >= buffer->counter) {
+		return NULL;
+	}
+	uint32_t index = (buffer->head_pointer - 1U - back_index) & (buffer->capacity - 1U);
+	return &buffer->events[index];
+}
+
+void branch_event_buffer_reset(BranchEventBuffer *buffer) {
+	if (!buffer) return;
+	buffer->head_pointer = 0;
+	buffer->counter = 0;
+}

@@ -1,25 +1,14 @@
 {
-  "oep": "0x8099790",
+  "oep": "0x0",
   "arch": "x86",
-  "oep_confidence": 0.3000,
-  "oep_candidates": [
-    {"addr": "0x8099790", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 139, "concretized": 0, "total": 139, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 140, "address_failures": 0, "generation": 1},
-    {"addr": "0x806af50", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 403, "concretized": 0, "total": 403, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 404, "address_failures": 0, "generation": 2},
-    {"addr": "0x80a0440", "score": 0.3000, "confidence": 0.3000, "dse_verdict": "UNKNOWN", "dse_evidence": "NONE", "dse_reason": "PATH_MODEL_INCOMPLETE", "candidate_query": "NOT_RUN", "alternative_query": "NOT_RUN", "target_symbolic": true, "target_tainted": true, "slice_complete": false, "slice_len": 151, "concretized": 0, "total": 151, "aux_miss": 0, "unsupported": 0, "meta_missing": 0, "address_constraints": 152, "address_failures": 0, "generation": 3}
-  ],
-  "base": "0x8048000",
+  "oep_confidence": 0.0000,
+  "base": "0x0",
   "regions": [
-    {"addr": "0x8048000", "size": 4096, "prot": 1, "offset": 0, "lib": false, "module": "static"},
-    {"addr": "0x8049000", "size": 462848, "prot": 5, "offset": 4096, "lib": false, "module": "static"},
-    {"addr": "0x80ba000", "size": 208896, "prot": 1, "offset": 466944, "lib": false, "module": "static"},
-    {"addr": "0x80ed000", "size": 16384, "prot": 3, "offset": 675840, "lib": false, "module": "static"}
   ],
-  "file_dependencies": [    {"path": "/proc/self/exe", "write": false},
-    {"path": "/tmp/testfile.txt", "write": true}],
+  "file_dependencies": [],
   "library_dependencies": [],
   "resolved_imports": [],
   "network_dependencies": [
-    {"op":"socket","fd":3,"domain":"AF_INET","type":"tcp"},
-    {"op":"connect","fd":3,"ip":"127.0.0.1","port":80,"type":"tcp"}
+
   ]
 }
