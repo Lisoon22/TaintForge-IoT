@@ -91,6 +91,7 @@ typedef struct {
 	bool is_indirect_branch;
 	uint16_t insn_id;
 	RegId branch_target_reg;
+	RegSlice branch_target_slice;
 	DtaInsnFamily family;
 	uint32_t mem_addr_reg_mask;
 	uint32_t mem_read_addr_reg_mask;

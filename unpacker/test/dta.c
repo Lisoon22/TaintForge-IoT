@@ -2017,6 +2017,7 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 	memcpy(m->instr_bytes, bytes, m->size);
 	m->insn_id = insn->id;
 	m->branch_target_reg = REG_INVALID;
+	m->branch_target_slice = reg_slice_invalid();
 	m->family = classify_x86_insn(insn->id);
 	m->condition_code = x86_condition_code(insn->id);
 	m->flags_read_mask =x86_condition_flag_mask(m->condition_code);
@@ -2029,9 +2030,11 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 	if (insn->detail) {
 		//lookup on W/R flag
 		cs_x86 *x86 = &insn->detail->x86;
-		if (m->is_conditional_branch && x86->op_count > 0 && x86->operands[0].type == X86_OP_IMM) {
+		if ((m->is_conditional_branch || insn->id == X86_INS_JMP || insn->id == X86_INS_CALL) &&
+		    x86->op_count > 0 && x86->operands[0].type == X86_OP_IMM) {
 			m->direct_target_valid = true;
-			m->direct_target = (uint64_t)(uint32_t)x86->operands[0].imm;
+			m->direct_target =
+				(uint64_t)x86->operands[0].imm;
 		}
 		for (unsigned prefix_index = 0;prefix_index < (sizeof(x86->prefix) / sizeof(x86->prefix[0])); prefix_index++) {
 			if (x86->prefix[prefix_index] == 0xf2 || x86->prefix[prefix_index] == 0xf3) {
@@ -2075,7 +2078,7 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 			m->has_mem_write = false;
 			m->mem_read_addr_reg_mask = 0;
 			m->mem_write_addr_reg_mask = 0;
-		}
+		} 
 		if (m->is_self_zeroing && m->reg_write_count == 0) {
 			RegSlice dst =reg_slice_from_x86(x86->operands[0].reg,x86->operands[0].size);
 			if (reg_slice_is_valid(dst)) {
@@ -2232,7 +2235,8 @@ InsnMeta *meta_decode(const uint8_t *bytes, size_t size, uint64_t pc, csh handle
 			if (x86->op_count > 0) {
 				if (x86->operands[0].type == X86_OP_REG) {
 					m->is_indirect_branch = true;
-					m->branch_target_reg = x86_reg_to_rid(x86->operands[0].reg);
+					m->branch_target_slice = reg_slice_from_x86(x86->operands[0].reg, x86->operands[0].size);
+					m->branch_target_reg = reg_slice_is_valid(m->branch_target_slice) ? m->branch_target_slice.reg_id : REG_INVALID;
 				} else if (x86->operands[0].type == X86_OP_MEM) {
 					uint32_t target_address = x86_mem_address_reg_mask(&x86->operands[0]);
 					m->is_indirect_branch = true;

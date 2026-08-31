@@ -3,7 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+
 #include "dta.h"
+#include "dcfg.h"
 
 typedef struct {
 	uint64_t seq_id;
@@ -48,6 +50,7 @@ typedef struct {
 	X86ConditionCode condition_code;
 	BranchOutcome outcome;
 	ProvLabelId condition_label;
+	DcfgEdgeId dcfg_edge_id;
 } BranchEvent;
 
 typedef struct {

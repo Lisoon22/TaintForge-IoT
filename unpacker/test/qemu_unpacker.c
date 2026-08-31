@@ -12,6 +12,7 @@
 #include "dta.h"
 #include "trace.h"
 #include "dse.h"
+#include "dcfg.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -88,6 +89,7 @@ static csh cs_handle;
 static TraceBuffer *g_trace = NULL;
 static DseAuxRing *g_aux = NULL;
 static BranchEventBuffer *g_branch_events = NULL;
+static DcfgGraph *g_dcfg = NULL;
 static uint64_t g_analysis_scope_id = UINT64_C(1);
 static uint64_t g_next_resource_object_id = UINT64_C(1);
 static char *g_main_image_path = NULL;
@@ -229,10 +231,40 @@ typedef struct {
 } dta_mem_transfer_t;
 
 typedef struct {
+	bool active;
+	DcfgEdgeKind kind;
+	DcfgNodeKey source;
+	uint64_t instruction_pc;
+	uint64_t trace_seq_id;
+
+	bool expected_target_valid;
+	uint64_t expected_target;
+	ProvLabelId target_label;
+} dcfg_pending_transfer_t;
+
+typedef struct {
 	DtaVcpuState dta;
 	dta_mem_transfer_t mem_transfer;
 	uint64_t current_ip;
+
+	dcfg_pending_transfer_t dcfg_pending_transfer;
+	bool dcfg_block_active;
+	DcfgNodeKey dcfg_block_key;
+	bool dcfg_last_insn_valid;
+	uint64_t dcfg_last_insn_pc;
+	uint8_t dcfg_last_insn_size;
 } PluginVcpuState;
+
+static uint32_t next_code_generation(void) {
+	uint32_t observed = __atomic_load_n(&g_unpack_gen, __ATOMIC_RELAXED);
+	while (observed != UINT32_MAX) {
+		uint32_t desired = observed + 1U;
+		if (__atomic_compare_exchange_n(&g_unpack_gen, &observed, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			return desired;
+		}
+	}
+	return UINT32_MAX;
+}
 
 static GPtrArray *g_vcpu_states = NULL;
 static GMutex g_vcpu_states_lock;
@@ -549,6 +581,10 @@ static bool shadow_fill_incomplete(uint64_t address, uint64_t size, uint64_t rea
 
 static ProvLabelId dta_incomplete_unknown_label(uint64_t reasons);
 
+static bool dse_read_reg(int rid, uint64_t *out);
+
+static bool dse_resolve_mem_target(uint64_t vaddr, const InsnMeta *meta, uint64_t *out_addr, uint64_t *out_val);
+
 static const char *branch_outcome_name(BranchOutcome outcome) {
 	switch (outcome) {
 		case BRANCH_OUTCOME_TAKEN:
@@ -609,44 +645,431 @@ static void log_branch_root_set(uint64_t event_id, const char *channel, ProvRoot
 	}
 }
 
+static void log_dcfg_target_root_set(DcfgEdgeId edge_id, uint64_t sequence_id, const char *channel, ProvRootSetId set_id) {
+	if (!g_prov_registry || !channel) {
+		return;
+	}
+	ProvRootSetView set;
+	if (!prov_root_set_get(g_prov_registry, set_id, &set)) {
+		return;
+	}
+	for (uint32_t index = 0; index < set.count; index++) {
+		ProvRootKey root;
+		if (!prov_root_get(g_prov_registry, set.roots[index], &root)) {
+			continue;
+		}
+		if (root.kind == PROV_ROOT_RESOURCE_BYTE) {
+			ProvResourceView resource;
+			const char *name = "<unknown>";
+			if (root.source_id <= UINT32_MAX && prov_resource_get(g_prov_registry, (ProvResourceId)root.source_id, &resource) && resource.display_name) {
+				name = resource.display_name;
+			}
+			fprintf(
+				stderr,
+				"[DCFG-TARGET-ROOT] edge=%u"
+				" seq=%" PRIu64
+				" channel=%s root=%u"
+				" resource=%" PRIu64
+				" path=%s offset=%" PRIu64 "\n",
+				edge_id,
+				sequence_id,
+				channel,
+				set.roots[index],
+				root.source_id,
+				name,
+				root.offset);
+		} else {
+			fprintf(
+				stderr,
+				"[DCFG-TARGET-ROOT] edge=%u"
+				" seq=%" PRIu64
+				" channel=%s root=%u"
+				" kind=%u source=%" PRIu64
+				" discriminator=%u"
+				" offset=%" PRIu64
+				" instance=%" PRIu64 "\n",
+				edge_id,
+				sequence_id,
+				channel,
+				set.roots[index],
+				(unsigned)root.kind,
+				root.source_id,
+				root.discriminator,
+				root.offset,
+				root.semantic_instance);
+		}
+	}
+}
+
+static uint32_t dcfg_code_generation_for_pc(uint64_t pc) {
+	if (!pages ||page_size == 0 || (page_size & (page_size - 1U)) != 0) {
+		return 0;
+	}
+	uint64_t page_address = pc & ~((uint64_t)page_size - 1U);
+	page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_address);
+	return page ? page->gen_written : 0;
+}
+
+static DcfgNodeKey dcfg_node_key_for_pc(uint64_t pc) {
+	DcfgNodeKey key = {
+		.start_pc = is_i386 ? (uint64_t)(uint32_t)pc : pc,
+		.code_generation = dcfg_code_generation_for_pc(pc),
+		.bytes_hash = 0
+	};
+	return key;
+}
+
+static void dcfg_set_current_block(PluginVcpuState *vcpu_state, DcfgNodeKey key) {
+	if (!vcpu_state) return;
+	vcpu_state->dcfg_block_active = true;
+	vcpu_state->dcfg_block_key = key;
+}
+
+static void dcfg_track_instruction(PluginVcpuState *vcpu_state, uint64_t pc, uint8_t size) {
+	if (!vcpu_state) return;
+	bool contiguous = false;
+	if (vcpu_state->dcfg_last_insn_valid) {
+		uint64_t expected = vcpu_state->dcfg_last_insn_pc + vcpu_state->dcfg_last_insn_size;
+		if (is_i386) expected = (uint32_t)expected;
+		contiguous = guest_pc_equal(pc, expected);
+	}
+	if (!vcpu_state->dcfg_block_active || !contiguous) {
+		dcfg_set_current_block(vcpu_state, dcfg_node_key_for_pc(pc));
+	}
+	vcpu_state->dcfg_last_insn_valid = true;
+	vcpu_state->dcfg_last_insn_pc = is_i386 ? (uint64_t)(uint32_t)pc : pc;
+	vcpu_state->dcfg_last_insn_size = size;
+}
+
+static DcfgEdgeKind dcfg_jcc_kind(BranchOutcome outcome) {
+	switch (outcome) {
+		case BRANCH_OUTCOME_TAKEN:
+			return DCFG_EDGE_JCC_TAKEN;
+		case BRANCH_OUTCOME_NOT_TAKEN:
+			return DCFG_EDGE_JCC_FALLTHROUGH;
+		case BRANCH_OUTCOME_UNKNOWN: default:
+			return DCFG_EDGE_JCC_UNKNOWN;
+	}
+}
+
+static DcfgEdgeKind dcfg_control_transfer_kind(const InsnMeta *meta) {
+	if (!meta || meta->is_conditional_branch) {
+		return DCFG_EDGE_INVALID;
+	}
+	switch (meta->insn_id) {
+		case X86_INS_JMP:
+			return meta->is_indirect_branch ? DCFG_EDGE_INDIRECT_JMP : DCFG_EDGE_DIRECT_JMP;
+		case X86_INS_CALL:
+			return DCFG_EDGE_CALL;
+		case X86_INS_RET:
+			return DCFG_EDGE_RET;
+		default:
+			return DCFG_EDGE_INVALID;
+	}
+}
+
+static void log_dcfg_transfer(const dcfg_pending_transfer_t *pending, DcfgEdgeId edge_id) {
+	if (!pending || !g_dcfg || edge_id == DCFG_EDGE_ID_INVALID) {
+		return;
+	}
+	DcfgEdgeView edge;
+	DcfgNodeView source;
+	DcfgNodeView target;
+	if (!dcfg_edge_get(g_dcfg, edge_id, &edge) || !dcfg_node_get(g_dcfg, edge.source_node, &source) || !dcfg_node_get(g_dcfg, edge.target_node, &target)) {
+		return;
+	}
+	ProvLabelView target_label;
+	bool target_label_valid = g_prov_registry && prov_label_get(g_prov_registry, pending->target_label, &target_label);
+	uint8_t complete_mask = target_label_valid ? target_label.complete_mask : 0;
+	uint64_t incomplete_reasons = target_label_valid ? target_label.incomplete_reasons : PROV_INCOMPLETE_UNKNOWN;
+	fprintf(stderr,
+		"[DCFG-XFER] edge=%u"
+		" src-node=%u dst-node=%u"
+		" src=0x%" PRIx64
+		" dst=0x%" PRIx64
+		" pc=0x%" PRIx64
+		" src-gen=%u dst-gen=%u"
+		" kind=%s count=%" PRIu64
+		" seq=%" PRIu64
+		" expected-valid=%u"
+		" expected=0x%" PRIx64
+		" target-label=%u"
+		" target-summary=%u"
+		" complete=0x%02x"
+		" reasons=0x%" PRIx64 "\n",
+		edge.edge_id,
+		edge.source_node,
+		edge.target_node,
+		source.key.start_pc,
+		target.key.start_pc,
+		pending->instruction_pc,
+		source.key.code_generation,
+		target.key.code_generation,
+		dcfg_edge_kind_name(edge.kind),
+		edge.occurrence_count,
+		pending->trace_seq_id,
+		pending->expected_target_valid ? 1U : 0U,
+		pending->expected_target,
+		pending->target_label,
+		edge.target_summary,
+		complete_mask,
+		incomplete_reasons);
+	if (target_label_valid) {
+		log_dcfg_target_root_set(edge_id, pending->trace_seq_id, "data", target_label.data_roots);
+		log_dcfg_target_root_set(edge_id, pending->trace_seq_id, "address", target_label.address_roots);
+	}
+}
+
+static void finalize_pending_transfer(PluginVcpuState *vcpu_state, uint64_t observed_next_pc) {
+	if (!vcpu_state || !vcpu_state->dcfg_pending_transfer.active) {
+		return;
+	}
+	dcfg_pending_transfer_t pending =vcpu_state->dcfg_pending_transfer;
+	memset(&vcpu_state->dcfg_pending_transfer,0, sizeof(vcpu_state->dcfg_pending_transfer));
+	DcfgNodeKey target_key = dcfg_node_key_for_pc(observed_next_pc);
+	dcfg_set_current_block(vcpu_state, target_key);
+
+	if (pending.expected_target_valid && !guest_pc_equal(pending.expected_target, observed_next_pc)) {
+		fprintf(stderr,
+			"[DCFG] transfer target mismatch"
+			" pc=0x%" PRIx64
+			" expected=0x%" PRIx64
+			" observed=0x%" PRIx64 "\n",
+			pending.instruction_pc,
+			pending.expected_target,
+			observed_next_pc);
+	}
+
+	if (!g_dcfg) return;
+	DcfgBranchObservation observation = {
+		.source = pending.source,
+		.target = target_key,
+		.kind = pending.kind,
+		.branch_seq_id = pending.trace_seq_id,
+		.vcpu_index = vcpu_state->dta.vcpu_index,
+		.condition_label = PROV_LABEL_CLEAN,
+		.target_label = pending.target_label
+	};
+	DcfgEdgeId edge_id = DCFG_EDGE_ID_INVALID;
+
+	if (!dcfg_record_branch(g_dcfg, &observation, &edge_id)) {
+		fprintf(
+			stderr,
+			"[DCFG] failed to record transfer"
+			" pc=0x%" PRIx64
+			" next=0x%" PRIx64
+			" seq=%" PRIu64 "\n",
+			pending.instruction_pc,
+			observed_next_pc,
+			pending.trace_seq_id);
+		return;
+	}
+	log_dcfg_transfer(&pending, edge_id);
+}
+
+static ProvLabelId dcfg_join_target_labels(const ProvLabelId *labels, uint32_t count, uint64_t failure_reason) {
+	if (!g_prov_registry || (count != 0 && !labels)) {
+		return PROV_LABEL_ID_INVALID;
+	}
+	ProvLabelId joined = prov_label_join_many(g_prov_registry, labels, count);
+	if (joined != PROV_LABEL_ID_INVALID) {
+		return joined;
+	}
+	return dta_incomplete_unknown_label(failure_reason);
+}
+
+static ProvLabelId dcfg_register_target_label(const dta_mem_transfer_t *transfer, const InsnMeta *meta) {
+	if (!transfer || !meta || !reg_slice_is_valid(meta->branch_target_slice)) {
+		return dta_incomplete_unknown_label(
+			PROV_INCOMPLETE_IMPLICIT_OPERAND);
+	}
+	ProvLabelId labels[MAX_REG_BYTES];
+	if (!reg_slice_load_labels(&transfer->pre_regs, meta->branch_target_slice, labels)) {
+		return dta_incomplete_unknown_label(
+			PROV_INCOMPLETE_IMPLICIT_OPERAND);
+	}
+	return dcfg_join_target_labels(labels, meta->branch_target_slice.width, PROV_INCOMPLETE_IMPLICIT_OPERAND);
+}
+
+static ProvLabelId dcfg_memory_target_label(uint64_t instruction_pc, const dta_mem_transfer_t *transfer, const InsnMeta *meta, bool *out_expected_target_valid, uint64_t *out_expected_target) {
+	if (out_expected_target_valid) {
+		*out_expected_target_valid = false;
+	}
+	if (out_expected_target) {
+		*out_expected_target = 0;
+	}
+	if (!g_shadow || !transfer || !meta) {
+		return dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+	}
+
+	uint64_t target_address = 0;
+	uint64_t target_value = 0;
+	if (!dse_resolve_mem_target(instruction_pc, meta,
+			&target_address,&target_value)) {
+		return dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+	}
+	if (is_i386) {
+		target_value = (uint32_t)target_value;
+	}
+	if (out_expected_target_valid) {
+		*out_expected_target_valid = true;
+	}
+	if (out_expected_target) {
+		*out_expected_target = target_value;
+	}
+	uint32_t width = guest_ptr_bytes();
+	if (width == 0 || width > MAX_REG_BYTES) {
+		return dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+	}
+
+	ProvLabelId raw_labels[MAX_REG_BYTES];
+	ProvLabelId effective_labels[MAX_REG_BYTES];
+	if (!shadow_load_labels(g_shadow, target_address,
+			raw_labels, width) ||
+			!dta_effective_mem_read_labels(
+				&transfer->pre_regs, meta, raw_labels,
+				(uint8_t)width, effective_labels)) {
+		return dta_incomplete_unknown_label(PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+	}
+
+	return dcfg_join_target_labels(effective_labels, width, PROV_INCOMPLETE_UNRESOLVED_MEMORY);
+}
+
+static void begin_pending_transfer(PluginVcpuState *vcpu_state, const InsnMeta *meta, uint64_t trace_seq_id) {
+	if (!vcpu_state || !meta || trace_seq_id == 0) {
+		return;
+	}
+	DcfgEdgeKind kind = dcfg_control_transfer_kind(meta);
+	if (kind == DCFG_EDGE_INVALID) return;
+	dcfg_pending_transfer_t pending;
+	memset(&pending, 0, sizeof(pending));
+	pending.active = true;
+	pending.kind = kind;
+	pending.source = vcpu_state->dcfg_block_active ? vcpu_state->dcfg_block_key : dcfg_node_key_for_pc(meta->pc);
+	pending.instruction_pc = is_i386 ? (uint64_t)(uint32_t)meta->pc : meta->pc;
+	pending.trace_seq_id = trace_seq_id;
+	pending.target_label = PROV_LABEL_CLEAN;
+
+	if (meta->direct_target_valid) {
+		pending.expected_target_valid = true;
+		pending.expected_target = is_i386 ? (uint64_t)(uint32_t)meta->direct_target : meta->direct_target;
+	} else if (meta->is_indirect_branch && meta->branch_target_reg >= 0 && meta->branch_target_reg < REG_COUNT) {
+		pending.target_label = dcfg_register_target_label(&vcpu_state->mem_transfer, meta);
+		uint64_t concrete_target = 0;
+		if (dse_read_reg(meta->branch_target_reg, &concrete_target)) {
+			uint32_t shift = (uint32_t) meta->branch_target_slice.byte_offset * 8U;
+			uint32_t bits = (uint32_t) meta->branch_target_slice.width * 8U;
+			concrete_target >>= shift;
+			if (bits < 64U) {
+				concrete_target &= (UINT64_C(1) << bits) - UINT64_C(1);
+			}
+			pending.expected_target_valid = true;
+			pending.expected_target = is_i386 ? (uint64_t)(uint32_t)concrete_target : concrete_target;
+		}
+	} else if (meta->is_indirect_branch) {
+		pending.target_label = dcfg_memory_target_label(pending.instruction_pc, &vcpu_state->mem_transfer, meta,
+				&pending.expected_target_valid, &pending.expected_target);
+	}
+	if (!g_prov_registry ||!prov_label_is_valid(g_prov_registry, pending.target_label)) {
+		pending.target_label = dta_incomplete_unknown_label(PROV_INCOMPLETE_UNKNOWN);
+	}
+	if (pending.target_label == PROV_LABEL_ID_INVALID) {
+		return;
+	}
+	vcpu_state->dcfg_pending_transfer = pending;
+}
+
+static void log_dcfg_branch(const BranchEvent *event) {
+	if (!event || !g_dcfg || event->dcfg_edge_id == DCFG_EDGE_ID_INVALID) {
+		return;
+	}
+	DcfgEdgeView edge;
+	DcfgNodeView source;
+	DcfgNodeView target;
+	if (!dcfg_edge_get(g_dcfg, event->dcfg_edge_id, &edge) || !dcfg_node_get(g_dcfg, edge.source_node, &source) || !dcfg_node_get(g_dcfg, edge.target_node, &target)) {
+		return;
+	}
+	fprintf(
+		stderr,
+		"[DCFG-JCC] event=%" PRIu64
+		" edge=%u"
+		" src-node=%u"
+		" dst-node=%u"
+		" src=0x%" PRIx64
+		" dst=0x%" PRIx64
+		" pc=0x%" PRIx64
+		" src-gen=%u"
+		" dst-gen=%u"
+		" kind=%s"
+		" count=%" PRIu64
+		" seq=%" PRIu64
+		" label=%u\n",
+		event->event_id,
+		edge.edge_id,
+		edge.source_node,
+		edge.target_node,
+		source.key.start_pc,
+		target.key.start_pc,
+		event->pc,
+		source.key.code_generation,
+		target.key.code_generation,
+		dcfg_edge_kind_name(edge.kind),
+		edge.occurrence_count,
+		event->branch_seq_id,
+		event->condition_label);
+}
+
 static void log_branch_event(const BranchEvent *event) {
 	if (!event || !g_prov_registry) {
 		return;
 	}
 	ProvLabelView label;
 	if (!prov_label_get(g_prov_registry, event->condition_label, &label)) {
-		fprintf(
-			stderr,
+		fprintf(stderr,
 			"[BRANCH-PROV] event=%" PRIu64
 			" invalid-label=%u\n",
-			event->event_id, event->condition_label);
+			event->event_id,
+			event->condition_label);
 		return;
 	}
-	fprintf(
-		stderr,
+	fprintf(stderr,
 		"[BRANCH-PROV] event=%" PRIu64
+		" edge=%u"
 		" seq=%" PRIu64
 		" vcpu=%u pc=0x%" PRIx64
 		" next=0x%" PRIx64
 		" outcome=%s cc=%u label=%u"
 		" complete=0x%02x reasons=0x%" PRIx64 "\n",
-		event->event_id, event->branch_seq_id,
-		event->vcpu_index, event->pc, event->observed_next_pc,
-		branch_outcome_name(event->outcome), (unsigned)event->condition_code,
-		event->condition_label, label.complete_mask, label.incomplete_reasons);
+		event->event_id,
+		event->dcfg_edge_id,
+		event->branch_seq_id,
+		event->vcpu_index,
+		event->pc,
+		event->observed_next_pc,
+		branch_outcome_name(event->outcome),
+		(unsigned)event->condition_code,
+		event->condition_label,
+		label.complete_mask,
+		label.incomplete_reasons);
+
 	log_branch_root_set(event->event_id, "data", label.data_roots);
 	log_branch_root_set(event->event_id, "address", label.address_roots);
+	log_dcfg_branch(event);
 }
 
 static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observed_next_pc) {
 	if (!vcpu_state || !vcpu_state->dta.pending_branch.active) {
 		return;
 	}
-	DtaPendingBranch pending =vcpu_state->dta.pending_branch;
+	DtaPendingBranch pending = vcpu_state->dta.pending_branch;
 	dta_pending_branch_clear(&vcpu_state->dta);
+	DcfgNodeKey source_key = vcpu_state->dcfg_block_active ? vcpu_state->dcfg_block_key : dcfg_node_key_for_pc(pending.pc);
+	DcfgNodeKey target_key = dcfg_node_key_for_pc(observed_next_pc);
+	dcfg_set_current_block(vcpu_state, target_key);
 	if (!g_branch_events) return;
 	BranchEvent event;
 	memset(&event, 0, sizeof(event));
+
 	event.branch_seq_id = pending.seq_id;
 	event.vcpu_index = vcpu_state->dta.vcpu_index;
 	event.meta_id = pending.meta_id;
@@ -657,7 +1080,9 @@ static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observ
 	event.observed_next_pc = observed_next_pc;
 	event.condition_code = pending.condition_code;
 	event.condition_label = pending.condition_label;
+	event.dcfg_edge_id = DCFG_EDGE_ID_INVALID;
 	event.outcome = BRANCH_OUTCOME_UNKNOWN;
+
 	bool is_fallthrough = guest_pc_equal(observed_next_pc, pending.fallthrough);
 	bool is_target = pending.direct_target_valid && guest_pc_equal(observed_next_pc, pending.direct_target);
 	if (is_fallthrough && !is_target) {
@@ -665,7 +1090,27 @@ static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observ
 	} else if (is_target && !is_fallthrough) {
 		event.outcome = BRANCH_OUTCOME_TAKEN;
 	}
-
+	if (g_dcfg) {
+		DcfgBranchObservation observation = {
+			.source = source_key,
+			.target = target_key,
+			.kind = dcfg_jcc_kind(event.outcome),
+			.branch_seq_id = event.branch_seq_id,
+			.vcpu_index = event.vcpu_index,
+			.condition_label = event.condition_label,
+			.target_label = PROV_LABEL_CLEAN
+		};
+		if (!dcfg_record_branch(g_dcfg, &observation, &event.dcfg_edge_id)) {
+			fprintf(stderr,
+				"[DCFG] failed to record Jcc"
+				" pc=0x%" PRIx64
+				" next=0x%" PRIx64
+				" seq=%" PRIu64 "\n",
+				event.pc,
+				event.observed_next_pc,
+				event.branch_seq_id);
+		}
+	}
 	const BranchEvent *stored = branch_event_append(g_branch_events, &event);
 	if (stored) {
 		log_branch_event(stored);
@@ -1716,52 +2161,88 @@ static void lib_update_mapping(uint32_t fd, uint64_t addr, uint64_t size) {
 	}
 }
 
-static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_addr){
+static void apply_pending_mmap(const pending_mmap_t *pending, uint64_t mapped_addr) {
 	if (!pending || !pending->active || pending->size == 0) {
 		return;
 	}
-	if (page_size == 0 || (page_size & (page_size - 1)) != 0) {
-		fprintf(stderr,"[MMAP] invalid page size: 0x%lx\n",(unsigned long)page_size);
+	if (page_size == 0 || (page_size & (page_size - 1U)) != 0) {
+		fprintf(stderr,
+			"[MMAP] invalid page size: 0x%lx\n",
+			(unsigned long)page_size);
 		return;
 	}
-	if ((pending->size - 1) > UINT64_MAX - mapped_addr) {
-		fprintf(stderr,"[MMAP] range overflow: addr=0x%lx size=0x%lx\n", (unsigned long)mapped_addr, (unsigned long)pending->size);
+	if ((pending->size - 1U) > UINT64_MAX - mapped_addr) {
+		fprintf(stderr,
+			"[MMAP] range overflow:"
+			" addr=0x%lx size=0x%lx\n",
+			(unsigned long)mapped_addr,
+			(unsigned long)pending->size);
 		return;
 	}
-	const char *name = (pending->syscall_num == 192) ? "mmap2" : "mmap";
-
-	fprintf(stderr, "[SYSCALL] %s requested=0x%lx mapped=0x%lx size=0x%lx prot=0x%x flags=0x%x fd=%d offset=0x%lx\n", name, (unsigned long)pending->requested_addr, (unsigned long)mapped_addr, (unsigned long)pending->size, pending->prot, pending->flags, pending->fd, (unsigned long)pending->offset);
+	const char *name = pending->syscall_num == 192 ? "mmap2" : "mmap";
+	fprintf(
+		stderr,
+		"[SYSCALL] %s"
+		" requested=0x%lx"
+		" mapped=0x%lx"
+		" size=0x%lx"
+		" prot=0x%x"
+		" flags=0x%x"
+		" fd=%d"
+		" offset=0x%lx\n",
+		name,
+		(unsigned long)pending->requested_addr,
+		(unsigned long)mapped_addr,
+		(unsigned long)pending->size,
+		pending->prot,
+		pending->flags,
+		pending->fd,
+		(unsigned long)pending->offset);
 	lib_update_mapping((uint32_t)pending->fd, mapped_addr, pending->size);
-
-	uint64_t page_mask = (uint64_t)page_size - 1;
-	uint64_t last_addr = mapped_addr + pending->size - 1;
+	uint64_t page_mask = (uint64_t)page_size - 1U;
+	uint64_t last_addr = mapped_addr + pending->size - 1U;
 	uint64_t page_start = mapped_addr & ~page_mask;
 	uint64_t page_last = last_addr & ~page_mask;
-	uint64_t mapped_size = (page_last - page_start) +(uint64_t)page_size;
+	uint64_t mapped_size = (page_last - page_start) + (uint64_t)page_size;
 	shadow_untaint_range(g_shadow, page_start, mapped_size);
 	bool anonymous_mapping = (pending->flags & GUEST_MAP_ANONYMOUS) != 0 || pending->fd < 0;
+
 	if (!anonymous_mapping && fd_is_taint_source(pending->fd)) {
-		if (!shadow_taint_range(g_shadow, mapped_addr, pending->size,0)) {
-			fprintf(stderr, "[DTA] failed to taint file-backed mmap addr=0x%lx size=0x%lx fd=%d\n", (unsigned long)mapped_addr, (unsigned long)pending->size, pending->fd);
+		if (!shadow_taint_range(g_shadow, mapped_addr, pending->size, 0)) {
+			fprintf(
+				stderr,
+				"[DTA] failed to taint"
+				" file-backed mmap"
+				" addr=0x%lx"
+				" size=0x%lx"
+				" fd=%d\n",
+				(unsigned long)mapped_addr,
+				(unsigned long)pending->size,
+				pending->fd);
 		} else {
 			g_taint_seen = true;
 		}
 	}
-	if (!(pending->prot & 0x2) && !(pending->prot & 0x4)) return;
-
+	if (!(pending->prot & 0x2) && !(pending->prot & 0x4)) {
+		return;
+	}
+	uint32_t remap_generation = 0;
 	for (uint64_t addr = page_start;; addr += page_size) {
 		gpointer key = (gpointer)(uintptr_t)addr;
-		page_t *p = g_hash_table_lookup(pages, key);
-		if (p) {
-			p->prot = pending->prot;
+		page_t *page = g_hash_table_lookup(pages, key);
+		if (page) {
+			page->prot = pending->prot;
 		} else {
-			p = g_new0(page_t, 1);
-			p->prot = pending->prot;
-			g_hash_table_insert(pages, key, p);
+			page = g_new0(page_t, 1);
+			page->prot = pending->prot;
+			g_hash_table_insert(pages, key, page);
 		}
 		if ((pending->prot & 0x4) && g_hash_table_contains(unmapped_pages, key)) {
-			p->dyn_exec = true;
-			p->gen_written = g_unpack_gen;
+			page->dyn_exec = true;
+			if (remap_generation == 0) {
+				remap_generation = next_code_generation();
+			}
+			page->gen_written = remap_generation;
 			if (g_layer_has_cand) {
 				g_layer_dirty = true;
 			}
@@ -1776,34 +2257,53 @@ static void apply_pending_mprotect(const pending_mmap_t *pending) {
 	if (!pending || !pending->active || pending->size == 0) {
 		return;
 	}
-	
+	if (page_size == 0 || (page_size & (page_size - 1U)) != 0) {
+		fprintf(stderr,
+			"[MPROTECT] invalid page size: 0x%lx\n",
+			(unsigned long)page_size);
+		return;
+	}
+
 	uint64_t addr = pending->requested_addr;
 	uint64_t size = pending->size;
 	int prot = pending->prot;
-	uint64_t page_mask = (uint64_t)page_size - 1;
+	if (size > UINT64_MAX - addr || addr + size > UINT64_MAX - (page_size - 1U)) {
+		fprintf(stderr,
+			"[MPROTECT] range overflow:"
+			" addr=0x%lx size=0x%lx\n",
+			(unsigned long)addr,
+			(unsigned long)size);
+		return;
+	}
+	uint64_t page_mask = (uint64_t)page_size - 1U;
 	uint64_t page_start = addr & ~page_mask;
-	uint64_t page_end = (addr + size + page_size - 1) & ~page_mask;
+	uint64_t page_end = (addr + size + page_size - 1U) & ~page_mask;
+	fprintf(stderr,
+		"[SYSCALL] mprotect(0x%lx, 0x%lx, prot=0x%x)\n",
+		(unsigned long)addr,
+		(unsigned long)size,
+		prot);
 
-	fprintf(stderr, "[SYSCALL] mprotect(0x%lx, 0x%lx, prot=0x%x)\n", (unsigned long)addr, (unsigned long)size, prot);
-
+	uint32_t remap_generation = 0;
 	for (uint64_t page_addr = page_start; page_addr < page_end; page_addr += page_size) {
 		gpointer key = (gpointer)(uintptr_t)page_addr;
-		page_t *p = g_hash_table_lookup(pages, key);
-
-		if (p) {
-			p->prot = prot;
+		page_t *page = g_hash_table_lookup(pages, key);
+		if (page) {
+			page->prot= prot;
 		} else {
-			p = g_new0(page_t, 1);
-			p->prot = prot;
-			g_hash_table_insert(pages, key, p);
+			page = g_new0(page_t, 1);
+			page->prot = prot;
+			g_hash_table_insert(pages, key, page);
 		}
-		if (p->written && (prot & 0x4)) {
-			p->exec_after_write = true;
+		if (page->written && (prot & 0x4)) {
+			page->exec_after_write = true;
 		}
 		if ((prot & 0x4) && g_hash_table_contains(unmapped_pages, key)) {
-			p->dyn_exec = true;
-			p->gen_written = g_unpack_gen;
-
+			page->dyn_exec = true;
+			if (remap_generation == 0) {
+				remap_generation = next_code_generation();
+			}
+			page->gen_written = remap_generation;
 			if (g_layer_has_cand) {
 				g_layer_dirty = true;
 			}
@@ -1930,30 +2430,33 @@ static file_dep_t *add_file_dep(const char *path, bool is_lib) {
 
 //mark write
 static void mark_written(uint64_t vaddr, uint32_t size) {
+	if (size == 0) return;
+	uint32_t write_generation = next_code_generation();
 	while (size > 0) {
-		uint64_t page_addr = vaddr & ~(page_size - 1);
-		uint32_t offset = vaddr & (page_size - 1);
-		uint32_t chunk = MIN(size, page_size - offset);
-		page_t *page = g_hash_table_lookup(pages,(gpointer)(uintptr_t)page_addr);
-
+		uint64_t page_addr = vaddr & ~((uint64_t)page_size - 1U);
+		uint32_t offset = (uint32_t)(vaddr & ((uint64_t)page_size - 1U));
+		uint32_t chunk = MIN(size, (uint32_t)page_size - offset);
+		page_t *page = g_hash_table_lookup(pages, (gpointer)(uintptr_t)page_addr);
 		if (!page) {
 			page = g_new0(page_t, 1);
 			page->prot = 0x3;
 			g_hash_table_insert(pages, (gpointer)(uintptr_t)page_addr, page);
 		}
-
-		if (!page->wbitmap) page->wbitmap = g_malloc0(page_size / 8);
-
+		if (!page->wbitmap) {
+			page->wbitmap = g_malloc0(page_size / 8U);
+		}
 		for (uint32_t i = 0; i < chunk; i++) {
 			uint32_t bit = offset + i;
-			page->wbitmap[bit >> 3] |= 1u << (bit & 7);
+			page->wbitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
 		}
 		page->written = true;
 		page->write_count++;
 		page->last_write = g_icount;
-		page->gen_written = g_unpack_gen;
+		page->gen_written = write_generation;
 		page->exec_seen = false;
-		if (g_layer_has_cand) g_layer_dirty = true;
+		if (g_layer_has_cand) {
+			g_layer_dirty = true;
+		}
 		vaddr += chunk;
 		size -= chunk;
 	}
@@ -2888,6 +3391,20 @@ static void plugin_exit(qemu_plugin_id_t id, void *udata) {
 	meta_free();
 
 	//tracer
+	if (g_dcfg) {
+		DcfgStats stats;
+		dcfg_graph_get_stats(g_dcfg, &stats);
+		fprintf(stderr,
+			"[DCFG-SUMMARY]"
+			" nodes=%u"
+			" edges=%u"
+			" occurrences=%" PRIu64 "\n",
+			stats.node_count,
+			stats.edge_count,
+			stats.branch_occurrence_count);
+		dcfg_graph_destroy(g_dcfg);
+		g_dcfg = NULL;
+	}
 	if (g_branch_events) {
 		branch_event_buffer_destroy(g_branch_events);
 		g_branch_events = NULL;
@@ -2949,6 +3466,8 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	const InsnMeta *meta = exec_ctx->meta;
 	finalize_missing_memory_flag_transfer(vcpu_state);
 	finalize_pending_branch(vcpu_state, vaddr);
+	finalize_pending_transfer(vcpu_state, vaddr);
+	dcfg_track_instruction(vcpu_state, vaddr, exec_ctx->size);
 	uint64_t current_reg_vals[REG_COUNT] = {0};
 	uint32_t current_reg_value_valid_mask = 0;
 	uint32_t current_eflags = 0;
@@ -3211,6 +3730,7 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		if (dse_resolve_mem_target(vaddr, meta, &slot, &val)) record_resolved_import(slot, val);
 	}
 	begin_pending_branch(vcpu_state, meta, current_trace_seq_id);
+	begin_pending_transfer(vcpu_state, meta, current_trace_seq_id);
 }
 
 //for network
@@ -3795,6 +4315,10 @@ static void plugin_install_cleanup(bool capstone_initialized, bool metadata_init
 		branch_event_buffer_destroy(g_branch_events);
 		g_branch_events = NULL;
 	}
+	if (g_dcfg) {
+		dcfg_graph_destroy(g_dcfg);
+		g_dcfg = NULL;
+	}
 	if (resolved_imports_by_slot) {
 		g_hash_table_destroy(resolved_imports_by_slot);
 		resolved_imports_by_slot = NULL;
@@ -3848,6 +4372,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	g_next_resource_object_id = UINT64_C(1);
 	g_main_image_resource_id = PROV_RESOURCE_ID_INVALID;
 	g_main_image_object_id = 0;
+	__atomic_store_n(&g_unpack_gen, 0, __ATOMIC_RELAXED);
 	g_clear_pointer(&g_main_image_path, g_free);
 
 	const char *target = info->target_name;
@@ -3868,6 +4393,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(
 	fprintf(stderr, "[PLUGIN] Loaded for architecture: %s (enum=%d)\n", target, current_arch);
 	if (!provenance_runtime_init(32)) {
 		fprintf(stderr, "[PLUGIN] provenance runtime init failed\n");
+		goto fail;
+	}
+	g_dcfg = dcfg_graph_create(g_prov_registry);
+	if (!g_dcfg) {
+		fprintf(stderr, "[PLUGIN] DCFG init failed\n");
 		goto fail;
 	}
 	if (cs_open(CS_ARCH_X86, CS_MODE_32, &cs_handle) != CS_ERR_OK) {
