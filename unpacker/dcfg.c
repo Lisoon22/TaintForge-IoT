@@ -256,6 +256,72 @@ bool dcfg_edge_get(DcfgGraph *graph, DcfgEdgeId edge_id, DcfgEdgeView *out_edge)
 	return valid;
 }
 
+static bool dcfg_label_has_no_roots(const ProvLabelView *label) {
+	return label && label->data_roots == PROV_ROOT_SET_EMPTY &&
+		label->address_roots == PROV_ROOT_SET_EMPTY;
+}
+
+static bool dcfg_labels_have_known_intersection(ProvRegistry *registry, const ProvLabelView *condition, const ProvLabelView *target) {
+	if (!registry || !condition || !target) return false;
+	return prov_root_sets_intersect(
+			registry,
+			condition->data_roots,
+			target->data_roots) ||
+		prov_root_sets_intersect(
+			registry,
+			condition->data_roots,
+			target->address_roots) ||
+		prov_root_sets_intersect(
+			registry,
+			condition->address_roots,
+			target->data_roots) ||
+		prov_root_sets_intersect(
+			registry,
+			condition->address_roots,
+			target->address_roots);
+}
+
+DcfgRelevance dcfg_labels_data_relevance(DcfgGraph *graph, ProvLabelId condition_label, ProvLabelId target_label) {
+	if (!graph || !prov_label_is_valid(graph->registry, condition_label) ||
+			!prov_label_is_valid(graph->registry, target_label)) {
+		return DCFG_RELEVANCE_UNKNOWN;
+	}
+	ProvLabelView condition;
+	ProvLabelView target;
+	if (!prov_label_get(graph->registry, condition_label, &condition) ||
+			!prov_label_get(graph->registry, target_label, &target)) {
+		return DCFG_RELEVANCE_UNKNOWN;
+	}
+	if (dcfg_labels_have_known_intersection(graph->registry, &condition, &target)) {
+		return DCFG_RELEVANCE_RELEVANT;
+	}
+
+	bool condition_complete =
+		(condition.complete_mask & PROV_COMPLETE_ALL) == PROV_COMPLETE_ALL;
+	bool target_complete =
+		(target.complete_mask & PROV_COMPLETE_ALL) == PROV_COMPLETE_ALL;
+	if ((condition_complete && dcfg_label_has_no_roots(&condition)) ||
+			(target_complete && dcfg_label_has_no_roots(&target)) ||
+			(condition_complete && target_complete)) {
+		return DCFG_RELEVANCE_IRRELEVANT;
+	}
+	return DCFG_RELEVANCE_UNKNOWN;
+}
+
+DcfgRelevance dcfg_edge_data_relevance(DcfgGraph *graph, DcfgEdgeId edge_id, ProvLabelId target_label) {
+	DcfgEdgeView edge;
+	if (!dcfg_edge_get(graph, edge_id, &edge)) {
+		return DCFG_RELEVANCE_UNKNOWN;
+	}
+	if (edge.kind != DCFG_EDGE_JCC_TAKEN &&
+		edge.kind != DCFG_EDGE_JCC_FALLTHROUGH &&
+		edge.kind != DCFG_EDGE_JCC_UNKNOWN) {
+		return DCFG_RELEVANCE_IRRELEVANT;
+	}
+	return dcfg_labels_data_relevance(graph, edge.condition_summary, target_label);
+}
+
+
 void dcfg_graph_get_stats(DcfgGraph *graph, DcfgStats *out_stats) {
 	if (!out_stats) return;
 	memset(out_stats, 0, sizeof(*out_stats));
@@ -285,5 +351,17 @@ const char *dcfg_edge_kind_name(DcfgEdgeKind kind) {
 			return "ret";
 		case DCFG_EDGE_INVALID: default:
 			return "invalid";
+	}
+}
+
+const char *dcfg_relevance_name(DcfgRelevance relevance) {
+	switch (relevance) {
+		case DCFG_RELEVANCE_IRRELEVANT:
+			return "irrelevant";
+		case DCFG_RELEVANCE_RELEVANT:
+			return "relevant";
+		case DCFG_RELEVANCE_UNKNOWN:
+		default:
+			return "unknown";
 	}
 }

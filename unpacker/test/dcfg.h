@@ -27,6 +27,12 @@ typedef enum {
 	DCFG_EDGE_RET
 } DcfgEdgeKind;
 
+typedef enum {
+	DCFG_RELEVANCE_IRRELEVANT = 0,
+	DCFG_RELEVANCE_RELEVANT,
+	DCFG_RELEVANCE_UNKNOWN
+} DcfgRelevance;
+
 typedef struct {
 	uint64_t start_pc;
 	uint32_t code_generation;
@@ -80,8 +86,12 @@ DcfgEdgeId dcfg_find_edge(DcfgGraph *graph, DcfgNodeId source_node, DcfgNodeId t
 bool dcfg_node_get(DcfgGraph *graph, DcfgNodeId node_id, DcfgNodeView *out_node);
 bool dcfg_edge_get(DcfgGraph *graph, DcfgEdgeId edge_id, DcfgEdgeView *out_edge);
 
+DcfgRelevance dcfg_labels_data_relevance(DcfgGraph *graph, ProvLabelId condition_label, ProvLabelId target_label);
+DcfgRelevance dcfg_edge_data_relevance(DcfgGraph *graph, DcfgEdgeId edge_id, ProvLabelId target_label);
+
 void dcfg_graph_get_stats(DcfgGraph *graph, DcfgStats *out_stats);
 const char *dcfg_edge_kind_name(DcfgEdgeKind kind);
+const char *dcfg_relevance_name(DcfgRelevance relevance);
 
 #ifdef __cplusplus
 }

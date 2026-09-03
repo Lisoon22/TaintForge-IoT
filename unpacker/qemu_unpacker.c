@@ -824,12 +824,13 @@ static void finalize_pending_transfer(PluginVcpuState *vcpu_state, uint64_t obse
 	if (!vcpu_state || !vcpu_state->dcfg_pending_transfer.active) {
 		return;
 	}
-	dcfg_pending_transfer_t pending =vcpu_state->dcfg_pending_transfer;
-	memset(&vcpu_state->dcfg_pending_transfer,0, sizeof(vcpu_state->dcfg_pending_transfer));
+	dcfg_pending_transfer_t pending = vcpu_state->dcfg_pending_transfer;
+	memset(&vcpu_state->dcfg_pending_transfer, 0,
+			sizeof(vcpu_state->dcfg_pending_transfer));
 	DcfgNodeKey target_key = dcfg_node_key_for_pc(observed_next_pc);
 	dcfg_set_current_block(vcpu_state, target_key);
-
-	if (pending.expected_target_valid && !guest_pc_equal(pending.expected_target, observed_next_pc)) {
+	if (pending.expected_target_valid &&
+	    !guest_pc_equal(pending.expected_target, observed_next_pc)) {
 		fprintf(stderr,
 			"[DCFG] transfer target mismatch"
 			" pc=0x%" PRIx64
@@ -840,7 +841,16 @@ static void finalize_pending_transfer(PluginVcpuState *vcpu_state, uint64_t obse
 			observed_next_pc);
 	}
 
-	if (!g_dcfg) return;
+	if (!g_dcfg) {
+		if (g_trace) {
+			(void)trace_record_control_transfer(
+				g_trace,
+				pending.trace_seq_id,
+				DCFG_EDGE_ID_INVALID,
+				pending.target_label);
+		}
+		return;
+	}
 	DcfgBranchObservation observation = {
 		.source = pending.source,
 		.target = target_key,
@@ -851,10 +861,17 @@ static void finalize_pending_transfer(PluginVcpuState *vcpu_state, uint64_t obse
 		.target_label = pending.target_label
 	};
 	DcfgEdgeId edge_id = DCFG_EDGE_ID_INVALID;
-
-	if (!dcfg_record_branch(g_dcfg, &observation, &edge_id)) {
-		fprintf(
-			stderr,
+	
+	if (!dcfg_record_branch(g_dcfg,
+		    &observation, &edge_id)) {
+		if (g_trace) {
+			(void)trace_record_control_transfer(
+				g_trace,
+				pending.trace_seq_id,
+				DCFG_EDGE_ID_INVALID,
+				pending.target_label);
+		}
+		fprintf(stderr,
 			"[DCFG] failed to record transfer"
 			" pc=0x%" PRIx64
 			" next=0x%" PRIx64
@@ -863,6 +880,20 @@ static void finalize_pending_transfer(PluginVcpuState *vcpu_state, uint64_t obse
 			observed_next_pc,
 			pending.trace_seq_id);
 		return;
+	}
+	if (g_trace &&
+	    !trace_record_control_transfer(
+		    g_trace,
+		    pending.trace_seq_id,
+		    edge_id,
+		    pending.target_label)) {
+		fprintf(
+			stderr,
+			"[TRACE] failed to attach control transfer"
+			" seq=%" PRIu64
+			" edge=%u\n",
+			pending.trace_seq_id,
+			edge_id);
 	}
 	log_dcfg_transfer(&pending, edge_id);
 }
@@ -1058,18 +1089,29 @@ static void log_branch_event(const BranchEvent *event) {
 }
 
 static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observed_next_pc) {
-	if (!vcpu_state || !vcpu_state->dta.pending_branch.active) {
+	if (!vcpu_state ||
+	    !vcpu_state->dta.pending_branch.active) {
 		return;
 	}
 	DtaPendingBranch pending = vcpu_state->dta.pending_branch;
 	dta_pending_branch_clear(&vcpu_state->dta);
-	DcfgNodeKey source_key = vcpu_state->dcfg_block_active ? vcpu_state->dcfg_block_key : dcfg_node_key_for_pc(pending.pc);
-	DcfgNodeKey target_key = dcfg_node_key_for_pc(observed_next_pc);
-	dcfg_set_current_block(vcpu_state, target_key);
-	if (!g_branch_events) return;
+	DcfgNodeKey source_key = vcpu_state->dcfg_block_active
+			? vcpu_state->dcfg_block_key
+			: dcfg_node_key_for_pc(pending.pc);
+	DcfgNodeKey target_key =
+		dcfg_node_key_for_pc(observed_next_pc);
+	dcfg_set_current_block(vcpu_state,target_key);
+	if (!g_branch_events) {
+		if (g_trace) {
+			(void)trace_record_control_transfer(
+				g_trace, pending.seq_id,
+				DCFG_EDGE_ID_INVALID,
+				PROV_LABEL_CLEAN);
+		}
+		return;
+	}
 	BranchEvent event;
 	memset(&event, 0, sizeof(event));
-
 	event.branch_seq_id = pending.seq_id;
 	event.vcpu_index = vcpu_state->dta.vcpu_index;
 	event.meta_id = pending.meta_id;
@@ -1082,25 +1124,35 @@ static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observ
 	event.condition_label = pending.condition_label;
 	event.dcfg_edge_id = DCFG_EDGE_ID_INVALID;
 	event.outcome = BRANCH_OUTCOME_UNKNOWN;
-
-	bool is_fallthrough = guest_pc_equal(observed_next_pc, pending.fallthrough);
-	bool is_target = pending.direct_target_valid && guest_pc_equal(observed_next_pc, pending.direct_target);
+	bool is_fallthrough = guest_pc_equal(
+			observed_next_pc,
+			pending.fallthrough);
+	bool is_target =
+		pending.direct_target_valid &&
+		guest_pc_equal(
+			observed_next_pc,
+			pending.direct_target);
 	if (is_fallthrough && !is_target) {
-		event.outcome = BRANCH_OUTCOME_NOT_TAKEN;
+		event.outcome =
+			BRANCH_OUTCOME_NOT_TAKEN;
 	} else if (is_target && !is_fallthrough) {
-		event.outcome = BRANCH_OUTCOME_TAKEN;
+		event.outcome =
+			BRANCH_OUTCOME_TAKEN;
 	}
 	if (g_dcfg) {
 		DcfgBranchObservation observation = {
 			.source = source_key,
 			.target = target_key,
-			.kind = dcfg_jcc_kind(event.outcome),
+			.kind = dcfg_jcc_kind(
+					event.outcome),
 			.branch_seq_id = event.branch_seq_id,
 			.vcpu_index = event.vcpu_index,
 			.condition_label = event.condition_label,
 			.target_label = PROV_LABEL_CLEAN
 		};
-		if (!dcfg_record_branch(g_dcfg, &observation, &event.dcfg_edge_id)) {
+		if (!dcfg_record_branch(g_dcfg,
+			    &observation,
+			    &event.dcfg_edge_id)) {
 			fprintf(stderr,
 				"[DCFG] failed to record Jcc"
 				" pc=0x%" PRIx64
@@ -1111,10 +1163,22 @@ static void finalize_pending_branch(PluginVcpuState *vcpu_state, uint64_t observ
 				event.branch_seq_id);
 		}
 	}
-	const BranchEvent *stored = branch_event_append(g_branch_events, &event);
-	if (stored) {
-		log_branch_event(stored);
+	if (g_trace && !trace_record_control_transfer(
+		    g_trace,
+		    event.branch_seq_id,
+		    event.dcfg_edge_id,
+		    PROV_LABEL_CLEAN)) {
+		fprintf(stderr,
+			"[TRACE] failed to attach conditional transfer"
+			" seq=%" PRIu64
+			" edge=%u\n",
+			event.branch_seq_id,
+			event.dcfg_edge_id);
 	}
+	const BranchEvent *stored = branch_event_append(
+			g_branch_events,
+			&event);
+	if (stored) log_branch_event(stored);
 }
 
 static void begin_pending_branch(PluginVcpuState *vcpu_state, const InsnMeta *meta, uint64_t trace_seq_id) {
@@ -3307,7 +3371,58 @@ static void build_oep_scoring(oep_cand_t *chosen) {
 
 	for (guint i = 0; i < top_count; i++) {
 		oep_cand_t *candidate = candidates[i];
-		g_string_append_printf(g_oep_scoring, "    {\"addr\": \"0x%lx\", \"score\": %.4f, \"confidence\": %.4f, \"dse_verdict\": \"%s\", \"dse_evidence\": \"%s\", \"dse_reason\": \"%s\", \"candidate_query\": \"%s\", \"alternative_query\": \"%s\", \"target_symbolic\": %s, \"target_tainted\": %s, \"slice_complete\": %s, \"slice_len\": %u, \"concretized\": %u, \"total\": %u, \"aux_miss\": %u, \"unsupported\": %u, \"meta_missing\": %u, \"address_constraints\": %u, \"address_failures\": %u, \"generation\": %u}%s\n", (unsigned long)candidate->addr, cand_score(candidate), cand_confidence(candidate), dse_verdict_name(candidate->dse.verdict), dse_evidence_name(candidate->dse.evidence), dse_verify_reason_name(candidate->dse.reason), dse_solver_status_name(candidate->dse.candidate_query), dse_solver_status_name(candidate->dse.alternative_query), candidate->dse.target_symbolic ? "true" : "false", candidate->target_tainted ? "true" : "false", candidate->dse.slice_complete ? "true" : "false", candidate->dse.slice_len, candidate->dse.concretized, candidate->dse.lifted_total, candidate->dse.aux_miss, candidate->dse.unsupported, candidate->dse.meta_missing, candidate->dse.address_constraints, candidate->dse.address_failures, candidate->generation, i + 1 < top_count ? "," : "");
+		g_string_append_printf(
+				g_oep_scoring,
+		"    {\"addr\": \"0x%lx\", "
+		"\"score\": %.4f, \"confidence\": %.4f, "
+		"\"dse_verdict\": \"%s\", "
+		"\"dse_evidence\": \"%s\", "
+		"\"dse_reason\": \"%s\", "
+		"\"candidate_query\": \"%s\", "
+		"\"alternative_query\": \"%s\", "
+		"\"target_symbolic\": %s, "
+		"\"target_tainted\": %s, "
+		"\"slice_complete\": %s, "
+		"\"slice_len\": %u, \"concretized\": %u, "
+		"\"total\": %u, \"aux_miss\": %u, "
+		"\"unsupported\": %u, \"meta_missing\": %u, "
+		"\"address_constraints\": %u, "
+		"\"address_failures\": %u, "
+		"\"relevance_applied\": %s, "
+		"\"relevance_complete\": %s, "
+		"\"relevance_considered\": %u, "
+		"\"relevance_relevant\": %u, "
+		"\"relevance_unknown\": %u, "
+		"\"relevance_irrelevant\": %u, "
+		"\"relevance_iterations\": %u, "
+		"\"generation\": %u}%s\n",
+		(unsigned long)candidate->addr,
+		cand_score(candidate),
+		cand_confidence(candidate),
+		dse_verdict_name(candidate->dse.verdict),
+		dse_evidence_name(candidate->dse.evidence),
+		dse_verify_reason_name(candidate->dse.reason),
+		dse_solver_status_name(candidate->dse.candidate_query),
+		dse_solver_status_name(candidate->dse.alternative_query),
+		candidate->dse.target_symbolic ? "true" : "false",
+		candidate->target_tainted ? "true" : "false",
+		candidate->dse.slice_complete ? "true" : "false",
+		candidate->dse.slice_len,
+		candidate->dse.concretized,
+		candidate->dse.lifted_total,
+		candidate->dse.aux_miss,
+		candidate->dse.unsupported,
+		candidate->dse.meta_missing,
+		candidate->dse.address_constraints,
+		candidate->dse.address_failures,
+		candidate->dse.relevance_applied ? "true" : "false",
+		candidate->dse.relevance_complete ? "true" : "false",
+		candidate->dse.relevance_events_considered,
+		candidate->dse.relevance_events_relevant,
+		candidate->dse.relevance_events_unknown,
+		candidate->dse.relevance_events_irrelevant,
+		candidate->dse.relevance_iterations,
+		candidate->generation, i + 1 < top_count ? "," : "");
 	}
 
 	g_string_append(g_oep_scoring,"  ],\n");
@@ -3526,10 +3641,13 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	uint64_t current_trace_seq_id = 0;
 	if (g_trace) {
 		TraceEntry entry = {0};
+		entry.vcpu_index = cpu_index;
 		entry.pc = vaddr;
 		entry.meta_id = exec_ctx->meta_id;
 		entry.size = exec_ctx->size;
-		memcpy(entry.instr_bytes,exec_ctx->instr_bytes, exec_ctx->size);
+		memcpy(entry.instr_bytes,
+				exec_ctx->instr_bytes,
+				exec_ctx->size);
 		const TraceEntry *stored_entry = trace_append(g_trace, &entry);
 		if (stored_entry) {
 			current_trace_seq_id = stored_entry->seq_id;
@@ -3608,10 +3726,33 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 		candidate->dse.alternative_query = DSE_SOLVER_NOT_RUN;
 		
 		if (prev_jump_matches) {
+			DseRelevanceContext relevance_context = {
+				.registry = g_prov_registry,
+				.dcfg = g_dcfg,
+				.branch_events = g_branch_events
+			};
 			if (prev_target_reg >= 0 && prev_target_reg < REG_COUNT) {
-				candidate->dse = dse_verify_oep_candidate(g_trace, g_aux,prev_jump_seq_id, prev_target_reg, vaddr, g_shadow, cs_handle);
+				candidate->dse = 
+					dse_verify_oep_candidate_with_relevance(
+							g_trace,
+							g_aux,
+							prev_jump_seq_id,
+							prev_target_reg,
+							vaddr,
+							g_shadow,
+							cs_handle,
+							&relevance_context);
 			} else if (prev_mem_target_valid) {
-				candidate->dse = dse_verify_oep_candidate_mem(g_trace, g_aux,prev_jump_seq_id, prev_mem_taddr, vaddr, g_shadow, cs_handle);
+				candidate->dse =
+					dse_verify_oep_candidate_mem_with_relevance(
+							g_trace,
+							g_aux,
+							prev_jump_seq_id,
+							prev_mem_taddr,
+							vaddr,
+							g_shadow,
+							cs_handle,
+							&relevance_context);
 			}
 		}
 		fprintf(
@@ -3621,14 +3762,19 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	"candidate=%s alternative=%s "
 	"(slice %u; concretized %u/%u; aux_miss %u, "
 	"unsup %u, meta_miss %u, addr_eq %u, addr_fail %u, "
-	"roots reg=%u mem=%u addr=%u)\n",
+	"roots reg=%u mem=%u addr=%u; "
+	"relevance considered=%u relevant=%u unknown=%u skipped=%u "
+	"iterations=%u applied=%s complete=%s)\n",
 	candidate->generation,
 	(unsigned long)candidate->addr,
 	(unsigned long)candidate->jump_site,
 	candidate->target_tainted ? "yes" : "no",
-	dse_verdict_name(candidate->dse.verdict),
-	dse_evidence_name(candidate->dse.evidence),
-	dse_verify_reason_name(candidate->dse.reason),
+	dse_verdict_name(
+		candidate->dse.verdict),
+	dse_evidence_name(
+		candidate->dse.evidence),
+	dse_verify_reason_name(
+		candidate->dse.reason),
 	dse_solver_status_name(
 		candidate->dse.candidate_query),
 	dse_solver_status_name(
@@ -3643,7 +3789,18 @@ static void vcpu_insn_exec(unsigned int cpu_index, void *udata) {
 	candidate->dse.address_failures,
 	candidate->dse.boundary_reg_bytes,
 	candidate->dse.boundary_mem_bytes,
-	candidate->dse.address_root_bytes);
+	candidate->dse.address_root_bytes,
+	candidate->dse.relevance_events_considered,
+	candidate->dse.relevance_events_relevant,
+	candidate->dse.relevance_events_unknown,
+	candidate->dse.relevance_events_irrelevant,
+	candidate->dse.relevance_iterations,
+	candidate->dse.relevance_applied
+		? "yes"
+		: "no",
+	candidate->dse.relevance_complete
+		? "yes"
+		: "no");
 		fprintf(
 	stderr,
 	"[DSE-MEM] expr_nodes=%u/%u "

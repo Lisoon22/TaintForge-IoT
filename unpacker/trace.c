@@ -59,6 +59,24 @@ const TraceEntry *trace_find_seq(const TraceBuffer *tb, uint64_t seq_id, uint32_
 	return NULL;
 }
 
+bool trace_record_control_transfer(TraceBuffer *tb, uint64_t seq_id, DcfgEdgeId edge_id, ProvLabelId target_label) {
+	if (!tb || seq_id == 0 || target_label == PROV_LABEL_ID_INVALID) {
+		return false;
+	}
+	for (uint32_t i = 0; i < tb->counter; i++) {
+		uint32_t index =
+			(tb->head_pointer - 1U - i) & (tb->capacity - 1U);
+		TraceEntry *entry = &tb->entries[index];
+		if (entry->seq_id != seq_id) continue;
+		entry->control_transfer_valid = true;
+		entry->dcfg_edge_id = edge_id;
+		entry->target_label = target_label;
+		return true;
+	}
+	return false;
+}
+
+
 void trace_reset(TraceBuffer *tb) {
 	if (!tb) return;
 	tb->head_pointer = 0;

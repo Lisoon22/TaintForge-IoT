@@ -60,6 +60,11 @@ typedef struct DseSlicePlan {
 	GHashTable *replay_memory_writes;
 } DseSlicePlan;
 
+typedef struct {
+	GHashTable *by_seq_id;
+	DseRelevanceStats stats;
+} DseRelevanceSelection;
+
 typedef enum {
 	DSE_REPLAY_CHECK_OK = 0,
 	DSE_REPLAY_CHECK_MISSING_BINDING,
@@ -3029,6 +3034,17 @@ DseSolverStatus dse_check_target_relation(DSECtx *ctx, SymExpr *target_expr, uin
 	return DSE_SOLVER_UNKNOWN;
 }
 
+static void dse_capture_relevance_metrics(DseVerifyResult *result, const DseRelevanceStats *relevance) {
+	if (!result || !relevance) return;
+	result->relevance_events_considered = relevance->events_considered;
+	result->relevance_events_relevant = relevance->events_relevant;
+	result->relevance_events_unknown = relevance->events_unknown;
+	result->relevance_events_irrelevant = relevance->events_irrelevant;
+	result->relevance_iterations = relevance->iterations;
+	result->relevance_applied = relevance->applied;
+	result->relevance_complete = relevance->complete;
+}
+
 static DseVerifyReason dse_replay_failure_reason(const DSECtx *ctx) {
 	if (!ctx) return DSE_REASON_MODEL_INCOMPLETE;
 	if (ctx->replay_mismatch) return DSE_REASON_REPLAY_MISMATCH;
@@ -3168,6 +3184,319 @@ static DseSliceResult dse_slice_result(DseSliceStatus status) {
 	memset(&result, 0, sizeof(result));
 	result.status = status;
 	return result;
+}
+
+static gpointer dse_relevance_encode(DcfgRelevance relevance) {
+	return GUINT_TO_POINTER((guint)relevance + 1U);
+}
+
+static DcfgRelevance dse_relevance_decode(gpointer encoded) {
+	if (!encoded) return DCFG_RELEVANCE_UNKNOWN;
+	guint value = GPOINTER_TO_UINT(encoded);
+	if (value == 0 ||
+		value > (guint)DCFG_RELEVANCE_UNKNOWN + 1U) {
+		return DCFG_RELEVANCE_UNKNOWN;
+	}
+	return (DcfgRelevance)(value - 1U);
+}
+
+static bool dse_relevance_store(DseRelevanceSelection *selection, uint64_t seq_id, DcfgRelevance relevance) {
+	if (!selection || !selection->by_seq_id || seq_id == 0) {
+		return false;
+	}
+	gint64 lookup = (gint64)seq_id;
+	gint64 *stored = g_try_new(gint64, 1);
+	if (!stored) return false;
+	*stored = lookup;
+	g_hash_table_replace(selection->by_seq_id,
+		stored, dse_relevance_encode(relevance));
+	return true;
+}
+
+static bool dse_relevance_lookup(const DseRelevanceSelection *selection, uint64_t seq_id, DcfgRelevance *out_relevance) {
+	if (out_relevance) {
+		*out_relevance = DCFG_RELEVANCE_UNKNOWN;
+	}
+	if (!selection || !selection->by_seq_id || seq_id == 0) {
+		return false;
+	}
+	gint64 lookup = (gint64)seq_id;
+	gpointer encoded =
+		g_hash_table_lookup(selection->by_seq_id, &lookup);
+	if (!encoded) return false;
+	if (out_relevance) {
+		*out_relevance = dse_relevance_decode(encoded);
+	}
+	return true;
+}
+
+static DcfgRelevance dse_relevance_combine(DcfgRelevance edge_relevance, DcfgRelevance event_relevance) {
+	if (event_relevance == DCFG_RELEVANCE_RELEVANT) {
+		return edge_relevance == DCFG_RELEVANCE_IRRELEVANT
+			? DCFG_RELEVANCE_UNKNOWN
+			: DCFG_RELEVANCE_RELEVANT;
+	}
+	if (event_relevance == DCFG_RELEVANCE_IRRELEVANT) {
+		return DCFG_RELEVANCE_IRRELEVANT;
+	}
+	return DCFG_RELEVANCE_UNKNOWN;
+}
+
+static DcfgRelevance dse_classify_branch_event(const DseRelevanceContext *relevance, const BranchEvent *event, ProvLabelId accumulated_label) {
+	if (!relevance || !relevance->registry || !relevance->dcfg ||
+		!event || event->branch_seq_id == 0 ||
+		!prov_label_is_valid(
+			relevance->registry, event->condition_label) ||
+		!prov_label_is_valid(
+			relevance->registry, accumulated_label)) {
+		return DCFG_RELEVANCE_UNKNOWN;
+	}
+
+	DcfgRelevance edge_relevance = dcfg_edge_data_relevance(relevance->dcfg, event->dcfg_edge_id, accumulated_label);
+	DcfgRelevance event_relevance = dcfg_labels_data_relevance(relevance->dcfg, event->condition_label, accumulated_label);
+	return dse_relevance_combine(edge_relevance, event_relevance);
+}
+
+static void dse_relevance_count_states(DseRelevanceSelection *selection) {
+	if (!selection || !selection->by_seq_id) {
+		return;
+	}
+	selection->stats.events_considered = 0;
+	selection->stats.events_relevant = 0;
+	selection->stats.events_unknown = 0;
+	selection->stats.events_irrelevant = 0;
+
+	GHashTableIter iterator;
+	gpointer value = NULL;
+	g_hash_table_iter_init(&iterator, selection->by_seq_id);
+	while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+		selection->stats.events_considered++;
+		switch (dse_relevance_decode(value)) {
+			case DCFG_RELEVANCE_RELEVANT:
+				selection->stats.events_relevant++;
+				break;
+			case DCFG_RELEVANCE_IRRELEVANT:
+				selection->stats.events_irrelevant++;
+				break;
+			case DCFG_RELEVANCE_UNKNOWN: default:
+				selection->stats.events_unknown++;
+				selection->stats.complete = false;
+				break;
+		}
+	}
+}
+
+static DseRelevanceSelection *dse_relevance_selection_create(const TraceBuffer *tb, uint64_t trigger_seq_id, const DseRelevanceContext *relevance) {
+	if (!relevance) return NULL;
+	DseRelevanceSelection *selection =
+		g_try_new0(DseRelevanceSelection, 1);
+	if (!selection) return NULL;
+	selection->by_seq_id = g_hash_table_new_full(
+			g_int64_hash, g_int64_equal,
+			g_free, NULL);
+	if (!selection->by_seq_id) {
+		g_free(selection);
+		return NULL;
+	}
+	selection->stats.applied = true;
+	selection->stats.complete = true;
+	selection->stats.accumulated_label = PROV_LABEL_ID_INVALID;
+	uint32_t trigger_back_index = 0;
+	const TraceEntry *trigger = trace_find_seq(tb,
+			trigger_seq_id, &trigger_back_index);
+	bool context_valid = trigger &&
+		relevance->registry && relevance->dcfg && relevance->branch_events;
+	ProvLabelId accumulated_label =
+		PROV_LABEL_ID_INVALID;
+	if (context_valid && trigger->control_transfer_valid &&
+		prov_label_is_valid(relevance->registry, trigger->target_label)) {
+		accumulated_label = trigger->target_label;
+	} else if (relevance->registry) {
+		accumulated_label = prov_label_unknown(relevance->registry);
+		selection->stats.complete = false;
+	}
+	selection->stats.accumulated_label = accumulated_label;
+	GArray *events =
+		g_array_new(FALSE, FALSE, sizeof(BranchEvent));
+	if (!events) {
+		g_hash_table_destroy(selection->by_seq_id);
+		g_free(selection);
+		return NULL;
+	}
+	if (context_valid) {
+		const BranchEventBuffer *buffer =
+			relevance->branch_events;
+		const TraceEntry *oldest =
+			tb->counter != 0
+			? trace_get_last(tb, tb->counter - 1U)
+			: NULL;
+		uint64_t oldest_seq_id = oldest ? oldest->seq_id
+			: trigger_seq_id;
+		for (uint32_t i = 0; i < buffer->counter; i++) {
+			const BranchEvent *event =
+				branch_event_get_last(buffer, i);
+			if (!event ||
+				event->branch_seq_id < oldest_seq_id ||
+				event->branch_seq_id >= trigger_seq_id ||
+				event->vcpu_index != trigger->vcpu_index) {
+				continue;
+			}
+			g_array_append_val(events, *event);
+			if (!dse_relevance_store(selection,
+					event->branch_seq_id,
+					DCFG_RELEVANCE_IRRELEVANT)) {
+				selection->stats.complete = false;
+			}
+		}
+	}
+	uint64_t requested_iterations = (uint64_t)events->len + 1U;
+	uint32_t maximum_iterations = requested_iterations > (uint64_t)DSE_MAX_RELEVANCE_ITERATIONS
+		? DSE_MAX_RELEVANCE_ITERATIONS
+		: (uint32_t)requested_iterations;
+	bool converged = !context_valid || events->len == 0;
+	for (uint32_t iteration = 0; iteration < maximum_iterations && context_valid;
+			iteration++) {
+		bool changed = false;
+		selection->stats.iterations = iteration + 1U;
+		for (guint i = 0;
+			i < events->len; i++) {
+			const BranchEvent *event = &g_array_index(events,
+					BranchEvent, i);
+			DcfgRelevance current =
+				DCFG_RELEVANCE_IRRELEVANT;
+			(void)dse_relevance_lookup(selection,
+				event->branch_seq_id, &current);
+			DcfgRelevance classified =
+				dse_classify_branch_event(
+					relevance, event,
+					accumulated_label);
+			bool newly_selected =
+				current == DCFG_RELEVANCE_IRRELEVANT &&
+				classified != DCFG_RELEVANCE_IRRELEVANT;
+
+			if (!newly_selected) continue;
+			if (!dse_relevance_store(selection,
+					event->branch_seq_id, classified)) {
+				selection->stats.complete = false;
+				continue;
+			}
+			changed = true;
+			if (prov_label_is_valid(relevance->registry,
+					event->condition_label)) {
+				ProvLabelId joined =
+					prov_label_join(relevance->registry,
+						accumulated_label,
+						event->condition_label);
+				if (joined != PROV_LABEL_ID_INVALID) {
+					accumulated_label = joined;
+				} else {
+					selection->stats.complete =
+						false;
+				}
+			} else {
+				selection->stats.complete =
+					false;
+			}
+		}
+		selection->stats.accumulated_label = accumulated_label;
+		if (!changed) {
+			converged = true;
+			break;
+		}
+	}
+	if (context_valid && !converged) {
+		bool unresolved = false;
+		for (guint i = 0;
+			i < events->len; i++) {
+			const BranchEvent *event =
+				&g_array_index(events,
+					BranchEvent, i);
+			DcfgRelevance current =
+				DCFG_RELEVANCE_UNKNOWN;
+			if (!dse_relevance_lookup(selection,
+					event->branch_seq_id, &current) ||
+				current !=
+					DCFG_RELEVANCE_IRRELEVANT) {
+				continue;
+			}
+			unresolved = true;
+			if (!dse_relevance_store(selection,
+					event->branch_seq_id,
+					DCFG_RELEVANCE_UNKNOWN)) {
+				selection->stats.complete = false;
+			}
+		}
+		if (unresolved) {
+			selection->stats.complete = false;
+		}
+	}
+
+	if (trigger) {
+		for (uint32_t i = trigger_back_index + 1U;
+			i < tb->counter; i++) {
+			const TraceEntry *entry = trace_get_last(tb, i);
+			if (!entry ||
+				entry->vcpu_index != trigger->vcpu_index) {
+				continue;
+			}
+			DcfgRelevance ignored;
+			if (dse_relevance_lookup(selection,
+					entry->seq_id,&ignored)) {
+				continue;
+			}
+			const InsnMeta *meta =
+				meta_lookup_id(
+					entry->meta_id);
+			if (!meta ||
+				!meta->is_conditional_branch) {
+				continue;
+			}
+			(void)dse_relevance_store(selection,
+				entry->seq_id,
+				DCFG_RELEVANCE_UNKNOWN);
+			selection->stats.complete = false;
+		}
+	}
+	dse_relevance_count_states(selection);
+	g_array_unref(events);
+	return selection;
+}
+
+static void dse_relevance_selection_destroy(DseRelevanceSelection *selection) {
+	if (!selection) return;
+	if (selection->by_seq_id) {
+		g_hash_table_destroy(selection->by_seq_id);
+	}
+	g_free(selection);
+}
+
+static DcfgRelevance dse_relevance_selection_get(const DseRelevanceSelection *selection, uint64_t seq_id) {
+	if (!selection) {
+		return DCFG_RELEVANCE_RELEVANT;
+	}
+	DcfgRelevance relevance =
+		DCFG_RELEVANCE_UNKNOWN;
+	(void)dse_relevance_lookup(selection,
+		seq_id, &relevance);
+	return relevance;
+}
+
+bool dse_analyze_branch_relevance(const TraceBuffer *tb, uint64_t trigger_seq_id, const DseRelevanceContext *relevance, DseRelevanceStats *out_stats) {
+	if (out_stats) {
+		memset(out_stats, 0, sizeof(*out_stats));
+	}
+	if (!tb || trigger_seq_id == 0 ||
+		!relevance || !out_stats) {
+		return false;
+	}
+	DseRelevanceSelection *selection =
+		dse_relevance_selection_create(
+			tb, trigger_seq_id,
+			relevance);
+	if (!selection) return false;
+	*out_stats = selection->stats;
+	dse_relevance_selection_destroy(selection);
+	return true;
 }
 
 static uint8_t dse_byte_mask(uint32_t byte_count) {
@@ -4081,7 +4410,7 @@ static bool dse_dependency_frontier_apply(DseDependencyFrontier *frontier, const
 	return true;
 }
 
-static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, DseSliceSeedKind seed_kind, RegId target_reg, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan) {
+static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, DseSliceSeedKind seed_kind, RegId target_reg, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan, const DseRelevanceContext *relevance) {
 	DseSliceResult result = dse_slice_result(DSE_SLICE_INVALID_INPUT);
 	DseDependencyFrontier data_frontier = {0};
 	DseDependencyFrontier replay_frontier = {0};
@@ -4098,6 +4427,7 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
 	bool path_budget_reported = false;
 	bool path_tracking_active = true;
 	bool success = false;
+	DseRelevanceSelection *relevance_selection = NULL;
 
 	if (!tb || !ring || !out_slice || max_len < 2 || trigger_seq_id == 0 || natural_mask == 0 || (plan && max_len > MAX_SLICE)) {
 		return result;
@@ -4128,6 +4458,14 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
 	if (!trigger) {
 		result.status = DSE_SLICE_TRIGGER_MISSING;
 		goto cleanup;
+	}
+	relevance_selection = dse_relevance_selection_create(tb,
+			trigger_seq_id, relevance);
+	if (relevance_selection) {
+		result.relevance = relevance_selection->stats;
+	} else if (relevance) {
+		result.relevance.applied = true;
+		result.relevance.complete = false;
 	}
 
 	const InsnMeta *trigger_meta = meta_lookup_id(trigger->meta_id);
@@ -4185,10 +4523,12 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
 			}
 		}
 	}
-		for (uint32_t i = trigger_back_index + 1;i < tb->counter && !(path_tracking_active ? dse_dependency_frontier_empty(&replay_frontier) : dse_dependency_frontier_empty(&data_frontier)); i++) {
+	for (uint32_t i = trigger_back_index + 1;i < tb->counter && !(path_tracking_active ? dse_dependency_frontier_empty(&replay_frontier) : dse_dependency_frontier_empty(&data_frontier)); i++) {
 		bool path_window_open = !dse_dependency_frontier_empty(&data_frontier);
 		const TraceEntry *entry = trace_get_last(tb, i);
-		if (!entry) continue;
+		if (!entry || entry->vcpu_index != trigger->vcpu_index) {
+			continue;
+		}
 		scanned_entries++;
 		const InsnMeta *meta = meta_lookup_id(entry->meta_id);
 		if (!meta) {
@@ -4234,8 +4574,9 @@ static DseSliceResult dse_build_value_slice(const TraceBuffer *tb, const DseAuxR
 			}
 		}
 		bool data_relevant = data_register_relevant || data_memory_relevant || data_flag_relevant;
+		DcfgRelevance branch_relevance = dse_relevance_selection_get(relevance_selection, entry->seq_id);
 		bool path_relevant = false;
-		if (path_tracking_active && path_window_open && meta->is_conditional_branch) {
+		if (path_tracking_active && path_window_open && meta->is_conditional_branch && branch_relevance != DCFG_RELEVANCE_IRRELEVANT) {
 			if (result.path_constraints_expected < DSE_MAX_PATH_CONSTRAINTS) {
 				path_relevant = true;
 			} else {
@@ -4387,27 +4728,31 @@ cleanup:
 	}
 	dse_dependency_frontier_destroy(&replay_frontier);
 	dse_dependency_frontier_destroy(&data_frontier);
+	if (relevance_selection) {
+		result.relevance = relevance_selection->stats;
+	}
+	dse_relevance_selection_destroy(relevance_selection);
 	g_free(dependency_is_data);
 	return result;
 }
 
 DseSliceResult dse_build_reg_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, const TraceEntry **out_slice, uint32_t max_len) {
-	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_REGISTER, target_reg, 0, 0, out_slice, max_len, NULL);
+	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_REGISTER, target_reg, 0, 0, out_slice, max_len, NULL, NULL);
 }
 
 DseSliceResult dse_build_mem_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len) {
-	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID, target_addr, target_size, out_slice, max_len, NULL);
+	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID, target_addr, target_size, out_slice, max_len, NULL, NULL);
 }
 
-static DseSliceResult dse_build_reg_slice_planned(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan) {
-	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_REGISTER, target_reg,0, 0, out_slice, max_len, plan);
+static DseSliceResult dse_build_reg_slice_planned(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan, const DseRelevanceContext *relevance) {
+	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_REGISTER, target_reg, 0, 0, out_slice, max_len, plan, relevance);
 }
 
-static DseSliceResult dse_build_mem_slice_planned(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan) {
-	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID, target_addr, target_size, out_slice, max_len, plan);
+static DseSliceResult dse_build_mem_slice_planned(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len, DseSlicePlan *plan, const DseRelevanceContext *relevance) {
+	return dse_build_value_slice(tb, ring, trigger_seq_id, DSE_SLICE_SEED_MEMORY, REG_INVALID, target_addr, target_size, out_slice, max_len, plan, relevance);
 }
 
-DseVerifyResult dse_verify_oep_candidate(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
+DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle, const DseRelevanceContext *relevance) {
 	(void)shadow;
 	DseVerifyResult result = dse_unknown_result(DSE_REASON_INVALID_INPUT);
 	if (!tb || !ring || target_reg < 0 || target_reg >= REG_COUNT || !g_arch) {
@@ -4421,7 +4766,8 @@ DseVerifyResult dse_verify_oep_candidate(TraceBuffer *tb, const DseAuxRing *ring
 	g_tb = tb;
 	const TraceEntry *slice[MAX_SLICE];
 	DseSliceResult slice_result =
-	dse_build_reg_slice_planned(tb,ring, trigger_seq_id, target_reg, slice, MAX_SLICE, &plan);
+	dse_build_reg_slice_planned(tb, ring, trigger_seq_id, target_reg, slice, MAX_SLICE, &plan, relevance);
+	dse_capture_relevance_metrics(&result, &slice_result.relevance);
 	result.data_slice_complete = slice_result.data_complete;
 	result.slice_complete = slice_result.complete;
 	result.boundary_flag_bits = (uint32_t)__builtin_popcount(slice_result.boundary_flags);
@@ -4506,7 +4852,7 @@ DseVerifyResult dse_verify_oep_candidate(TraceBuffer *tb, const DseAuxRing *ring
 	return result;
 }
 
-DseVerifyResult dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
+DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle, const DseRelevanceContext *relevance) {
 	(void)shadow;
 	DseVerifyResult result = dse_unknown_result(DSE_REASON_INVALID_INPUT);
 	if (!tb || !ring || !g_arch) {
@@ -4525,7 +4871,9 @@ DseVerifyResult dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *
 	g_tb = tb;
 	const TraceEntry *slice[MAX_SLICE];
 	uint8_t target_size = (uint8_t)(g_arch->natural_width / 8);
-	DseSliceResult slice_result = dse_build_mem_slice_planned(tb,ring,trigger_seq_id,target_addr,target_size,slice,MAX_SLICE,&plan);
+	DseSliceResult slice_result =
+	dse_build_mem_slice_planned(tb, ring, trigger_seq_id, target_addr, target_size, slice, MAX_SLICE, &plan, relevance);
+	dse_capture_relevance_metrics(&result, &slice_result.relevance);
 	result.data_slice_complete = slice_result.data_complete;
 	result.slice_complete = slice_result.complete;
 	result.boundary_flag_bits = (uint32_t)__builtin_popcount(slice_result.boundary_flags);
@@ -4618,4 +4966,12 @@ DseVerifyResult dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *
 	dse_ctx_free(&ctx);
 	dse_slice_plan_destroy(&plan);
 	return result;
+}
+
+DseVerifyResult dse_verify_oep_candidate(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
+	return dse_verify_oep_candidate_with_relevance(tb, ring, trigger_seq_id, target_reg, oep_candidate, shadow, cs_handle,NULL);
+}
+
+DseVerifyResult dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle) {
+	return dse_verify_oep_candidate_mem_with_relevance(tb, ring, trigger_seq_id, target_addr, oep_candidate, shadow, cs_handle,NULL);
 }

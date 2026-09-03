@@ -9,10 +9,15 @@
 
 typedef struct {
 	uint64_t seq_id;
+	uint32_t vcpu_index;
 	MetaId meta_id;
 	uint64_t pc;
-	uint8_t  instr_bytes[MAX_INSN_BYTES];
-	uint8_t  size;
+	uint8_t instr_bytes[MAX_INSN_BYTES];
+	uint8_t size;
+
+	bool control_transfer_valid;
+	DcfgEdgeId dcfg_edge_id;
+	ProvLabelId target_label;
 } TraceEntry;
 
 typedef struct {
@@ -29,6 +34,7 @@ const TraceEntry *trace_append(TraceBuffer *tb, const TraceEntry *entry);
 const TraceEntry *trace_get_last(const TraceBuffer *tb, uint32_t i);
 void trace_reset(TraceBuffer *tb);
 const TraceEntry *trace_find_seq(const TraceBuffer *tb, uint64_t seq_id, uint32_t *back_index);
+bool trace_record_control_transfer(TraceBuffer *tb, uint64_t seq_id, DcfgEdgeId edge_id, ProvLabelId target_label);
 
 typedef enum {
 	BRANCH_OUTCOME_UNKNOWN = 0,

@@ -15,6 +15,7 @@
 #define DSE_MAX_PATH_CONSTRAINTS 128U
 #define DSE_MAX_ROOT_LINEAGE 128U
 #define DSE_MAX_ROOT_SCAN_NODES 4096U
+#define DSE_MAX_RELEVANCE_ITERATIONS 64U
 
 typedef enum {
 	DSE_SOLVER_NOT_RUN = 0,
@@ -85,6 +86,11 @@ typedef struct {
 	uint32_t string_summaries_expected;
 	uint32_t expr_nodes_created;
 	uint32_t z3_cache_nodes;
+	uint32_t relevance_events_considered;
+	uint32_t relevance_events_relevant;
+	uint32_t relevance_events_unknown;
+	uint32_t relevance_events_irrelevant;
+	uint32_t relevance_iterations;
 
 	bool target_symbolic;
 	bool data_slice_complete;
@@ -97,7 +103,26 @@ typedef struct {
 	bool replay_valid;
 	bool slice_complete;
 	bool resource_limit_hit;
+	bool relevance_applied;
+	bool relevance_complete;
 } DseVerifyResult;
+
+typedef struct {
+	ProvRegistry *registry;
+	DcfgGraph *dcfg;
+	const BranchEventBuffer *branch_events;
+} DseRelevanceContext;
+
+typedef struct {
+	ProvLabelId accumulated_label;
+	uint32_t events_considered;
+	uint32_t events_relevant;
+	uint32_t events_unknown;
+	uint32_t events_irrelevant;
+	uint32_t iterations;
+	bool applied;
+	bool complete;
+} DseRelevanceStats;
 
 typedef enum {
 	DSE_ADDRESS_READ = 0,
@@ -137,6 +162,7 @@ typedef struct {
 	uint32_t path_constraints_expected;
 	uint32_t string_summaries;
 	uint32_t boundary_mem_byte_count;
+	DseRelevanceStats relevance;
 	bool data_complete;
 	bool path_complete;
 	bool complete;
@@ -403,7 +429,10 @@ const char *dse_verdict_name(DseVerdict verdict);
 const char *dse_verify_reason_name(DseVerifyReason reason);
 DseSliceResult dse_build_reg_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, const TraceEntry **out_slice, uint32_t max_len);
 DseSliceResult dse_build_mem_slice(const TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint8_t target_size, const TraceEntry **out_slice, uint32_t max_len);
+bool dse_analyze_branch_relevance(const TraceBuffer *tb, uint64_t trigger_seq_id, const DseRelevanceContext *relevance, DseRelevanceStats *out_stats);
 DseSolverStatus dse_check_target_relation(DSECtx *ctx, SymExpr *target_expr, uint64_t oep_candidate, bool equal);
 DseVerifyResult dse_verify_oep_candidate(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle);
 DseVerifyResult dse_verify_oep_candidate_mem(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle);
+DseVerifyResult dse_verify_oep_candidate_with_relevance(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, RegId target_reg, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle, const DseRelevanceContext *relevance);
+DseVerifyResult dse_verify_oep_candidate_mem_with_relevance(TraceBuffer *tb, const DseAuxRing *ring, uint64_t trigger_seq_id, uint64_t target_addr, uint64_t oep_candidate, ShadowMemory *shadow, csh cs_handle, const DseRelevanceContext *relevance);
 #endif
